@@ -41,47 +41,45 @@ async def run_test_list_processors(client: ClientSession):
         result: CallToolResult = await client.send_request(tool_request, CallToolResult)
 
         logger.info(f"Tool '{tool_name}' executed successfully.")
+        logger.debug(f"RUN_TEST_LIST: Full result.content = {result.content}") # Add more logging
 
-        # Process the CallToolResult - the actual data is in result.content
-        if result.content and isinstance(result.content, list) and len(result.content) > 0:
-            # Assuming the list contains TextContent objects and the first one holds our data
-            content_item = result.content[0]
-            if hasattr(content_item, 'text') and isinstance(content_item.text, str):
-                raw_json_string = content_item.text
-                # --- DEBUG LOGGING --- #
-                logger.debug(f"RUN_TEST_LIST: Received raw JSON string: {raw_json_string[:500]}...") # Log first 500 chars
-                # --- END DEBUG LOGGING --- #
-                try:
-                    loaded_data = json.loads(raw_json_string)
-
-                    # --- REVERT FIX: Expect list directly --- #
-                    if isinstance(loaded_data, list):
-                        actual_processor_list = loaded_data
-                        logger.debug("RUN_TEST_LIST: Successfully parsed JSON list.")
-                    else:
-                        actual_processor_list = []
-                        logger.warning(f"RUN_TEST_LIST: Received unexpected data type from JSON: {type(loaded_data)}")
-                    # --- END REVERT FIX --- #
-
-                    if actual_processor_list: # Use the extracted list
-                         logger.info(f"Received {len(actual_processor_list)} processors (parsed from JSON):")
-                         for i, proc_entity in enumerate(actual_processor_list):
-                             # Now proc_entity should be a dictionary
-                             proc_id = proc_entity.get("id", "N/A")
-                             proc_component = proc_entity.get("component", {})
-                             proc_name = proc_component.get("name", "N/A")
-                             proc_type = proc_component.get("type", "N/A")
-                             logger.info(f"  {i+1}. ID: {proc_id}, Name: {proc_name}, Type: {proc_type}")
-                    else:
-                         # This case might now be redundant if extraction handles dicts/lists
-                         logger.info(f"Parsed JSON content was not a list or extractable list from dict. Original type: {type(loaded_data)}, Content: {loaded_data}")
-                except json.JSONDecodeError as json_err:
-                     logger.error(f"Failed to parse JSON from TextContent: {json_err}")
-                     logger.error(f"Raw text content was: {raw_json_string}")
-            else:
-                 logger.warning(f"First content item is not TextContent or missing 'text': {type(content_item)}")
+        # Process the CallToolResult - Iterate through content items
+        actual_processor_list = [] # Initialize as empty list
+        if result.content and isinstance(result.content, list):
+            logger.debug(f"RUN_TEST_LIST: Iterating through {len(result.content)} content items.")
+            for i, content_item in enumerate(result.content):
+                # Expecting each item to be TextContent containing a JSON string for one processor
+                if hasattr(content_item, 'text') and isinstance(content_item.text, str):
+                    raw_json_string = content_item.text
+                    # logger.debug(f"RUN_TEST_LIST: Item {i}: Found text content: {raw_json_string[:100]}...") # Optional: Log snippet
+                    try:
+                        loaded_data = json.loads(raw_json_string)
+                        # Expecting a dictionary for each processor
+                        if isinstance(loaded_data, dict):
+                             # logger.debug(f"RUN_TEST_LIST: Item {i}: Successfully parsed dict.")
+                             actual_processor_list.append(loaded_data)
+                        else:
+                             logger.warning(f"RUN_TEST_LIST: Item {i}: Parsed text content, but it was not a dict (type: {type(loaded_data)})")
+                    except json.JSONDecodeError as json_err:
+                         logger.error(f"RUN_TEST_LIST: Item {i}: Failed to parse JSON from TextContent: {json_err}")
+                         logger.error(f"RUN_TEST_LIST: Item {i}: Raw text content was: {raw_json_string}")
+                else:
+                    logger.warning(f"RUN_TEST_LIST: Item {i}: Content item is not TextContent or missing .text (str): {type(content_item)}")
         else:
-             logger.warning(f"Tool executed but returned no content or content is not a non-empty list.")
+             logger.warning(f"RUN_TEST_LIST: Tool executed but returned no content or content is not a list.")
+
+        # Now, process the actual_processor_list (which might be empty if parsing failed)
+        if actual_processor_list: # Use the extracted list
+             logger.info(f"Received {len(actual_processor_list)} processors:")
+             for i, proc_entity in enumerate(actual_processor_list):
+                 # Now proc_entity should be a dictionary
+                 proc_id = proc_entity.get("id", "N/A")
+                 proc_component = proc_entity.get("component", {})
+                 proc_name = proc_component.get("name", "N/A")
+                 proc_type = proc_component.get("type", "N/A")
+                 logger.info(f"  {i+1}. ID: {proc_id}, Name: {proc_name}, Type: {proc_type}")
+        else:
+             logger.info("No processors found or failed to parse processor list.")
 
     except McpError as e: # Catch MCP-specific errors
         logger.error(f"MCP Error executing tool '{tool_name}': Code={e.error.code}, Msg={e.error.message}, Data={e.error.data}", exc_info=True)
@@ -173,7 +171,7 @@ async def run_test_create_connection(
     source_id: str,
     source_relationship: str,
     target_id: str,
-    process_group_id: Optional[str] = None
+    process_group_id: str | None = None # Use pipe syntax
 ):
     """Tests the create_nifi_connection tool."""
     tool_name = "create_nifi_connection"
@@ -606,6 +604,27 @@ async def main():
 
             # Wait briefly for server to be fully ready after init (optional)
             await asyncio.sleep(0.5)
+
+            # ---> TEST: Explicitly list tools <--- 
+            try:
+                logger.info("---> Testing: List Available MCP Tools <---")
+                list_tools_result = await client.list_tools() # Result is likely a ListToolsResult object
+                # Access the list of tools via the .tools attribute
+                if list_tools_result and list_tools_result.tools:
+                    actual_tools_list = list_tools_result.tools
+                    logger.info(f"Server reported {len(actual_tools_list)} available tools:")
+                    for tool in actual_tools_list:
+                        # Each tool object should have .name and .description attributes
+                        tool_name = getattr(tool, 'name', '[Name missing]')
+                        tool_desc = getattr(tool, 'description', '[Description missing]')
+                        logger.info(f"  - Name: {tool_name}, Description: {tool_desc}")
+                else:
+                    logger.warning("Server returned a result, but it did not contain a list of tools.")
+            except McpError as e:
+                 logger.error(f"MCP Error listing tools: Code={e.error.code}, Msg={e.error.message}", exc_info=True)
+            except Exception as e:
+                 logger.error(f"Unexpected error listing tools: {e}", exc_info=True)
+            # ---> END TEST: List Tools <--- 
 
             # --- Run Test Tool Calls ---
             # await run_test_list_processors(client)

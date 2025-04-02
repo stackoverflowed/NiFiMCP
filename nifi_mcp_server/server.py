@@ -3,9 +3,14 @@ import logging
 import signal # Add signal import for cleanup
 from typing import List, Dict, Optional, Any
 import json
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Body
+from dotenv import load_dotenv
+from fastapi.middleware.cors import CORSMiddleware
+import os
+import sys
 
-# Import our NiFi API client and exception (Absolute Import)
-from nifi_client import NiFiClient, NiFiAuthenticationError
+# Import our NiFi API client and exception (Relative Import)
+from .nifi_client import NiFiClient, NiFiAuthenticationError
 
 # Import MCP server components (Corrected for v1.6.0)
 from mcp.server import FastMCP
@@ -18,10 +23,20 @@ logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(leve
 logger = logging.getLogger("nifi_mcp_server")
 logger.debug("nifi_mcp_server logger initialized with DEBUG level.")
 
+# Load .env file at module level for potential Uvicorn execution
+load_dotenv()
+
 # --- Server Setup ---
 
 # Initialize FastMCP server - name should be descriptive
-mcp = FastMCP("nifi_controller", description="An MCP server to interact with Apache NiFi.")
+# Apply version-specific workarounds for MCP 1.6.0 based on Perplexity analysis
+mcp = FastMCP(
+    "nifi_controller",
+    description="An MCP server to interact with Apache NiFi.",
+    protocol_version="2024-09-01",  # Explicitly set protocol version
+    type_validation_mode="compat",  # Use compatibility mode for type validation
+    # json_serializer=lambda x: x     # REMOVED: Let MCP handle default serialization
+)
 
 # Instantiate our NiFi API client (uses environment variables for config)
 # Consider a more robust way to handle client lifecycle if needed
@@ -33,7 +48,7 @@ except ValueError as e:
     # Decide how to handle this - maybe exit or have tools return errors
     nifi_api_client = None # Mark as unavailable
 
-# --- Helper Function for Authentication ---
+# --- Helper Function for Authentication (Keep for potential future use, but commented tools won't call it) ---
 
 async def ensure_authenticated():
     """Helper to ensure the NiFi client is authenticated before tool use."""
@@ -54,14 +69,14 @@ async def ensure_authenticated():
         except Exception as e:
             logger.error(f"Unexpected error during authentication: {e}", exc_info=True)
             raise ToolError(f"An unexpected error occurred during NiFi authentication: {e}")
+    pass # Add pass to avoid syntax error if body is empty
 
 
-# --- MCP Tools ---
-
+# --- NiFi Tools ---
 @mcp.tool()
 async def list_nifi_processors(
-    process_group_id: Optional[str] = None
-) -> list:
+    process_group_id: str | None = None # Use pipe syntax
+) -> list: # Changed return type hint from str to list
     """
     Lists processors within a specified NiFi process group.
 
@@ -96,7 +111,7 @@ async def list_nifi_processors(
             raise ToolError("Unexpected data format received from NiFi API client for list_processors.")
         
         # Return the list directly, let MCP handle serialization
-        return processors_list
+        return processors_list # Return the list
     except (NiFiAuthenticationError, ConnectionError) as e:
         logger.error(f"API error listing processors: {e}", exc_info=True)
         # Convert NiFi client errors to MCP errors
@@ -112,7 +127,7 @@ async def create_nifi_processor(
     name: str,
     position_x: int,
     position_y: int,
-    process_group_id: Optional[str] = None,
+    process_group_id: str | None = None, # Use pipe syntax
     # Add config later if needed
     # config: Optional[Dict[str, Any]] = None
 ) -> Dict:
@@ -131,8 +146,7 @@ async def create_nifi_processor(
         # config: An optional dictionary representing the processor's configuration properties.
 
     Returns:
-        A dictionary representing the newly created processor entity, following the
-        NiFi API response structure for ProcessorEntity.
+        A dictionary representing the result, including status and the created entity.
     """
     await ensure_authenticated() # Ensure we are logged in
 
@@ -194,28 +208,22 @@ async def create_nifi_connection(
     source_id: str,
     source_relationship: str,
     target_id: str,
-    process_group_id: Optional[str] = None,
-    # selected_relationships: Optional[List[str]] = None # Optional: More advanced config
+    process_group_id: str | None = None, # Use pipe syntax
+    # Add more options like selected_relationships if needed
 ) -> Dict:
     """
-    Creates a connection between two components (processors, ports, etc.)
-    within a specified NiFi process group.
-
-    If process_group_id is not provided, it assumes the components exist in the
-    root process group and attempts to fetch its ID.
+    Creates a connection between two components within a specified NiFi process group.
 
     Args:
-        source_id: The UUID of the source component.
-        source_relationship: The name of the relationship originating from the source component (e.g., "success", "failure").
+        source_id: The UUID of the source component (processor, port, etc.).
+        source_relationship: The name of the relationship originating from the source.
         target_id: The UUID of the target component.
-        process_group_id: The UUID of the process group where the connection should be created. Defaults to the root group if None.
-        # selected_relationships: Optionally specify which relationships to include if the source has multiple.
+        process_group_id: The UUID of the process group containing the components. Defaults to the root group if None.
 
     Returns:
-        A dictionary representing the newly created connection entity, following the
-        NiFi API response structure for ConnectionEntity.
+        A dictionary representing the created connection entity.
     """
-    await ensure_authenticated() # Ensure we are logged in
+    await ensure_authenticated()
 
     target_pg_id = process_group_id
     if target_pg_id is None:
@@ -224,23 +232,21 @@ async def create_nifi_connection(
             target_pg_id = await nifi_api_client.get_root_process_group_id()
         except Exception as e:
             logger.error(f"Failed to get root process group ID for connection: {e}", exc_info=True)
-            raise ToolError(f"Failed to determine root process group ID for connection creation: {e}")
+            raise ToolError(f"Failed to determine root process group ID for connection: {e}")
 
-    # NiFi API expects relationships to be provided as a list, even if it's just one
-    relationships = [source_relationship]
-
-    logger.info(f"Executing create_nifi_connection: Source={source_id}, Rel='{source_relationship}', Target={target_id} in group: {target_pg_id}")
+    relationships = [source_relationship] # API expects a list
+    logger.info(f"Executing create_nifi_connection: From {source_id} ({source_relationship}) To {target_id} in group {target_pg_id}")
 
     try:
-        # Call the NiFi client method to create the connection
         connection_entity = await nifi_api_client.create_connection(
             process_group_id=target_pg_id,
             source_id=source_id,
             target_id=target_id,
-            relationships=relationships # Pass the list of relationships
+            relationships=relationships
         )
         logger.info(f"Successfully created connection with ID: {connection_entity.get('id', 'N/A')}")
-        return connection_entity
+        return connection_entity # Return the connection details
+
     except (NiFiAuthenticationError, ConnectionError, ValueError) as e:
         logger.error(f"API error creating connection: {e}", exc_info=True)
         raise ToolError(f"Failed to create NiFi connection: {e}")
@@ -250,30 +256,28 @@ async def create_nifi_connection(
 
 
 @mcp.tool()
-async def get_nifi_processor_details(processor_id: str) -> Dict:
+async def get_nifi_processor_details(processor_id: str) -> dict:
     """
-    Retrieves the detailed information and configuration for a specific processor.
+    Retrieves the details and configuration of a specific processor.
 
     Args:
-        processor_id: The UUID of the processor to inspect.
+        processor_id: The UUID of the processor to retrieve.
 
     Returns:
-        A dictionary containing the processor's details and configuration,
-        following the NiFi API response structure for ProcessorEntity.
-
-    Raises:
-        ToolError: If authentication fails, the processor is not found, or another API error occurs.
+        A dictionary containing the processor's entity (details, config, revision, etc.).
+        Raises ToolError if the processor is not found or an API error occurs.
     """
-    await ensure_authenticated() # Ensure we are logged in
+    await ensure_authenticated()
 
     logger.info(f"Executing get_nifi_processor_details for processor ID: {processor_id}")
-
     try:
-        # Call the NiFi client method to get processor details
-        details = await nifi_api_client.get_processor_details(processor_id)
-        return details
-    except ValueError as e: # Catch the specific error for processor not found
-        logger.warning(f"Processor not found error for ID {processor_id}: {e}")
+        processor_entity = await nifi_api_client.get_processor_details(processor_id)
+        # The client method should raise ValueError if not found, which we catch below
+        logger.info(f"Successfully retrieved details for processor {processor_id}")
+        return processor_entity # Return the full entity
+
+    except ValueError as e: # Specific catch for 'processor not found'
+        logger.warning(f"Processor with ID {processor_id} not found: {e}")
         raise ToolError(f"Processor not found: {e}") from e
     except (NiFiAuthenticationError, ConnectionError) as e:
         logger.error(f"API error getting processor details: {e}", exc_info=True)
@@ -284,332 +288,393 @@ async def get_nifi_processor_details(processor_id: str) -> Dict:
 
 
 @mcp.tool()
-async def delete_nifi_processor(processor_id: str, version: int) -> Dict:
+async def delete_nifi_processor(processor_id: str, version: int) -> dict:
     """
-    Deletes a specific processor from the NiFi canvas.
+    Deletes a specific processor.
 
-    Requires the current revision version of the processor to prevent conflicts.
+    Requires the processor ID and the current revision version to prevent conflicts.
 
     Args:
         processor_id: The UUID of the processor to delete.
         version: The current revision version of the processor.
 
     Returns:
-        A dictionary containing a success message if deletion is successful.
-
-    Raises:
-        ToolError: If authentication fails, the processor is not found,
-                   the version is incorrect (conflict), or another API error occurs.
-    """
-    await ensure_authenticated() # Ensure we are logged in
-
-    logger.info(f"Executing delete_nifi_processor for processor ID: {processor_id} at version {version}")
-
-    try:
-        # Call the NiFi client method to delete the processor
-        deleted = await nifi_api_client.delete_processor(processor_id, version)
-
-        if deleted:
-            return {"status": "success", "message": f"Processor {processor_id} deleted successfully."}
-        else:
-            # This might indicate a 404 handled within the client method
-             raise ToolError(f"Processor {processor_id} could not be deleted (possibly not found).")
-
-    except ValueError as e: # Catch the specific error for version conflict (409)
-        logger.warning(f"Conflict deleting processor {processor_id} (version {version}): {e}")
-        # Revert: Raise ToolError for client to catch as McpError
-        raise ToolError(f"Conflict deleting processor: {e}. Ensure the correct version is provided.") from e
-    except (NiFiAuthenticationError, ConnectionError) as e:
-        logger.error(f"API error deleting processor {processor_id}: {e}", exc_info=True)
-        # Revert: Raise ToolError
-        raise ToolError(f"Failed to delete NiFi processor: {e}")
-    except Exception as e:
-        logger.error(f"Unexpected error deleting processor {processor_id}: {e}", exc_info=True)
-        # Revert: Raise ToolError
-        raise ToolError(f"An unexpected error occurred deleting processor: {e}")
-
-
-@mcp.tool()
-async def list_nifi_connections(
-    process_group_id: Optional[str] = None
-) -> list:
-    """
-    Lists connections within a specified NiFi process group.
-
-    If process_group_id is not provided, it will attempt to list connections
-    in the root process group.
-
-    Args:
-        process_group_id: The UUID of the process group to inspect. Defaults to the root group if None.
-
-    Returns:
-        A list of dictionaries, where each dictionary
-        represents a connection found in the specified process group.
+        A dictionary indicating success or failure.
     """
     await ensure_authenticated()
 
-    target_pg_id = process_group_id
-    if target_pg_id is None:
-        logger.info("No process_group_id provided for list_connections, fetching root ID.")
-        try:
-            target_pg_id = await nifi_api_client.get_root_process_group_id()
-        except Exception as e:
-            logger.error(f"Failed to get root process group ID for list_connections: {e}", exc_info=True)
-            raise ToolError(f"Failed to determine root process group ID for list_connections: {e}")
-
-    logger.info(f"Executing list_nifi_connections for group: {target_pg_id}")
+    logger.info(f"Executing delete_nifi_processor for ID: {processor_id} at version {version}")
     try:
-        connections_list = await nifi_api_client.list_connections(target_pg_id)
-        if not isinstance(connections_list, list):
-            logger.error(f"API client list_connections did not return a list. Got: {type(connections_list)}")
-            raise ToolError("Unexpected data format received from NiFi API client for list_connections.")
-        
-        return connections_list
+        success = await nifi_api_client.delete_processor(processor_id, version)
+        if success:
+            logger.info(f"Successfully deleted processor {processor_id}")
+            return {"status": "success", "message": f"Processor {processor_id} deleted."}
+        else:
+            # This case might not be reachable if the client raises exceptions on failure
+            logger.warning(f"NiFi API client reported failure deleting processor {processor_id}, but did not raise exception.")
+            return {"status": "error", "message": f"Deletion failed for processor {processor_id} according to API client."}
+
+    except ValueError as e: # Catch 'not found' or 'conflict'
+        logger.warning(f"Error deleting processor {processor_id}: {e}")
+        # Distinguish between not found and conflict if possible from the error message
+        if "conflict" in str(e).lower():
+            raise ToolError(f"Conflict deleting processor {processor_id}: Check revision version ({version}). {e}") from e
+        else:
+            raise ToolError(f"Processor not found or other error: {e}") from e
     except (NiFiAuthenticationError, ConnectionError) as e:
-        logger.error(f"API error listing connections: {e}", exc_info=True)
-        raise ToolError(f"Failed to list NiFi connections: {e}")
+        logger.error(f"API error deleting processor: {e}", exc_info=True)
+        raise ToolError(f"Failed to delete NiFi processor: {e}")
     except Exception as e:
-        logger.error(f"Unexpected error listing connections: {e}", exc_info=True)
-        raise ToolError(f"An unexpected error occurred listing connections: {e}")
+        logger.error(f"Unexpected error deleting processor: {e}", exc_info=True)
+        raise ToolError(f"An unexpected error occurred during processor deletion: {e}")
+
 
 @mcp.tool()
-async def delete_nifi_connection(connection_id: str, version: int) -> Dict:
+async def delete_nifi_connection(connection_id: str, version: int) -> dict:
     """
-    Deletes a specific connection from the NiFi canvas.
+    Deletes a specific connection.
 
-    Requires the current revision version of the connection to prevent conflicts.
+    Requires the connection ID and the current revision version.
 
     Args:
         connection_id: The UUID of the connection to delete.
         version: The current revision version of the connection.
 
     Returns:
-        A dictionary containing a success message if deletion is successful.
-
-    Raises:
-        ToolError: If authentication fails, the connection is not found,
-                   the version is incorrect (conflict), or another API error occurs.
+        A dictionary indicating success or failure.
     """
     await ensure_authenticated()
 
     logger.info(f"Executing delete_nifi_connection for ID: {connection_id} at version {version}")
-
     try:
-        deleted = await nifi_api_client.delete_connection(connection_id, version)
-
-        if deleted:
-            return {"status": "success", "message": f"Connection {connection_id} deleted successfully."}
+        success = await nifi_api_client.delete_connection(connection_id, version)
+        if success:
+            logger.info(f"Successfully deleted connection {connection_id}")
+            return {"status": "success", "message": f"Connection {connection_id} deleted."}
         else:
-            raise ToolError(f"Connection {connection_id} could not be deleted (possibly not found).")
+            logger.warning(f"NiFi API client reported failure deleting connection {connection_id}, but did not raise exception.")
+            return {"status": "error", "message": f"Deletion failed for connection {connection_id} according to API client."}
 
-    except ValueError as e: # Catch version conflict (409)
-        logger.warning(f"Conflict deleting connection {connection_id} (version {version}): {e}")
-        # Revert: Raise ToolError
-        raise ToolError(f"Conflict deleting connection: {e}. Ensure the correct version is provided.") from e
+    except ValueError as e: # Catch 'not found' or 'conflict'
+        logger.warning(f"Error deleting connection {connection_id}: {e}")
+        if "conflict" in str(e).lower():
+            raise ToolError(f"Conflict deleting connection {connection_id}: Check revision version ({version}). {e}") from e
+        else:
+            raise ToolError(f"Connection not found or other error: {e}") from e
     except (NiFiAuthenticationError, ConnectionError) as e:
-        logger.error(f"API error deleting connection {connection_id}: {e}", exc_info=True)
-        # Revert: Raise ToolError
+        logger.error(f"API error deleting connection: {e}", exc_info=True)
         raise ToolError(f"Failed to delete NiFi connection: {e}")
     except Exception as e:
-        logger.error(f"Unexpected error deleting connection {connection_id}: {e}", exc_info=True)
-        # Revert: Raise ToolError
-        raise ToolError(f"An unexpected error occurred deleting connection: {e}")
+        logger.error(f"Unexpected error deleting connection: {e}", exc_info=True)
+        raise ToolError(f"An unexpected error occurred during connection deletion: {e}")
 
 
 @mcp.tool()
 async def update_nifi_processor_config(
     processor_id: str,
     config_properties: Dict[str, Any]
+    # Add state? scheduled: Optional[bool] = None
 ) -> Dict:
     """
-    Updates the configuration properties for a specific processor.
+    Updates the configuration properties of a specific processor.
 
-    This requires fetching the processor's current revision first.
+    This requires fetching the current processor revision first.
 
     Args:
         processor_id: The UUID of the processor to update.
-        config_properties: A dictionary where keys are property names (as strings)
-                           and values are the new property values (as strings,
-                           booleans, numbers etc., depending on the property).
+        config_properties: A dictionary where keys are property names and values are the desired settings.
 
     Returns:
-        A dictionary representing the updated processor entity.
-
-    Raises:
-        ToolError: If authentication fails, the processor is not found,
-                   there's a revision conflict (409), or another API error occurs.
+        A dictionary representing the updated processor entity or an error status.
     """
     await ensure_authenticated()
 
-    logger.info(f"Executing update_nifi_processor_config for ID: {processor_id} with props: {config_properties}")
-
+    logger.info(f"Executing update_nifi_processor_config for ID: {processor_id} with properties: {config_properties}")
     try:
-        updated_entity = await nifi_api_client.update_processor_config(processor_id, config_properties)
-        return updated_entity
-    except ValueError as e: # Catch conflict or not found from client
-        logger.error(f"Update processor config failed for {processor_id}: {e}")
-        # Distinguish between conflict and not found if possible based on message
-        if "Conflict updating processor" in str(e):
-            raise ToolError(f"Conflict updating processor {processor_id}: Revision mismatch. Try again.") from e
-        elif "not found" in str(e):
-             raise ToolError(f"Processor {processor_id} not found for update.") from e
+        # The client method handles getting revision and making the update
+        updated_entity = await nifi_api_client.update_processor_config(
+            processor_id=processor_id,
+            config_updates=config_properties
+        )
+        logger.info(f"Successfully updated configuration for processor {processor_id}")
+        
+        # Check validation status
+        component = updated_entity.get("component", {})
+        validation_status = component.get("validationStatus", "UNKNOWN")
+        validation_errors = component.get("validationErrors", [])
+        name = component.get("name", processor_id)
+        
+        if validation_status == "VALID":
+            return {
+                "status": "success",
+                "message": f"Processor '{name}' configuration updated successfully.",
+                "entity": updated_entity
+            }
         else:
-            raise ToolError(f"Update processor config failed: {e}") from e
+            error_msg_snippet = f" ({validation_errors[0]})" if validation_errors else ""
+            logger.warning(f"Processor '{name}' configuration updated, but validation status is {validation_status}{error_msg_snippet}.")
+            return {
+                "status": "warning",
+                "message": f"Processor '{name}' configuration updated, but validation status is {validation_status}{error_msg_snippet}. Check configuration.",
+                "entity": updated_entity
+            }
+
+    except ValueError as e: # Catch 'not found' or 'conflict'
+        logger.warning(f"Error updating processor config {processor_id}: {e}")
+        if "conflict" in str(e).lower():
+            # raise ToolError(f"Conflict updating processor {processor_id}: {e}") from e
+            return {"status": "error", "message": f"Conflict updating processor {processor_id}: {e}", "entity": None}
+        else:
+            # raise ToolError(f"Processor not found or other value error updating config: {e}") from e
+            return {"status": "error", "message": f"Processor not found or other error updating config: {e}", "entity": None}
     except (NiFiAuthenticationError, ConnectionError) as e:
-        logger.error(f"API error updating processor config for {processor_id}: {e}", exc_info=True)
-        raise ToolError(f"Failed to update NiFi processor config: {e}")
+        logger.error(f"API error updating processor config: {e}", exc_info=True)
+        # raise ToolError(f"Failed to update NiFi processor config: {e}")
+        return {"status": "error", "message": f"Failed to update NiFi processor config: {e}", "entity": None}
     except Exception as e:
-        logger.error(f"Unexpected error updating processor config for {processor_id}: {e}", exc_info=True)
-        raise ToolError(f"An unexpected error occurred updating processor config: {e}")
+        logger.error(f"Unexpected error updating processor config: {e}", exc_info=True)
+        # raise ToolError(f"An unexpected error occurred during processor config update: {e}")
+        return {"status": "error", "message": f"An unexpected error occurred during processor config update: {e}", "entity": None}
 
 
 @mcp.tool()
 async def start_nifi_processor(processor_id: str) -> Dict:
     """
-    Starts a specific processor (sets state to RUNNING).
-
-    Requires fetching the processor's current revision first.
+    Starts a specific processor.
 
     Args:
         processor_id: The UUID of the processor to start.
 
     Returns:
-        A dictionary representing the updated processor entity with the new state.
-
-    Raises:
-        ToolError: If authentication fails, the processor is not found,
-                   there's a revision conflict (409), or another API error occurs.
+        A dictionary indicating the status (success, warning, error) and the updated entity.
     """
     await ensure_authenticated()
     logger.info(f"Executing start_nifi_processor for ID: {processor_id}")
     try:
         updated_entity = await nifi_api_client.update_processor_state(processor_id, "RUNNING")
-        # Check the actual state after the API call
-        actual_state = updated_entity.get("component", {}).get("state", "UNKNOWN")
-        if actual_state == "RUNNING":
-            return {
-                "status": "success",
-                "message": f"Processor {processor_id} started successfully.",
-                "entity": updated_entity
-            }
+        # Check the actual state returned
+        component = updated_entity.get("component", {})
+        current_state = component.get("state")
+        name = component.get("name", processor_id)
+        validation_status = component.get("validationStatus", "UNKNOWN")
+        
+        if current_state == "RUNNING":
+             logger.info(f"Successfully started processor '{name}'.")
+             return {"status": "success", "message": f"Processor '{name}' started successfully.", "entity": updated_entity}
+        elif current_state == "DISABLED" or validation_status != "VALID":
+             logger.warning(f"Processor '{name}' could not be started. Current state: {current_state}, Validation: {validation_status}.")
+             return {"status": "warning", "message": f"Processor '{name}' could not be started (State: {current_state}, Validation: {validation_status}). Check configuration and dependencies.", "entity": updated_entity}
         else:
-            logger.warning(f"Processor {processor_id} state is {actual_state} after start request (expected RUNNING). Possible validation errors.")
-            return {
-                "status": "warning",
-                "message": f"Processor {processor_id} state set to RUNNING via API, but current state is {actual_state}. Check NiFi bulletins for validation errors.",
-                "entity": updated_entity
-            }
-    except ValueError as e: # Catch conflict or not found from client
-        logger.error(f"Start processor failed for {processor_id}: {e}")
-        # Return error status
-        status = "error"
-        message = f"Start processor failed: {e}"
-        if "Conflict" in str(e):
-            message = f"Conflict starting processor {processor_id}: Revision mismatch. Try again."
-        elif "not found" in str(e):
-             message = f"Processor {processor_id} not found for starting."
-             status = "not_found"
-        return {"status": status, "message": message, "entity": None}
+             logger.warning(f"Processor '{name}' state is {current_state} after start request. Expected RUNNING.")
+             return {"status": "warning", "message": f"Processor '{name}' is {current_state} after start request. Check NiFi UI for details.", "entity": updated_entity}
+
+    except ValueError as e: # Not found / Invalid state
+        logger.warning(f"Error starting processor {processor_id}: {e}")
+        # raise ToolError(f"Could not start processor {processor_id}: {e}") from e
+        return {"status": "error", "message": f"Could not start processor {processor_id}: {e}", "entity": None}
     except (NiFiAuthenticationError, ConnectionError) as e:
-        logger.error(f"API error starting processor {processor_id}: {e}", exc_info=True)
+        logger.error(f"API error starting processor: {e}", exc_info=True)
         # raise ToolError(f"Failed to start NiFi processor: {e}")
-        return {"status": "error", "message": f"API error starting processor: {e}", "entity": None}
+        return {"status": "error", "message": f"Failed to start NiFi processor: {e}", "entity": None}
     except Exception as e:
-        logger.error(f"Unexpected error starting processor {processor_id}: {e}", exc_info=True)
+        logger.error(f"Unexpected error starting processor: {e}", exc_info=True)
         # raise ToolError(f"An unexpected error occurred starting processor: {e}")
-        return {"status": "error", "message": f"Unexpected error starting processor: {e}", "entity": None}
+        return {"status": "error", "message": f"An unexpected error occurred starting processor: {e}", "entity": None}
 
 @mcp.tool()
 async def stop_nifi_processor(processor_id: str) -> Dict:
     """
-    Stops a specific processor (sets state to STOPPED).
-
-    Requires fetching the processor's current revision first.
+    Stops a specific processor.
 
     Args:
         processor_id: The UUID of the processor to stop.
 
     Returns:
-        A dictionary representing the updated processor entity with the new state.
-
-    Raises:
-        ToolError: If authentication fails, the processor is not found,
-                   there's a revision conflict (409), or another API error occurs.
+        A dictionary indicating the status (success, warning, error) and the updated entity.
     """
     await ensure_authenticated()
     logger.info(f"Executing stop_nifi_processor for ID: {processor_id}")
     try:
         updated_entity = await nifi_api_client.update_processor_state(processor_id, "STOPPED")
-        # Check the actual state after the API call
-        actual_state = updated_entity.get("component", {}).get("state", "UNKNOWN")
-        # NiFi might take a moment, so accept STOPPING or STOPPED
-        if actual_state in ["STOPPED", "STOPPING"]:
-            return {
-                "status": "success",
-                "message": f"Processor {processor_id} stopped (or stopping) successfully.",
-                "entity": updated_entity
-            }
+        # Check the actual state returned
+        component = updated_entity.get("component", {})
+        current_state = component.get("state")
+        name = component.get("name", processor_id)
+
+        if current_state == "STOPPED":
+             logger.info(f"Successfully stopped processor '{name}'.")
+             return {"status": "success", "message": f"Processor '{name}' stopped successfully.", "entity": updated_entity}
         else:
-            # This case is less common for stopping unless there's an error
-            logger.warning(f"Processor {processor_id} state is {actual_state} after stop request (expected STOPPED/STOPPING).")
-            return {
-                "status": "warning",
-                "message": f"Processor {processor_id} state set to STOPPED via API, but current state is {actual_state}. This might indicate an issue.",
-                "entity": updated_entity
-            }
-    except ValueError as e: # Catch conflict or not found from client
-        logger.error(f"Stop processor failed for {processor_id}: {e}")
-        status = "error"
-        message = f"Stop processor failed: {e}"
-        if "Conflict" in str(e):
-            message = f"Conflict stopping processor {processor_id}: Revision mismatch. Try again."
-        elif "not found" in str(e):
-             message = f"Processor {processor_id} not found for stopping."
-             status = "not_found"
-        return {"status": status, "message": message, "entity": None}
+             # This might happen if it was already stopped or disabled
+             logger.warning(f"Processor '{name}' state is {current_state} after stop request. Expected STOPPED.")
+             # Consider returning success if already stopped, but warning is safer
+             return {"status": "warning", "message": f"Processor '{name}' is {current_state} after stop request. Check NiFi UI for details.", "entity": updated_entity}
+
+    except ValueError as e: # Not found / Invalid state
+        logger.warning(f"Error stopping processor {processor_id}: {e}")
+        # raise ToolError(f"Could not stop processor {processor_id}: {e}") from e
+        return {"status": "error", "message": f"Could not stop processor {processor_id}: {e}", "entity": None}
     except (NiFiAuthenticationError, ConnectionError) as e:
-        logger.error(f"API error stopping processor {processor_id}: {e}", exc_info=True)
+        logger.error(f"API error stopping processor: {e}", exc_info=True)
         # raise ToolError(f"Failed to stop NiFi processor: {e}")
-        return {"status": "error", "message": f"API error stopping processor: {e}", "entity": None}
+        return {"status": "error", "message": f"Failed to stop NiFi processor: {e}", "entity": None}
     except Exception as e:
-        logger.error(f"Unexpected error stopping processor {processor_id}: {e}", exc_info=True)
+        logger.error(f"Unexpected error stopping processor: {e}", exc_info=True)
         # raise ToolError(f"An unexpected error occurred stopping processor: {e}")
-        return {"status": "error", "message": f"Unexpected error stopping processor: {e}", "entity": None}
+        return {"status": "error", "message": f"An unexpected error occurred stopping processor: {e}", "entity": None}
 
-# --- Server Run --- #
 
+# === Add a Simple Dummy Tool ===
+@mcp.tool()
+async def ping_test(message: str) -> str:
+    """A simple async test tool that echoes a message."""
+    logger.info(f"Executing async ping_test with message: {message}")
+    # Simulate async work if needed, but not necessary for this test
+    # await asyncio.sleep(0.01)
+    return f"Pong: {message}"
+
+# Remove FastAPI integration
+# app = FastAPI(...) and websocket_endpoint and middleware
+
+# Keep cleanup function
 async def cleanup():
     """Perform cleanup tasks on server shutdown."""
     if nifi_api_client:
         logger.info("Closing NiFi API client connection.")
         await nifi_api_client.close()
 
-if __name__ == "__main__":
-    # Ensure .env is loaded if running directly (server loads its own when launched by client)
-    from dotenv import load_dotenv
-    load_dotenv()
+# === FastAPI Application Setup === #
+app = FastAPI(
+    title="NiFi MCP REST Bridge", 
+    description="Exposes NiFi MCP tools via a REST API."
+)
 
-    # Register cleanup function using loop (may need adjustment for different OS/Python versions)
+# --- CORS Middleware --- #
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Permissive for now
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# --- FastAPI Event Handlers --- #
+@app.on_event("startup")
+async def startup_event():
+    logger.info("FastAPI server starting up...")
+    # Perform initial authentication check
     try:
-        loop = asyncio.get_event_loop()
-        # Add signal handlers if loop supports it (may not work on Windows)
-        if hasattr(signal, 'SIGINT'):
-            loop.add_signal_handler(signal.SIGINT, lambda: asyncio.create_task(cleanup()))
-        if hasattr(signal, 'SIGTERM'):
-            loop.add_signal_handler(signal.SIGTERM, lambda: asyncio.create_task(cleanup()))
-    except NotImplementedError:
-        logger.warning("Signal handlers not supported on this platform/loop.")
+        await ensure_authenticated()
+        logger.info("Initial NiFi authentication successful.")
     except Exception as e:
-        logger.error(f"Error setting up signal handlers: {e}")
+        logger.error(f"Initial NiFi authentication failed on startup: {e}", exc_info=True)
+        # Depending on requirements, you might want to prevent startup
+        # raise RuntimeError("NiFi authentication failed, cannot start server.") from e
 
-    logger.info("Starting NiFi MCP Server...")
-    # Run the server using stdio transport
+@app.on_event("shutdown")
+async def shutdown_event():
+    logger.info("FastAPI server shutting down...")
+    await cleanup()
+
+# --- REST API Endpoints --- #
+
+@app.get("/tools", response_model=List[Dict[str, Any]])
+async def get_tools():
+    """Retrieve the list of available MCP tools in OpenAI function format."""
     try:
-        mcp.run(transport='stdio')
-    finally:
-        # Ensure cleanup runs even if mcp.run exits unexpectedly
-        # Note: This might run cleanup twice if signal handler also runs
-        logger.info("Server run loop finished. Performing final cleanup...")
-        asyncio.run(cleanup())
+        logger.debug(f"Inspecting mcp object attributes: {dir(mcp)}") # Keep debug for now
+        formatted_tools = []
+        # Access the ToolManager instance
+        tool_manager = getattr(mcp, '_tool_manager', None)
+        if tool_manager:
+            # Call the ToolManager's list_tools method
+            tools_info = tool_manager.list_tools() # Assuming this returns ToolInfo objects or similar
+            
+            for tool_info in tools_info: 
+                # Assume tool_info has attributes like name, description, parameters (which is schema)
+                # The structure of tool_info needs confirmation by looking at ToolManager.list_tools source
+                tool_name = getattr(tool_info, 'name', 'unknown')
+                tool_description = getattr(tool_info, 'description', '')
+                parameters_schema = getattr(tool_info, 'parameters', {"type": "object", "properties": {}}) # parameters should be the schema
+                
+                # Ensure parameters_schema is correctly formatted if it comes directly
+                if not isinstance(parameters_schema, dict) or "type" not in parameters_schema:
+                    logger.warning(f"Tool '{tool_name}' has unexpected parameters format: {parameters_schema}. Skipping schema details.")
+                    parameters_schema = {"type": "object", "properties": {}} # Default to empty if format is wrong
 
-    logger.info("NiFi MCP Server stopped.")
+                formatted_tools.append({
+                    "type": "function",
+                    "function": {
+                        "name": tool_name,
+                        "description": tool_description,
+                        "parameters": parameters_schema
+                    }
+                })
+            logger.info(f"Returning {len(formatted_tools)} tool definitions via ToolManager.")
+            return formatted_tools
+        else:
+            logger.warning("Could not find ToolManager (_tool_manager) on MCP instance.")
+            return []
+    except Exception as e:
+        logger.error(f"Error retrieving tool definitions via ToolManager: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error retrieving tools.")
+
+# Define a Pydantic model for the request body, expecting arbitrary key-value pairs
+from pydantic import BaseModel
+class ToolExecutionPayload(BaseModel):
+    arguments: Dict[str, Any]
+
+@app.post("/tools/{tool_name}")
+async def execute_tool(tool_name: str, payload: ToolExecutionPayload):
+    """Execute a specified MCP tool with the given arguments via ToolManager."""
+    logger.info(f"Received request to execute tool '{tool_name}' via ToolManager with arguments: {payload.arguments}")
+    
+    tool_manager = getattr(mcp, '_tool_manager', None)
+    if not tool_manager:
+        logger.error("Could not find ToolManager on MCP instance during execution.")
+        raise HTTPException(status_code=500, detail="Internal server configuration error: ToolManager not found.")
+
+    # Check if tool exists using ToolManager (assuming it has a way to check/get)
+    # Option A: Try/Except around call_tool
+    # Option B: Check via list_tools result (less efficient)
+    # Let's go with Option A for now.
+
+    try:
+        # Ensure NiFi client is authenticated before execution
+        await ensure_authenticated() 
+        
+        # Get context. This might be tricky outside a real MCP request.
+        # Try getting a default/dummy context or passing None if allowed.
+        # context = mcp.get_context() # This might fail if no request context exists
+        context = None # Simplest assumption: maybe context is optional for call_tool?
+        
+        # Call the ToolManager's call_tool method
+        result = await tool_manager.call_tool(tool_name, payload.arguments, context=context)
+            
+        logger.info(f"Execution of tool '{tool_name}' via ToolManager successful.")
+        
+        # The result from call_tool might need conversion (similar to FastMCP.call_tool)
+        # For now, assume it's the direct result we want.
+        # TODO: Verify the return type of tool_manager.call_tool and convert if necessary.
+        return {"result": result}
+        
+    except ToolError as e:
+        # Assuming ToolManager.call_tool raises ToolError for tool-specific issues (like not found)
+        logger.error(f"ToolError executing tool '{tool_name}' via ToolManager: {e.message} (Code: {e.code})", exc_info=True)
+        # Check if it's a 'tool not found' type error if ToolManager provides specific exceptions
+        # if isinstance(e, ToolNotFoundError): # Hypothetical specific exception
+        #     raise HTTPException(status_code=404, detail=f"Tool '{tool_name}' not found.")
+        raise HTTPException(status_code=400, detail=f"Error executing tool '{tool_name}': {e.message} (Code: {e.code})")
+    except NiFiAuthenticationError as e:
+         logger.error(f"NiFi Authentication Error during tool '{tool_name}' execution: {e}", exc_info=True)
+         raise HTTPException(status_code=503, detail=f"NiFi authentication failed: {e}") # 503 Service Unavailable
+    except Exception as e:
+        logger.error(f"Unexpected error executing tool '{tool_name}' via ToolManager: {e}", exc_info=True)
+        # Check if it's a context-related error
+        if "Context is not available outside of a request" in str(e):
+             logger.error(f"Tool '{tool_name}' likely requires context, which is unavailable in this REST setup.")
+             raise HTTPException(status_code=501, detail=f"Tool '{tool_name}' cannot be executed via REST API as it requires MCP context.")
+        # Catch potential argument mismatches or other runtime errors
+        if isinstance(e, TypeError) and ("required positional argument" in str(e) or "unexpected keyword argument" in str(e)):
+             raise HTTPException(status_code=422, detail=f"Invalid arguments for tool '{tool_name}': {e}")
+        raise HTTPException(status_code=500, detail=f"Internal server error executing tool '{tool_name}'.")

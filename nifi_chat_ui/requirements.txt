@@ -3,3 +3,7 @@ openai
 google-generativeai
 python-dotenv
 mcp 
+fastapi
+uvicorn
+websockets
+requests

@@ -31,18 +31,29 @@ with st.sidebar:
     st.markdown("---")  # Add a visual separator
     st.subheader("Available MCP Tools")
     # Restore get_available_tools call
-    tools = get_available_tools()
-    if not tools:
+    tools_list = get_available_tools()
+    if not tools_list:
         st.warning("No MCP tools available or failed to retrieve.") # Updated message
     else:
-        for tool in tools:
-            # Check if 'parameters' exists and is a dict before accessing 'properties'
-            parameters = tool.get('parameters', {})
-            properties = parameters.get('properties', {})
-            required_params = parameters.get('required', [])
+        # Iterate through the list of tools (OpenAI format)
+        for tool_data in tools_list:
+            # Ensure the structure is as expected
+            if not isinstance(tool_data, dict) or tool_data.get("type") != "function" or not isinstance(tool_data.get("function"), dict):
+                st.warning(f"Skipping unexpected tool data format: {tool_data}")
+                continue
             
-            with st.expander(f"🔧 {tool.get('name', 'Unnamed Tool')}", expanded=False):
-                st.markdown(f"**Description:** {tool.get('description', 'No description')}")
+            # Access the nested function dictionary
+            function_details = tool_data.get("function", {})
+            tool_name = function_details.get('name', 'Unnamed Tool')
+            tool_description = function_details.get('description', 'No description')
+            parameters = function_details.get('parameters', {}) # parameters schema
+            
+            # Ensure parameters is a dict before accessing properties
+            properties = parameters.get('properties', {}) if isinstance(parameters, dict) else {}
+            required_params = parameters.get('required', []) if isinstance(parameters, dict) else []
+            
+            with st.expander(f"🔧 {tool_name}", expanded=False):
+                st.markdown(f"**Description:** {tool_description}")
                 if properties:
                     st.markdown("**Parameters:**")
                     for param_name, param_info in properties.items():
@@ -51,7 +62,7 @@ with st.sidebar:
                         param_desc = param_info.get('description', 'No description') if isinstance(param_info, dict) else 'Invalid parameter info'
                         st.markdown(f"- {required}`{param_name}`: {param_desc}")
                 else:
-                    st.markdown("_(No parameters specified)_)")
+                    st.markdown("_(No parameters specified)_")
 
 
 # Main chat interface
