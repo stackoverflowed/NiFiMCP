@@ -524,6 +524,57 @@ class NiFiClient:
             logger.error(f"An unexpected error occurred changing state for processor {processor_id}: {e}", exc_info=True)
             raise ConnectionError(f"An unexpected error occurred changing processor state: {e}") from e
 
+    async def get_parameter_context(self, process_group_id: str) -> list:
+        """Get parameter contexts assigned to a process group."""
+        if not self._token:
+            raise NiFiAuthenticationError("Client is not authenticated. Call authenticate() first.")
+
+        client = await self._get_client()
+        
+        # First, get the process group entity to find the parameter context
+        endpoint = f"/process-groups/{process_group_id}"
+        try:
+            logger.info(f"Fetching process group {process_group_id} to get parameter context")
+            response = await client.get(endpoint)
+            response.raise_for_status()
+            group_data = response.json()
+            
+            # Check if the process group has a parameter context
+            parameter_context_id = group_data.get("component", {}).get("parameterContext", {}).get("id")
+            
+            if not parameter_context_id:
+                logger.info(f"No parameter context found for process group {process_group_id}")
+                return []
+                
+            # Now get the parameter context details
+            endpoint = f"/parameter-contexts/{parameter_context_id}"
+            response = await client.get(endpoint)
+            response.raise_for_status()
+            context_data = response.json()
+            
+            # Extract parameters
+            parameters = []
+            for param in context_data.get("component", {}).get("parameters", []):
+                parameters.append({
+                    "name": param.get("parameter", {}).get("name"),
+                    "value": param.get("parameter", {}).get("value"),
+                    "description": param.get("parameter", {}).get("description"),
+                    "sensitive": param.get("parameter", {}).get("sensitive", False)
+                })
+            
+            logger.info(f"Found {len(parameters)} parameters for process group {process_group_id}")
+            return parameters
+            
+        except httpx.HTTPStatusError as e:
+            logger.error(f"Failed to get parameter context for process group {process_group_id}: {e.response.status_code} - {e.response.text}")
+            raise ConnectionError(f"Failed to get parameter context: {e.response.status_code}") from e
+        except (httpx.RequestError, ValueError) as e:
+            logger.error(f"Error getting parameter context for process group {process_group_id}: {e}")
+            raise ConnectionError(f"Error getting parameter context: {e}") from e
+        except Exception as e:
+            logger.error(f"An unexpected error occurred getting parameter context: {e}", exc_info=True)
+            raise ConnectionError(f"An unexpected error occurred getting parameter context: {e}") from e
+
 # Example usage (for testing this module directly)
 async def main():
     client = NiFiClient()

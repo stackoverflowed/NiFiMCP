@@ -9,8 +9,17 @@ from fastapi.middleware.cors import CORSMiddleware
 import os
 import sys
 
-# Import our NiFi API client and exception (Relative Import)
-from .nifi_client import NiFiClient, NiFiAuthenticationError
+# Import our NiFi API client and exception (Absolute Import)
+from nifi_mcp_server.nifi_client import NiFiClient, NiFiAuthenticationError
+# Import flow documentation tools
+from nifi_mcp_server.flow_documenter import (
+    extract_important_properties,
+    analyze_expressions,
+    build_graph_structure,
+    format_connection,
+    find_source_to_sink_paths,
+    find_decision_branches
+)
 
 # Import MCP server components (Corrected for v1.6.0)
 from mcp.server import FastMCP
@@ -110,8 +119,11 @@ async def list_nifi_processors(
             logger.error(f"API client list_processors did not return a list. Got: {type(processors_list)}")
             raise ToolError("Unexpected data format received from NiFi API client for list_processors.")
         
-        # Return the list directly, let MCP handle serialization
-        return processors_list # Return the list
+        # Filter the processor data to include only essential fields
+        filtered_processors = [filter_processor_data(processor) for processor in processors_list]
+        
+        # Return the filtered list directly, let MCP handle serialization
+        return filtered_processors # Return the filtered list
     except (NiFiAuthenticationError, ConnectionError) as e:
         logger.error(f"API error listing processors: {e}", exc_info=True)
         # Convert NiFi client errors to MCP errors
@@ -120,6 +132,20 @@ async def list_nifi_processors(
         logger.error(f"Unexpected error listing processors: {e}", exc_info=True)
         raise ToolError(f"An unexpected error occurred: {e}")
 
+def filter_processor_data(processor):
+    """Extract only the essential fields from a processor object"""
+    return {
+        "id": processor.get("id"),
+        "name": processor.get("component", {}).get("name"),
+        "type": processor.get("component", {}).get("type"),
+        "state": processor.get("component", {}).get("state"),
+        "position": processor.get("position"),
+        "runStatus": processor.get("status", {}).get("runStatus"),
+        "validationStatus": processor.get("component", {}).get("validationStatus"),
+        "relationships": [rel.get("name") for rel in processor.get("component", {}).get("relationships", [])],
+        "inputRequirement": processor.get("component", {}).get("inputRequirement"),
+        "bundle": processor.get("component", {}).get("bundle"),
+    }
 
 @mcp.tool()
 async def create_nifi_processor(
@@ -709,3 +735,170 @@ async def execute_tool(tool_name: str, payload: ToolExecutionPayload):
         if isinstance(e, TypeError) and ("required positional argument" in str(e) or "unexpected keyword argument" in str(e)):
              raise HTTPException(status_code=422, detail=f"Invalid arguments for tool '{tool_name}': {e}")
         raise HTTPException(status_code=500, detail=f"Internal server error executing tool '{tool_name}'.")
+
+@mcp.tool()
+async def document_nifi_flow(
+    process_group_id: str | None = None,
+    starting_processor_id: str | None = None,
+    max_depth: int = 10,
+    include_properties: bool = True,
+    include_descriptions: bool = True
+) -> Dict[str, Any]:
+    """
+    Documents a NiFi flow by traversing processors and their connections.
+
+    Args:
+        process_group_id: The UUID of the process group to document. Defaults to the root group if None.
+        starting_processor_id: The UUID of the processor to start the traversal from.
+            If None, documents all processors in the process group.
+        max_depth: Maximum depth to traverse from the starting processor. Defaults to 10.
+        include_properties: Whether to include processor properties in the documentation. Defaults to True.
+        include_descriptions: Whether to include processor descriptions in the documentation. Defaults to True.
+
+    Returns:
+        A dictionary containing the flow documentation, including:
+        - processors: A list of processors and their configurations
+        - connections: A list of connections between processors
+        - graph_structure: The graph structure for traversal
+        - common_paths: Pre-identified paths through the flow
+        - decision_points: Branching points in the flow
+        - parameters: Parameter context information (if available)
+    """
+    await ensure_authenticated()
+
+    # Get data from NiFi
+    target_pg_id = process_group_id
+    if target_pg_id is None:
+        logger.info("No process_group_id provided, fetching root process group ID.")
+        try:
+            target_pg_id = await nifi_api_client.get_root_process_group_id()
+        except Exception as e:
+            logger.error(f"Failed to get root process group ID: {e}", exc_info=True)
+            raise ToolError(f"Failed to determine root process group ID: {e}")
+    
+    try:
+        # Get all processors in the process group
+        processors = await nifi_api_client.list_processors(target_pg_id)
+        connections = await nifi_api_client.list_connections(target_pg_id)
+        
+        # Filter processors if starting_processor_id is provided
+        filtered_processors = processors
+        if starting_processor_id:
+            # Find the starting processor
+            start_processor = next((p for p in processors if p["id"] == starting_processor_id), None)
+            if not start_processor:
+                raise ToolError(f"Starting processor with ID {starting_processor_id} not found")
+            
+            # Build graph and perform traversal to find connected processors
+            processor_map = {p["id"]: p for p in processors}
+            graph = build_graph_structure(processors, connections)
+            
+            # Build a set of processor IDs to include (breadth-first search)
+            included_processors = set([starting_processor_id])
+            to_visit = [starting_processor_id]
+            visited = set()
+            depth = 0
+            
+            while to_visit and depth < max_depth:
+                current_level = to_visit
+                to_visit = []
+                depth += 1
+                
+                for proc_id in current_level:
+                    visited.add(proc_id)
+                    
+                    # Add outgoing connections
+                    if proc_id in graph["outgoing"]:
+                        for conn in graph["outgoing"][proc_id]:
+                            dest_id = conn["destinationId"] if "destinationId" in conn else conn["destination"]["id"]
+                            if dest_id not in visited and dest_id not in to_visit:
+                                included_processors.add(dest_id)
+                                to_visit.append(dest_id)
+                    
+                    # Add incoming connections
+                    if proc_id in graph["incoming"]:
+                        for conn in graph["incoming"][proc_id]:
+                            src_id = conn["sourceId"] if "sourceId" in conn else conn["source"]["id"]
+                            if src_id not in visited and src_id not in to_visit:
+                                included_processors.add(src_id)
+                                to_visit.append(src_id)
+            
+            # Filter processors and connections
+            filtered_processors = [p for p in processors if p["id"] in included_processors]
+            filtered_connections = [
+                c for c in connections if 
+                (c["sourceId"] if "sourceId" in c else c["source"]["id"]) in included_processors and
+                (c["destinationId"] if "destinationId" in c else c["destination"]["id"]) in included_processors
+            ]
+        else:
+            filtered_connections = connections
+        
+        # Enrich processor data with important properties and expressions
+        enriched_processors = []
+        for processor in filtered_processors:
+            proc_data = {
+                "id": processor["id"],
+                "name": processor["component"]["name"],
+                "type": processor["component"]["type"],
+                "state": processor["component"]["state"],
+                "position": processor["position"],
+                "relationships": [r["name"] for r in processor["component"].get("relationships", [])],
+                "validation_status": processor["component"].get("validationStatus", "UNKNOWN")
+            }
+            
+            if include_properties:
+                # Extract and analyze properties
+                property_info = extract_important_properties(processor)
+                proc_data["properties"] = property_info["key_properties"]
+                proc_data["dynamic_properties"] = property_info["dynamic_properties"]
+                
+                # Analyze expressions
+                proc_data["expressions"] = analyze_expressions(property_info["all_properties"])
+            
+            if include_descriptions:
+                proc_data["description"] = processor["component"].get("config", {}).get("comments", "")
+            
+            enriched_processors.append(proc_data)
+        
+        # Build graph structure for the filtered processors
+        processor_map = {p["id"]: p for p in filtered_processors}
+        graph = build_graph_structure(filtered_processors, filtered_connections)
+        
+        # Find common paths and decision points
+        paths = find_source_to_sink_paths(processor_map, graph)
+        decision_points = find_decision_branches(processor_map, graph)
+        
+        # Format connections
+        formatted_connections = [format_connection(c, processor_map) for c in filtered_connections]
+        
+        # Assemble result
+        result = {
+            "processors": enriched_processors,
+            "connections": formatted_connections,
+            "graph_structure": {
+                "outgoing_count": {p_id: len(conns) for p_id, conns in graph["outgoing"].items()},
+                "incoming_count": {p_id: len(conns) for p_id, conns in graph["incoming"].items()}
+            },
+            "common_paths": paths,
+            "decision_points": decision_points
+        }
+        
+        # Include parameter context if available
+        if include_properties:
+            parameters = await nifi_api_client.get_parameter_context(target_pg_id)
+            if parameters:
+                result["parameters"] = parameters
+        
+        return result
+        
+    except (NiFiAuthenticationError, ConnectionError) as e:
+        logger.error(f"API error documenting flow: {e}", exc_info=True)
+        raise ToolError(f"Failed to document NiFi flow: {e}")
+    except Exception as e:
+        logger.error(f"Unexpected error documenting flow: {e}", exc_info=True)
+        raise ToolError(f"An unexpected error occurred while documenting the flow: {e}")
+
+# Run with uvicorn if this module is run directly
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")

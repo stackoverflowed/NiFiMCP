@@ -91,9 +91,20 @@ if prompt := st.chat_input("What would you like to do with NiFi?"):
                 elif provider == "OpenAI":
                     response = get_openai_response(st.session_state.messages)
                 else:
-                    # This case shouldn't be reachable if selectbox is populated
                     response = "Error: Invalid provider selected."
-                st.markdown(response)
+                
+                # Assuming response now includes tools called and token counts
+                tools_called = response.get("tools_called", [])
+                token_count_in = response.get("token_count_in", 0)
+                token_count_out = response.get("token_count_out", 0)
+
+                # Display the response
+                st.markdown(response["content"])  # Assuming response is now a dict with content
+                # Display tools called
+                st.markdown("### Tools Called:")
+                st.markdown(", ".join(tools_called) if tools_called else "No tools called.")
+                st.markdown(f"**Tokens In:** {token_count_in}")
+                st.markdown(f"**Tokens Out:** {token_count_out}")
         
         # Add assistant response to chat history
-        st.session_state.messages.append({"role": "assistant", "content": response}) 
+        st.session_state.messages.append({"role": "assistant", "content": response["content"]}) 
