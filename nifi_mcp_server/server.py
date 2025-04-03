@@ -591,23 +591,54 @@ async def get_tools():
             tools_info = tool_manager.list_tools() # Assuming this returns ToolInfo objects or similar
             
             for tool_info in tools_info: 
-                # Assume tool_info has attributes like name, description, parameters (which is schema)
-                # The structure of tool_info needs confirmation by looking at ToolManager.list_tools source
                 tool_name = getattr(tool_info, 'name', 'unknown')
                 tool_description = getattr(tool_info, 'description', '')
-                parameters_schema = getattr(tool_info, 'parameters', {"type": "object", "properties": {}}) # parameters should be the schema
+                # Extract only the necessary parts for the schema
+                raw_params_schema = getattr(tool_info, 'parameters', {})
                 
-                # Ensure parameters_schema is correctly formatted if it comes directly
-                if not isinstance(parameters_schema, dict) or "type" not in parameters_schema:
-                    logger.warning(f"Tool '{tool_name}' has unexpected parameters format: {parameters_schema}. Skipping schema details.")
-                    parameters_schema = {"type": "object", "properties": {}} # Default to empty if format is wrong
+                # Build the schema explicitly for OpenAI/Gemini compatibility
+                parameters_schema = {
+                    "type": "object",
+                    "properties": {}, # Initialize empty properties
+                }
+                raw_properties = raw_params_schema.get('properties', {})
+                
+                # Iterate through properties and clean them
+                cleaned_properties = {}
+                if isinstance(raw_properties, dict):
+                    for prop_name, prop_schema in raw_properties.items():
+                        if isinstance(prop_schema, dict):
+                            # Create a copy to avoid modifying the original
+                            cleaned_schema = prop_schema.copy()
+                            # Remove problematic fields: anyOf, title, default, etc.
+                            cleaned_schema.pop('anyOf', None) 
+                            cleaned_schema.pop('title', None)
+                            cleaned_schema.pop('default', None)  # Also remove default values
+                            cleaned_properties[prop_name] = cleaned_schema
+                        else:
+                            # Handle cases where a property schema isn't a dict
+                            logger.warning(f"Property '{prop_name}' in tool '{tool_name}' has non-dict schema: {prop_schema}. Skipping property.")
+                
+                parameters_schema["properties"] = cleaned_properties
+                
+                # Only include required if it's non-empty and properties exist
+                required_list = raw_params_schema.get('required', [])
+                if required_list and cleaned_properties: # Only add required if there are properties
+                     parameters_schema["required"] = required_list
+                elif "required" in parameters_schema: # Clean up just in case
+                     del parameters_schema["required"]
+
+                # Remove properties/required fields entirely if properties dict is empty
+                if not parameters_schema["properties"]:
+                     del parameters_schema["properties"]
+                     if "required" in parameters_schema: del parameters_schema["required"]
 
                 formatted_tools.append({
                     "type": "function",
                     "function": {
                         "name": tool_name,
                         "description": tool_description,
-                        "parameters": parameters_schema
+                        "parameters": parameters_schema # Use the cleaned schema
                     }
                 })
             logger.info(f"Returning {len(formatted_tools)} tool definitions via ToolManager.")

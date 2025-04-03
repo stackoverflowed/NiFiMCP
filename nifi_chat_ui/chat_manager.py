@@ -1,3 +1,5 @@
+from __future__ import annotations # Add this import for forward references
+
 # Placeholder for LLM interaction logic 
 
 import google.generativeai as genai
@@ -7,6 +9,29 @@ import streamlit as st # Import streamlit for error messages
 import json
 from typing import List, Dict, Any, Optional
 from mcp_handler import get_available_tools, execute_mcp_tool
+import sys
+
+# Import Gemini types for correct tool formatting
+try:
+    print("DEBUG [chat_manager.py]: Attempting to import google.generativeai.types...")
+    # Try importing the modules first
+    import google.generativeai.types as genai_types 
+    print(f"DEBUG [chat_manager.py]: Imported google.generativeai.types as genai_types: {dir(genai_types)}")
+    # Then access the specific classes
+    Tool = genai_types.Tool
+    FunctionDeclaration = genai_types.FunctionDeclaration
+    print("DEBUG [chat_manager.py]: Successfully accessed Tool, FunctionDeclaration.")
+    gemini_types_imported = True
+except ImportError as e:
+    print(f"ERROR [chat_manager.py]: Failed to import google.generativeai.types: {e}", file=sys.stderr)
+    gemini_types_imported = False
+except AttributeError as e:
+    print(f"ERROR [chat_manager.py]: Failed to access attributes within google.generativeai.types: {e}", file=sys.stderr)
+    gemini_types_imported = False
+except Exception as e:
+    # Catch any other unexpected import errors
+    print(f"ERROR [chat_manager.py]: An unexpected error occurred during google.generativeai.types import: {e}", file=sys.stderr)
+    gemini_types_imported = False
 
 # --- Client Initialization --- #
 gemini_configured = False
@@ -39,37 +64,124 @@ def configure_llms():
 # --- Tool Management --- #
 
 @st.cache_data(ttl=3600)  # Cache tool definitions for 1 hour
-def get_formatted_tool_definitions(provider: str = "openai") -> List[Dict[str, Any]]:
+def get_formatted_tool_definitions(provider: str) -> List[Dict[str, Any]] | List['Tool'] | None:
     """Gets tool definitions from the MCP server and formats them for the specified LLM provider."""
-    tools = get_available_tools()
-    
-    if provider == "openai":
-        # OpenAI already uses the same format as our MCP server
-        return tools
-    elif provider == "gemini":
-        # Convert OpenAI format to Gemini format
-        gemini_tools = []
-        for tool in tools:
-            gemini_tool = {
-                "function_declarations": [{
-                    "name": tool["name"],
-                    "description": tool["description"],
-                    "parameters": tool["parameters"]
-                }]
-            }
-            gemini_tools.append(gemini_tool)
-        return gemini_tools
-    else:
-        raise ValueError(f"Unsupported LLM provider: {provider}")
+    tools = get_available_tools() # This returns list of OpenAI format dicts
+    if not tools:
+        st.warning("Failed to retrieve tools from MCP handler.")
+        return None # Return None if fetching failed
 
-def handle_tool_call(tool_name: str, parameters: Dict[str, Any]) -> Dict[str, Any]:
-    """Executes a tool call and returns the result."""
+    # Debug: Print raw tools received
+    print(f"DEBUG [get_formatted_tool_definitions]: Raw tools from server: {json.dumps(tools, indent=2)}")
+
+    if provider == "openai":
+        # OpenAI format matches our API format directly, but let's clean up the schema
+        cleaned_tools = []
+        for tool in tools:
+            if tool.get("type") == "function" and isinstance(tool.get("function"), dict):
+                function_def = tool["function"]
+                # Clean up parameters if present
+                if "parameters" in function_def and isinstance(function_def["parameters"], dict):
+                    # Remove additionalProperties field which might cause issues
+                    if "additionalProperties" in function_def["parameters"]:
+                        del function_def["parameters"]["additionalProperties"]
+                    
+                    # Also clean properties if present
+                    if "properties" in function_def["parameters"] and isinstance(function_def["parameters"]["properties"], dict):
+                        for prop_name, prop_value in function_def["parameters"]["properties"].items():
+                            if isinstance(prop_value, dict) and "additionalProperties" in prop_value:
+                                del prop_value["additionalProperties"]
+                
+                cleaned_tools.append(tool)
+        
+        print(f"DEBUG [get_formatted_tool_definitions]: Cleaned tools for OpenAI: {json.dumps(cleaned_tools, indent=2)}")
+        return cleaned_tools
+    elif provider == "gemini":
+        if not gemini_types_imported:
+            st.error("Required google-generativeai types (Tool, FunctionDeclaration) could not be imported. Cannot format tools for Gemini.")
+            return None
+        
+        # Convert OpenAI format list to a list containing ONE Gemini Tool object
+        all_declarations = []
+        for tool_data in tools:
+            # Basic validation
+            if not isinstance(tool_data, dict) or tool_data.get("type") != "function" or not isinstance(tool_data.get("function"), dict):
+                st.warning(f"Skipping tool with unexpected format: {tool_data}")
+                continue
+                
+            func_details = tool_data.get("function", {})
+            name = func_details.get("name")
+            description = func_details.get("description")
+            # Parameters should be a dict matching JSON Schema requirements
+            parameters_schema = func_details.get("parameters") 
+            
+            if not name or not description:
+                st.warning(f"Skipping tool with missing name or description: {func_details}")
+                continue
+
+            # Clean up parameters schema for Gemini
+            if parameters_schema and isinstance(parameters_schema, dict):
+                # Remove additionalProperties field which causes issues with Gemini
+                if "additionalProperties" in parameters_schema:
+                    del parameters_schema["additionalProperties"]
+                
+                # Also clean properties if present
+                if "properties" in parameters_schema and isinstance(parameters_schema["properties"], dict):
+                    for prop_name, prop_value in parameters_schema["properties"].items():
+                        if isinstance(prop_value, dict):
+                            # Remove additionalProperties if present
+                            if "additionalProperties" in prop_value:
+                                del prop_value["additionalProperties"]
+                            
+                            # Add default type "string" if no type is specified
+                            if "type" not in prop_value or not prop_value["type"]:
+                                prop_value["type"] = "string"
+                                print(f"DEBUG: Added default type 'string' to property '{prop_name}'")
+                        else:
+                            # If property is empty or not a dict, replace with a basic string type
+                            parameters_schema["properties"][prop_name] = {"type": "string"}
+                            print(f"DEBUG: Replaced empty property '{prop_name}' with string type")
+
+            # Create FunctionDeclaration with cleaned schema
+            declaration = FunctionDeclaration(
+                name=name,
+                description=description,
+                parameters=parameters_schema 
+            )
+            all_declarations.append(declaration)
+            
+        if not all_declarations:
+            st.warning("No valid tool declarations found after formatting for Gemini.")
+            return None
+        
+        # Debug: Print what we're creating for Gemini     
+        print(f"DEBUG [get_formatted_tool_definitions]: Created {len(all_declarations)} FunctionDeclarations for Gemini")
+        # For debugging, print the original schema dict instead of the FunctionDeclaration object
+        if len(all_declarations) > 0 and parameters_schema:
+            print(f"DEBUG: Sample cleaned parameters schema: {json.dumps(parameters_schema, indent=2)}")
+        
+        # Return a list containing one Tool object
+        return [Tool(function_declarations=all_declarations)]
+    else:
+        st.error(f"Unsupported LLM provider for tool formatting: {provider}")
+        return None
+
+def handle_tool_call(tool_name: str, parameters: Dict[str, Any], display_in_ui: bool = False) -> Dict[str, Any]:
+    """Executes a tool call and returns the result.
+    
+    Args:
+        tool_name: The name of the tool to execute
+        parameters: The parameters to pass to the tool
+        display_in_ui: Whether to display the tool call in the UI (should be False when called from within LLM functions)
+    """
     print(f"Executing tool: {tool_name} with parameters: {parameters}")
     
-    # Show the tool call to the user
-    with st.chat_message("assistant"):
-        st.markdown(f"🔧 Using tool: `{tool_name}`")
-        st.json(parameters)
+    # Only show the tool call to the user if explicitly requested
+    # This prevents nested chat messages in Streamlit
+    if display_in_ui:
+        with st.chat_message("assistant"):
+            st.markdown(f"🔧 Using tool: `{tool_name}`")
+            st.json(parameters)
     
     result = execute_mcp_tool(tool_name, parameters)
     
@@ -91,10 +203,12 @@ def get_gemini_response(chat_history: List[Dict[str, str]]) -> str:
             return "Error: Google API Key not configured or configuration failed."
 
     try:
-        model = genai.GenerativeModel('gemini-1.5-pro')  # Using pro for function calling support
+        model = genai.GenerativeModel('gemini-1.5-pro')
         
-        # Get tool definitions in Gemini format
-        tools = get_formatted_tool_definitions("gemini")
+        # Get tool definitions in Gemini format (now returns List[Tool] or None)
+        gemini_tool_config = get_formatted_tool_definitions("gemini")
+        if gemini_tool_config is None:
+            return "Error: Failed to get or format tool definitions for Gemini."
         
         # Convert chat history to Gemini format
         gemini_history = []
@@ -103,39 +217,94 @@ def get_gemini_response(chat_history: List[Dict[str, str]]) -> str:
             if role in ["user", "model"]:
                 gemini_history.append({"role": role, "parts": [msg["content"]]})
 
-        # Make the API call with tools
+        # Debug: Print the structure being sent
+        print(f"DEBUG [get_gemini_response]: Sending History: {json.dumps(gemini_history, indent=2)}")
+        print(f"DEBUG [get_gemini_response]: Sending Tools (count): {len(gemini_tool_config)}")
+        
+        # Make the API call with the correctly formatted tools
         response = model.generate_content(
             gemini_history,
-            tools=tools,
-            tool_choice="auto"
+            tools=gemini_tool_config, # Pass the list[Tool]
+            # tool_config={'function_calling_config': 'AUTO'} # Alternate way for Gemini? Check docs if needed
         )
 
-        # Check if the response includes a tool call
-        if hasattr(response, 'candidates') and response.candidates:
-            for candidate in response.candidates:
-                if hasattr(candidate, 'content') and candidate.content.parts:
-                    for part in candidate.content.parts:
-                        if hasattr(part, 'function_call'):
-                            # Execute the tool call
-                            tool_name = part.function_call.name
-                            parameters = json.loads(part.function_call.args)
-                            tool_result = handle_tool_call(tool_name, parameters)
-                            
-                            # Send tool result back to Gemini
-                            gemini_history.append({
-                                "role": "function",
-                                "parts": [json.dumps(tool_result)],
-                                "name": tool_name
-                            })
-                            
-                            # Get final response
-                            final_response = model.generate_content(gemini_history)
-                            return final_response.text
+        # --- IMPORTANT: Adapt response parsing for Gemini --- 
+        # The way tool calls and results are handled might differ slightly
+        response_content = None
+        function_call_part = None
+        
+        # Safely access candidate and parts
+        try:
+            candidate = response.candidates[0]
+            if candidate.content and candidate.content.parts:
+                 # Check for function call *first*
+                 for part in candidate.content.parts:
+                     if hasattr(part, 'function_call') and part.function_call:
+                          function_call_part = part
+                          break # Found the function call part
+                 # If no function call, assume text content
+                 if not function_call_part:
+                      response_content = candidate.text # Use .text for safe text extraction
+        except (IndexError, AttributeError) as e:
+             print(f"DEBUG: Error parsing Gemini response structure: {e}")
+             # Fallback or default response?
+             response_content = response.text # Attempt to get text anyway
 
-        # If no tool call, return the text directly
-        return response.text
+        # --- Handle Function Call if present ---
+        if function_call_part:
+            function_call = function_call_part.function_call
+            tool_name = function_call.name
+            # Gemini often puts args directly in function_call.args, might not need json.loads
+            parameters = dict(function_call.args) 
+            
+            print(f"DEBUG [get_gemini_response]: Gemini requested tool '{tool_name}' with args: {parameters}")
+            
+            # Execute tool via handler (which uses REST API), don't display in UI from here
+            tool_result_dict = handle_tool_call(tool_name, parameters, display_in_ui=False) 
+            
+            # Convert tool_result_dict to a simple JSON string
+            tool_result_json = json.dumps(tool_result_dict)
+            
+            # Create a NEW history instead of appending to existing one to prevent nesting
+            new_history = gemini_history.copy()
+            
+            # Add a simplified version of the model's response with the function call
+            new_history.append({
+                "role": "model", 
+                "parts": [{"text": f"I'll use the tool {tool_name}({json.dumps(parameters)})"}]
+            })
+            
+            # Add our function response as a simple text string
+            # IMPORTANT: Use "user" role instead of "function" - Gemini only supports "user" and "model" roles
+            new_history.append({
+                "role": "user",  # Changed from "function" to "user"
+                "parts": [{"text": f"Result of {tool_name}: {tool_result_json}"}]
+            })
+
+            # Debug: Print history before second call
+            # Safer JSON serialization by avoiding complex objects
+            history_for_debug = []
+            for msg in new_history:
+                serializable_msg = dict(msg)
+                history_for_debug.append(serializable_msg)
+            print(f"DEBUG [get_gemini_response]: Sending History (Post-Tool Call): {json.dumps(history_for_debug, indent=2)}")
+
+            # Get final response from Gemini after providing tool result
+            final_response = model.generate_content(new_history)
+            return final_response.text # Safely get text content
+            
+        # If no tool call, return the initial text content
+        elif response_content is not None:
+            return response_content
+        else:
+             # Handle cases where response is empty or unexpected
+             print(f"DEBUG: Unexpected Gemini response structure: {response}")
+             st.error("Received an unexpected or empty response from Gemini.")
+             return "Sorry, I received an unexpected response from Gemini."
 
     except Exception as e:
+        import traceback
+        traceback.print_exc()  # Print full traceback for better debugging
         st.error(f"An error occurred while contacting the Gemini API: {e}")
         return f"Sorry, I encountered an error while trying to get a response from Gemini: {e}"
 
@@ -151,57 +320,96 @@ def get_openai_response(chat_history: List[Dict[str, str]]) -> str:
     try:
         # Get tool definitions in OpenAI format
         tools = get_formatted_tool_definitions("openai")
+        if not tools:
+            return "Error: Failed to get or format tool definitions for OpenAI."
         
-        # Prepare messages for OpenAI
+        # Prepare messages for OpenAI - just use the basic history
         messages_for_openai = [
             {"role": msg["role"], "content": msg["content"]}
             for msg in chat_history
         ]
 
-        # Make the API call with tools
+        print(f"DEBUG [get_openai_response]: Initial call with {len(messages_for_openai)} messages")
+        print(f"DEBUG [get_openai_response]: Messages: {json.dumps(messages_for_openai, indent=2)}")
+        print(f"DEBUG [get_openai_response]: Tools: {json.dumps(tools, indent=2)}")
+        
+        # Initial API call with tools
         completion = openai_client.chat.completions.create(
-            model="gpt-3.5-turbo-0125",  # Using a version that supports tools
+            model="gpt-3.5-turbo-0125",
             messages=messages_for_openai,
             tools=tools,
             tool_choice="auto"
         )
         
-        # Check if the response includes a tool call
+        # Get response message 
         response_message = completion.choices[0].message
-        if response_message.tool_calls:
-            # Handle each tool call in sequence
-            for tool_call in response_message.tool_calls:
-                tool_name = tool_call.function.name
-                parameters = json.loads(tool_call.function.arguments)
-                
-                # Execute the tool
-                tool_result = handle_tool_call(tool_name, parameters)
-                
-                # Add the tool call and result to the conversation
-                messages_for_openai.append({
-                    "role": "assistant",
-                    "content": None,
-                    "tool_calls": [
-                        {
-                            "id": tool_call.id,
-                            "function": {"name": tool_name, "arguments": json.dumps(parameters)}
-                        }
-                    ]
-                })
-                messages_for_openai.append({
-                    "role": "tool",
-                    "content": json.dumps(tool_result),
-                    "tool_call_id": tool_call.id
-                })
-            
-            # Get final response after tool calls
-            final_completion = openai_client.chat.completions.create(
-                model="gpt-3.5-turbo-0125",
-                messages=messages_for_openai
-            )
-            return final_completion.choices[0].message.content
         
-        # If no tool call, return the content directly
+        # If no tool calls, return the content directly
+        if not hasattr(response_message, 'tool_calls') or not response_message.tool_calls:
+            return response_message.content
+            
+        print(f"DEBUG [get_openai_response]: Assistant requested tool(s): {len(response_message.tool_calls)}")
+        
+        # We have tool calls - handle them
+        # Simplified: Just process the first tool call for now
+        # In a real app, you might want to handle multiple tool calls
+        if len(response_message.tool_calls) > 0:
+            # Extract just what we need from the first tool call
+            tool_call = response_message.tool_calls[0]
+            tool_name = tool_call.function.name
+            try:
+                parameters = json.loads(tool_call.function.arguments)
+            except json.JSONDecodeError as e:
+                print(f"ERROR: Could not parse tool arguments: {e}")
+                return f"I tried to use a tool but encountered an error parsing the arguments: {e}"
+                
+            tool_call_id = tool_call.id
+            
+            # Execute the tool (don't display in UI from here)
+            tool_result = handle_tool_call(tool_name, parameters, display_in_ui=False)
+            
+            # Create a completely new message array with original history
+            second_messages = messages_for_openai.copy()
+            
+            # Add the assistant's request with the tool call
+            # Make sure to use a valid format that won't cause nesting issues
+            second_messages.append({
+                "role": "assistant",
+                "content": None,  # Must be None when tool_calls is present
+                "tool_calls": [{
+                    "id": tool_call_id,
+                    "type": "function",
+                    "function": {
+                        "name": tool_name,
+                        "arguments": json.dumps(parameters)  # Use parameter dict and convert to JSON
+                    }
+                }]
+            })
+            
+            # Add the tool response
+            second_messages.append({
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "content": json.dumps(tool_result)  # Convert result to json string
+            })
+            
+            print(f"DEBUG [get_openai_response]: Second call with {len(second_messages)} messages including tool result")
+            print(f"DEBUG [get_openai_response]: Second call messages: {json.dumps(second_messages, indent=2)}")
+            
+            # Make second API call with tool results
+            try:
+                final_completion = openai_client.chat.completions.create(
+                    model="gpt-3.5-turbo-0125",
+                    messages=second_messages
+                )
+                return final_completion.choices[0].message.content
+            except Exception as e:
+                print(f"ERROR in second API call: {e}")
+                st.error(f"Error in follow-up API call: {e}")
+                # Return a fallback response or the original content
+                return response_message.content or "I encountered an error processing the tool results."
+                
+        # Fallback - return original content if no valid tool calls processed
         return response_message.content
 
     except Exception as e:
