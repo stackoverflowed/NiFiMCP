@@ -21,25 +21,28 @@ except ImportError:
 
 # Import Gemini types for correct tool formatting
 try:
-    print("DEBUG [chat_manager.py]: Attempting to import google.generativeai.types...")
     # Try importing the modules first
     import google.generativeai.types as genai_types 
-    print(f"DEBUG [chat_manager.py]: Imported google.generativeai.types as genai_types: {dir(genai_types)}")
     # Then access the specific classes
     Tool = genai_types.Tool
     FunctionDeclaration = genai_types.FunctionDeclaration
-    print("DEBUG [chat_manager.py]: Successfully accessed Tool, FunctionDeclaration.")
     gemini_types_imported = True
 except ImportError as e:
     print(f"ERROR [chat_manager.py]: Failed to import google.generativeai.types: {e}", file=sys.stderr)
     gemini_types_imported = False
+    Tool = None
+    FunctionDeclaration = None
 except AttributeError as e:
     print(f"ERROR [chat_manager.py]: Failed to access attributes within google.generativeai.types: {e}", file=sys.stderr)
     gemini_types_imported = False
+    Tool = None
+    FunctionDeclaration = None
 except Exception as e:
     # Catch any other unexpected import errors
     print(f"ERROR [chat_manager.py]: An unexpected error occurred during google.generativeai.types import: {e}", file=sys.stderr)
     gemini_types_imported = False
+    Tool = None
+    FunctionDeclaration = None
 
 # --- Client Initialization --- #
 gemini_configured = False
@@ -52,7 +55,6 @@ def configure_llms():
         try:
             genai.configure(api_key=config.GOOGLE_API_KEY)
             gemini_configured = True
-            print("DEBUG [chat_manager.py]: Gemini configured.") # Add debug print
         except Exception as e:
             st.warning(f"Failed to configure Gemini: {e}")
             gemini_configured = False
@@ -60,7 +62,6 @@ def configure_llms():
     if config.OPENAI_API_KEY and openai_client is None:
         try:
             openai_client = OpenAI(api_key=config.OPENAI_API_KEY)
-            print("DEBUG [chat_manager.py]: OpenAI client initialized.") # Add debug print
         except Exception as e:
             st.warning(f"Failed to initialize OpenAI client: {e}")
             openai_client = None
@@ -71,16 +72,19 @@ def configure_llms():
 
 # --- Tool Management --- #
 
-@st.cache_data(ttl=3600)  # Cache tool definitions for 1 hour
-def get_formatted_tool_definitions(provider: str) -> List[Dict[str, Any]] | List['Tool'] | None:
+# @st.cache_data(ttl=3600)  # Cache tool definitions for 1 hour
+def get_formatted_tool_definitions(provider: str) -> List[Dict[str, Any]] | List["genai_types.FunctionDeclaration"] | None:
     """Gets tool definitions from the MCP server and formats them for the specified LLM provider."""
+    global FunctionDeclaration  # Make FunctionDeclaration accessible in function scope
+    
+    # Convert provider to lowercase for case-insensitive comparison
+    provider = provider.lower()
+    
     tools = get_available_tools() # This returns list of OpenAI format dicts
+    
     if not tools:
         st.warning("Failed to retrieve tools from MCP handler.")
         return None # Return None if fetching failed
-
-    # Debug: Print raw tools received
-    print(f"DEBUG [get_formatted_tool_definitions]: Raw tools from server: {json.dumps(tools, indent=2)}")
 
     if provider == "openai":
         # OpenAI format matches our API format directly, but let's clean up the schema
@@ -102,74 +106,105 @@ def get_formatted_tool_definitions(provider: str) -> List[Dict[str, Any]] | List
                 
                 cleaned_tools.append(tool)
         
-        print(f"DEBUG [get_formatted_tool_definitions]: Cleaned tools for OpenAI: {json.dumps(cleaned_tools, indent=2)}")
         return cleaned_tools
     elif provider == "gemini":
         if not gemini_types_imported:
             st.error("Required google-generativeai types (Tool, FunctionDeclaration) could not be imported. Cannot format tools for Gemini.")
             return None
+            
+        if not FunctionDeclaration:
+            st.error("FunctionDeclaration is not available. Cannot format tools for Gemini.")
+            return None
         
-        # Convert OpenAI format list to a list containing ONE Gemini Tool object
+        # Convert OpenAI format list to a list containing Gemini FunctionDeclaration objects
         all_declarations = []
+        
         for tool_data in tools:
-            # Basic validation
-            if not isinstance(tool_data, dict) or tool_data.get("type") != "function" or not isinstance(tool_data.get("function"), dict):
-                st.warning(f"Skipping tool with unexpected format: {tool_data}")
-                continue
-                
             func_details = tool_data.get("function", {})
             name = func_details.get("name")
             description = func_details.get("description")
-            # Parameters should be a dict matching JSON Schema requirements
             parameters_schema = func_details.get("parameters") 
             
             if not name or not description:
-                st.warning(f"Skipping tool with missing name or description: {func_details}")
                 continue
-
-            # Clean up parameters schema for Gemini
-            if parameters_schema and isinstance(parameters_schema, dict):
-                # Remove additionalProperties field which causes issues with Gemini
-                if "additionalProperties" in parameters_schema:
-                    del parameters_schema["additionalProperties"]
                 
-                # Also clean properties if present
-                if "properties" in parameters_schema and isinstance(parameters_schema["properties"], dict):
-                    for prop_name, prop_value in parameters_schema["properties"].items():
-                        if isinstance(prop_value, dict):
-                            # Remove additionalProperties if present
-                            if "additionalProperties" in prop_value:
-                                del prop_value["additionalProperties"]
-                            
-                            # Add default type "string" if no type is specified
-                            if "type" not in prop_value or not prop_value["type"]:
-                                prop_value["type"] = "string"
-                                print(f"DEBUG: Added default type 'string' to property '{prop_name}'")
-                        else:
-                            # If property is empty or not a dict, replace with a basic string type
-                            parameters_schema["properties"][prop_name] = {"type": "string"}
-                            print(f"DEBUG: Replaced empty property '{prop_name}' with string type")
+            # Clean up parameters schema for Gemini
+            cleaned_schema = parameters_schema.copy() if parameters_schema else {}
+            if isinstance(cleaned_schema, dict):
+                # Always set top-level type to OBJECT if it has properties
+                if "properties" in cleaned_schema:
+                    cleaned_schema["type"] = "OBJECT"
+                
+                # Recursively clean properties and array items
+                def clean_gemini_schema(schema_node):
+                    if not isinstance(schema_node, dict):
+                        return schema_node
 
-            # Create FunctionDeclaration with cleaned schema
-            declaration = FunctionDeclaration(
-                name=name,
-                description=description,
-                parameters=parameters_schema 
-            )
-            all_declarations.append(declaration)
+                    # Remove problematic fields
+                    schema_node.pop("additionalProperties", None)
+                    
+                    # Handle properties
+                    if "properties" in schema_node:
+                        # If we have properties, this must be an OBJECT type
+                        schema_node["type"] = "OBJECT"
+                        props = schema_node["properties"]
+                        for prop_name, prop_value in list(props.items()): # Use list for safe iteration
+                            if isinstance(prop_value, dict):
+                                # Clean nested schema
+                                props[prop_name] = clean_gemini_schema(prop_value.copy())
+                                # Ensure type is specified
+                                if "type" not in props[prop_name]:
+                                    if "properties" in props[prop_name]:
+                                        props[prop_name]["type"] = "OBJECT"
+                                    elif "items" in props[prop_name]:
+                                        props[prop_name]["type"] = "ARRAY"
+                                    else:
+                                        props[prop_name]["type"] = "STRING"
+                                # Convert type to uppercase for Gemini
+                                if "type" in props[prop_name]:
+                                    props[prop_name]["type"] = props[prop_name]["type"].upper()
+                            else:
+                                # Non-dict properties default to STRING type
+                                props[prop_name] = {"type": "STRING"}
+                    
+                    # Handle arrays
+                    if "items" in schema_node:
+                        schema_node["type"] = "ARRAY"
+                        if isinstance(schema_node["items"], dict):
+                            schema_node["items"] = clean_gemini_schema(schema_node["items"].copy())
+                    
+                    # Ensure type is uppercase for Gemini
+                    if "type" in schema_node:
+                        schema_node["type"] = schema_node["type"].upper()
+                    elif not any(key in schema_node for key in ["properties", "items", "enum"]):
+                        # If no type and no complex structure, default to STRING
+                        schema_node["type"] = "STRING"
+                    
+                    return schema_node
+
+                cleaned_schema = clean_gemini_schema(cleaned_schema)
+                # Use a different variable name to avoid confusion if cleaning returns None unexpectedly
+                schema_to_use = cleaned_schema if cleaned_schema is not None else {"type": "OBJECT", "properties": {}}
+
+            # Create FunctionDeclaration with the fully cleaned schema
+            try:
+                 declaration = FunctionDeclaration(
+                     name=name,
+                     description=description,
+                     parameters=schema_to_use # Use the cleaned schema 
+                 )
+                 all_declarations.append(declaration)
+            except Exception as decl_error:
+                 print(f"ERROR creating FunctionDeclaration for '{name}': {decl_error}", file=sys.stderr)
+                 print(f"Schema that caused error: {json.dumps(schema_to_use, indent=2)}", file=sys.stderr)
+                 st.warning(f"Skipping tool '{name}' due to schema error during FunctionDeclaration creation: {decl_error}")
+                 continue # Skip to the next tool
             
         if not all_declarations:
             st.warning("No valid tool declarations found after formatting for Gemini.")
             return None
         
-        # Debug: Print what we're creating for Gemini     
-        print(f"DEBUG [get_formatted_tool_definitions]: Created {len(all_declarations)} FunctionDeclarations for Gemini")
-        # For debugging, print the original schema dict instead of the FunctionDeclaration object
-        if len(all_declarations) > 0 and parameters_schema:
-            print(f"DEBUG: Sample cleaned parameters schema: {json.dumps(parameters_schema, indent=2)}")
-        
-        # Return a list containing one Tool object
-        return [Tool(function_declarations=all_declarations)]
+        return all_declarations
     else:
         st.error(f"Unsupported LLM provider for tool formatting: {provider}")
         return None
@@ -221,335 +256,296 @@ def count_tokens_gemini(text: str) -> int:
     return len(text) // 4
 
 def calculate_input_tokens(messages: List[Dict], provider: str) -> int:
-    """Calculate input tokens more accurately based on all messages"""
-    if not messages:
-        return 0
-    
-    # Serialize the entire message array to count all content
-    serialized = json.dumps(messages)
-    
-    if provider.lower() == "openai":
-        return count_tokens_openai(serialized)
-    else:  # gemini
-        return count_tokens_gemini(serialized)
+    """Calculates the token count for the input messages."""
+    total_tokens = 0
+    if provider == "openai":
+        # Ensure tiktoken is available
+        if not tiktoken_available:
+            print("Warning: tiktoken not available for precise OpenAI token counting.")
+            return 0 # Or fallback to estimation
+            
+        # Select the appropriate model, default to gpt-3.5-turbo if unknown
+        # This might need adjustment based on the actual model used in get_openai_response
+        model = "gpt-3.5-turbo" # Make this dynamic if possible later
+        try:
+            encoding = tiktoken.encoding_for_model(model)
+            for message in messages:
+                # Add tokens for role and content, plus overhead per message
+                # Ref: https://github.com/openai/openai-cookbook/blob/main/examples/How_to_count_tokens_with_tiktoken.ipynb
+                total_tokens += 4 # Every message follows <|im_start|>{role/name}\n{content}<|im_end|>
+
+                for key, value in message.items():
+                    if value: # Ensure value is not None
+                         total_tokens += len(encoding.encode(str(value))) # Encode content/role/etc.
+                    if key == "name": # If there's a name, the role is omitted
+                        total_tokens -= 1 # Role is always required and always 1 token
+            total_tokens += 2 # Every reply is primed with <|im_start|>assistant -> Adjust if needed
+            return total_tokens
+        except Exception as e:
+            print(f"Error calculating OpenAI tokens: {e}")
+            return 0 # Return 0 on error
+            
+    elif provider == "gemini":
+        # Gemini token counting is simpler via API, but requires making a call.
+        # For a rough estimate, we can count characters or use a basic word count.
+        # Let's use a character count heuristic for now.
+        # A more accurate way would be to call model.count_tokens(messages) if needed later.
+        total_chars = sum(len(str(msg.get("content", ""))) for msg in messages)
+        return total_chars // 4 # Very rough estimate: 1 token ~ 4 chars
+    else:
+        return 0 # Unknown provider
 
 # --- LLM Response Handling --- #
 
-def get_gemini_response(chat_history: List[Dict[str, str]]) -> Dict[str, Any]:
-    """Gets a response from the Gemini model based on the chat history."""
-    global gemini_configured
+def get_gemini_response(messages: List[Dict[str, Any]], system_prompt: str, tools: List["genai_types.FunctionDeclaration"] | None) -> Dict[str, Any]:
+    """Gets a response from the Gemini model, handling potential tool calls.
+
+    Args:
+        messages: The chat history (list of dicts with 'role' and 'content').
+        system_prompt: The system prompt string.
+        tools: Formatted tool definitions for Gemini (List[FunctionDeclaration] or None).
+
+    Returns:
+        A dictionary containing:
+            - 'content': The textual response (str) or None.
+            - 'tool_calls': A list of requested tool calls ([{'name':..., 'arguments':...}]) or None.
+            - 'token_count_in': Estimated input tokens.
+            - 'token_count_out': Estimated output tokens.
+    """
+    configure_llms() # Ensure client is configured
     if not gemini_configured:
-        # Attempt to reconfigure if key was added after startup
-        configure_llms()
-        if not gemini_configured:
-            return {"error": "Error: Google API Key not configured or configuration failed."}
+        return {"content": "Error: Gemini client not configured. Check API key.", "tool_calls": None, "token_count_in": 0, "token_count_out": 0}
+
+    # Use configured model from config.py
+    model_name = config.GEMINI_MODEL
+
+    # Convert message history to Gemini format
+    gemini_history = []
+    for msg in messages:
+        role = msg.get("role")
+        content = msg.get("content", "") # Ensure content is a string
+        
+        # Attempt to handle potential FunctionCall/FunctionResponse formats if they appear
+        # This might need refinement based on exactly how results are stored in messages
+        if isinstance(content, dict) and 'function_call' in content: 
+             # This was likely an older format, adapt if needed.
+             # Current loop expects results formatted as simple assistant messages.
+             continue
+             
+        # Map roles: user -> user, assistant -> model
+        mapped_role = "user" if role == "user" else "model"
+        
+        # Basic structure: {"role": ..., "parts": [{"text": ...}]}
+        # Handle potential tool results embedded in content (simple string format expected from app.py)
+        gemini_history.append({"role": mapped_role, "parts": [{"text": str(content)}]})
+
+    # Ensure history is not empty
+    if not gemini_history:
+         return {"content": "Error: Cannot generate response from empty or invalid history.", "tool_calls": None, "token_count_in": 0, "token_count_out": 0}
 
     try:
-        model = genai.GenerativeModel('gemini-1.5-pro')
-        
-        # Get tool definitions in Gemini format (now returns List[Tool] or None)
-        gemini_tool_config = get_formatted_tool_definitions("gemini")
-        if gemini_tool_config is None:
-            return {"error": "Error: Failed to get or format tool definitions for Gemini."}
-        
-        # Convert chat history to Gemini format
-        gemini_history = []
-        for msg in chat_history:
-            role = "model" if msg["role"] == "assistant" else msg["role"]
-            if role in ["user", "model"]:
-                gemini_history.append({"role": role, "parts": [msg["content"]]})
+        # Initialize the model with system prompt
+        model = genai.GenerativeModel(
+            model_name=model_name,
+            system_instruction=system_prompt 
+        )
 
-        # Debug: Print the structure being sent
-        print(f"DEBUG [get_gemini_response]: Sending History: {json.dumps(gemini_history, indent=2)}")
-        print(f"DEBUG [get_gemini_response]: Sending Tools (count): {len(gemini_tool_config)}")
-        
-        # Make the API call with the correctly formatted tools
+        # --- Generate Content ---
         response = model.generate_content(
             gemini_history,
-            tools=gemini_tool_config, # Pass the list[Tool]
-            # tool_config={'function_calling_config': 'AUTO'} # Alternate way for Gemini? Check docs if needed
+            tools=tools, # Pass the formatted tools
         )
 
-        # --- IMPORTANT: Adapt response parsing for Gemini --- 
-        # The way tool calls and results are handled might differ slightly
+        # --- Process Response ---
         response_content = None
-        function_call_part = None
-        
-        # Safely access candidate and parts
-        try:
-            candidate = response.candidates[0]
-            if candidate.content and candidate.content.parts:
-                 # Check for function call *first*
-                 for part in candidate.content.parts:
-                     if hasattr(part, 'function_call') and part.function_call:
-                          function_call_part = part
-                          break # Found the function call part
-                 # If no function call, assume text content
-                 if not function_call_part:
-                      response_content = candidate.text # Use .text for safe text extraction
-        except (IndexError, AttributeError) as e:
-             print(f"DEBUG: Error parsing Gemini response structure: {e}")
-             # Fallback or default response?
-             response_content = response.text # Attempt to get text anyway
+        response_tool_calls = []
 
-        # --- Handle Function Call if present ---
-        if function_call_part:
-            function_call = function_call_part.function_call
-            tool_name = function_call.name
-            # Gemini often puts args directly in function_call.args, might not need json.loads
-            parameters = dict(function_call.args) 
-            
-            print(f"DEBUG [get_gemini_response]: Gemini requested tool '{tool_name}' with args: {parameters}")
-            
-            # Execute tool via handler (which uses REST API), don't display in UI from here
-            tool_result_dict = handle_tool_call(tool_name, parameters, display_in_ui=False) 
-            
-            # Convert tool_result_dict to a simple JSON string
-            tool_result_json = json.dumps(tool_result_dict)
-            
-            # Create a NEW history instead of appending to existing one to prevent nesting
-            new_history = gemini_history.copy()
-            
-            # Add a simplified version of the model's response with the function call
-            new_history.append({
-                "role": "model", 
-                "parts": [{"text": f"I'll use the tool {tool_name}({json.dumps(parameters)})"}]
-            })
-            
-            # Add our function response as a simple text string
-            # IMPORTANT: Use "user" role instead of "function" - Gemini only supports "user" and "model" roles
-            new_history.append({
-                "role": "user",  # Changed from "function" to "user"
-                "parts": [{"text": f"Result of {tool_name}: {tool_result_json}"}]
-            })
+        # Check for function calls in the response parts
+        # Use response.candidates[0].content.parts
+        if response.candidates and response.candidates[0].content and response.candidates[0].content.parts:
+            for part in response.candidates[0].content.parts:
+                if part.function_call:
+                    fc = part.function_call
+                    # Convert arguments Struct to dict
+                    args_dict = {key: value for key, value in fc.args.items()}
+                    response_tool_calls.append({
+                        "name": fc.name,
+                        "arguments": args_dict
+                    })
+                elif part.text:
+                    response_content = part.text
 
-            # Debug: Print history before second call
-            # Safer JSON serialization by avoiding complex objects
-            history_for_debug = []
-            for msg in new_history:
-                serializable_msg = dict(msg)
-                history_for_debug.append(serializable_msg)
-            print(f"DEBUG [get_gemini_response]: Sending History (Post-Tool Call): {json.dumps(history_for_debug, indent=2)}")
+        # Calculate token counts (using heuristics for now)
+        input_tokens = calculate_input_tokens(messages, "gemini")
+        output_tokens = count_tokens_gemini(response_content or "") 
+        # Add heuristic token count for tool calls if any
+        if response_tool_calls:
+             output_tokens += count_tokens_gemini(json.dumps(response_tool_calls)) # Rough estimate
 
-            # Get final response from Gemini after providing tool result
-            final_response = model.generate_content(new_history)
-
-            # After processing the response
-            tools_called = []  # Collect tools called
-            
-            # More accurate token counting
-            # Input tokens - include all history plus the tool declarations
-            gemini_history_str = json.dumps(gemini_history)
-            tool_declaration_str = json.dumps(str(gemini_tool_config))  # Convert tool config to string for counting
-            token_count_in = count_tokens_gemini(gemini_history_str + tool_declaration_str)
-            
-            # Output tokens - include both the initial response and final response
-            initial_request_str = str(function_call_part) if function_call_part else ""
-            tool_result_str = tool_result_json if 'tool_result_json' in locals() else ""
-            final_response_str = final_response.text if hasattr(final_response, 'text') else ""
-            token_count_out = count_tokens_gemini(initial_request_str + tool_result_str + final_response_str)
-
-            # If a tool call was made, add it to tools_called
-            if function_call_part:
-                tools_called.append(function_call_part.function_call.name)
-
-            return {
-                "content": final_response.text or "No response content.",
-                "tools_called": tools_called,
-                "token_count_in": token_count_in,
-                "token_count_out": token_count_out
-            }
-            
-        # If no tool call, return the initial text content
-        elif response_content is not None:
-            # After processing the response
-            tools_called = []  # Collect tools called
-            
-            # More accurate token counting
-            # Input tokens - include all history plus the tool declarations
-            gemini_history_str = json.dumps(gemini_history)
-            tool_declaration_str = json.dumps(str(gemini_tool_config))  # Convert tool config to string for counting
-            token_count_in = count_tokens_gemini(gemini_history_str + tool_declaration_str)
-            
-            # Output tokens - the response content
-            token_count_out = count_tokens_gemini(response_content)
-
-            # If a tool call was made, add it to tools_called
-            if function_call_part:
-                tools_called.append(function_call_part.function_call.name)
-
-            return {
-                "content": response_content or "No response content.",
-                "tools_called": tools_called,
-                "token_count_in": token_count_in,
-                "token_count_out": token_count_out
-            }
-        else:
-             # Handle cases where response is empty or unexpected
-             print(f"DEBUG: Unexpected Gemini response structure: {response}")
-             st.error("Received an unexpected or empty response from Gemini.")
-             return {"error": "Sorry, I received an unexpected response from Gemini."}
-
-    except Exception as e:
-        import traceback
-        traceback.print_exc()  # Print full traceback for better debugging
-        st.error(f"An error occurred while contacting the Gemini API: {e}")
-        return {"error": f"Sorry, I encountered an error while trying to get a response from Gemini: {e}"}
-
-def get_openai_response(chat_history: List[Dict[str, str]]) -> Dict[str, Any]:
-    """Gets a response from the OpenAI model."""
-    global openai_client
-    if openai_client is None:
-        # Attempt to reconfigure if key was added after startup
-        configure_llms()
-        if openai_client is None:
-            return {"error": "Error: OpenAI API Key not configured or client initialization failed."}
-
-    try:
-        # Get tool definitions in OpenAI format
-        tools = get_formatted_tool_definitions("openai")
-        if not tools:
-            return {"error": "Error: Failed to get or format tool definitions for OpenAI."}
-        
-        # Prepare messages for OpenAI - just use the basic history
-        messages_for_openai = [
-            {"role": msg["role"], "content": msg["content"]}
-            for msg in chat_history
-        ]
-
-        print(f"DEBUG [get_openai_response]: Initial call with {len(messages_for_openai)} messages")
-        print(f"DEBUG [get_openai_response]: Messages: {json.dumps(messages_for_openai, indent=2)}")
-        print(f"DEBUG [get_openai_response]: Tools: {json.dumps(tools, indent=2)}")
-        
-        # Initial API call with tools
-        completion = openai_client.chat.completions.create(
-            model="gpt-3.5-turbo-0125",
-            messages=messages_for_openai,
-            tools=tools,
-            tool_choice="auto"
-        )
-        
-        # Get response message 
-        response_message = completion.choices[0].message
-        
-        # If no tool calls, return the content directly
-        if not hasattr(response_message, 'tool_calls') or not response_message.tool_calls:
-            return {
-                "content": response_message.content,
-                "tools_called": [],
-                "token_count_in": len(" ".join([msg["content"] for msg in chat_history])),
-                "token_count_out": len(response_message.content.split())
-            }
-            
-        print(f"DEBUG [get_openai_response]: Assistant requested tool(s): {len(response_message.tool_calls)}")
-        
-        # We have tool calls - handle them
-        # Simplified: Just process the first tool call for now
-        # In a real app, you might want to handle multiple tool calls
-        if len(response_message.tool_calls) > 0:
-            # Extract just what we need from the first tool call
-            tool_call = response_message.tool_calls[0]
-            tool_name = tool_call.function.name
-            try:
-                parameters = json.loads(tool_call.function.arguments)
-            except json.JSONDecodeError as e:
-                print(f"ERROR: Could not parse tool arguments: {e}")
-                return {"error": f"I tried to use a tool but encountered an error parsing the arguments: {e}"}
-                
-            tool_call_id = tool_call.id
-            
-            # Execute the tool (don't display in UI from here)
-            tool_result = handle_tool_call(tool_name, parameters, display_in_ui=False)
-            
-            # Create a completely new message array with original history
-            second_messages = messages_for_openai.copy()
-            
-            # Add the assistant's request with the tool call
-            # Make sure to use a valid format that won't cause nesting issues
-            second_messages.append({
-                "role": "assistant",
-                "content": None,  # Must be None when tool_calls is present
-                "tool_calls": [{
-                    "id": tool_call_id,
-                    "type": "function",
-                    "function": {
-                        "name": tool_name,
-                        "arguments": json.dumps(parameters)  # Use parameter dict and convert to JSON
-                    }
-                }]
-            })
-            
-            # Add the tool response
-            second_messages.append({
-                "role": "tool",
-                "tool_call_id": tool_call_id,
-                "content": json.dumps(tool_result)  # Convert result to json string
-            })
-            
-            print(f"DEBUG [get_openai_response]: Second call with {len(second_messages)} messages including tool result")
-            print(f"DEBUG [get_openai_response]: Second call messages: {json.dumps(second_messages, indent=2)}")
-            
-            # Make second API call with tool results
-            try:
-                final_completion = openai_client.chat.completions.create(
-                    model="gpt-3.5-turbo-0125",
-                    messages=second_messages
-                )
-                response_content = final_completion.choices[0].message.content
-            except Exception as e:
-                print(f"ERROR in second API call: {e}")
-                st.error(f"Error in follow-up API call: {e}")
-                # Return a fallback response or the original content
-                response_content = response_message.content or "I encountered an error processing the tool results."
-
-            # After processing the response
-            tools_called = []  # Collect tools called
-            
-            # Calculate token counts more accurately
-            # Get token counts from the API response if available
-            if hasattr(final_completion, 'usage'):
-                token_count_in = final_completion.usage.prompt_tokens
-                token_count_out = final_completion.usage.completion_tokens
-            else:
-                # Fallback to manual counting
-                # Input tokens - include all messages and tool definitions
-                all_messages_str = json.dumps(second_messages)
-                tools_str = json.dumps(tools)
-                token_count_in = count_tokens_openai(all_messages_str + tools_str)
-                # Output tokens - the final response
-                token_count_out = count_tokens_openai(response_content)
-
-            # If a tool call was made, add it to tools_called
-            if hasattr(response_message, 'tool_calls') and response_message.tool_calls:
-                for tool_call in response_message.tool_calls:
-                    tools_called.append(tool_call.function.name)
-
-            return {
-                "content": response_content,
-                "tools_called": tools_called,
-                "token_count_in": token_count_in,
-                "token_count_out": token_count_out
-            }
-                
-        # Fallback - return original content if no valid tool calls processed
-        # Calculate token counts more accurately
-        if hasattr(completion, 'usage'):
-            token_count_in = completion.usage.prompt_tokens
-            token_count_out = completion.usage.completion_tokens
-        else:
-            # Fallback to manual counting
-            all_messages_str = json.dumps(messages_for_openai)
-            tools_str = json.dumps(tools)
-            token_count_in = count_tokens_openai(all_messages_str + tools_str)
-            token_count_out = count_tokens_openai(response_message.content)
-            
-        return {
-            "content": response_message.content,
-            "tools_called": [],
-            "token_count_in": token_count_in,
-            "token_count_out": token_count_out
+        final_response = {
+            "content": response_content,
+            "tool_calls": response_tool_calls if response_tool_calls else None,
+            "token_count_in": input_tokens,
+            "token_count_out": output_tokens
         }
+        return final_response
 
     except Exception as e:
-        st.error(f"An error occurred while contacting the OpenAI API: {e}")
-        return {"error": f"Sorry, I encountered an error while trying to get a response from OpenAI: {e}"} 
+        st.error(f"Error calling Gemini API: {e}")
+        print(f"ERROR [get_gemini_response]: Gemini API call failed: {e}", file=sys.stderr)
+        # Print details if available (e.g., response parts if error occurred during processing)
+        try:
+             # Ensure 'response' exists before accessing attributes
+             if 'response' in locals() and response and response.prompt_feedback:
+                  print(f"Gemini Safety Feedback: {response.prompt_feedback}", file=sys.stderr)
+        except Exception as report_err:
+             print(f"ERROR reporting Gemini error details: {report_err}", file=sys.stderr)
+        return {"content": f"Error communicating with Gemini: {e}", "tool_calls": None, "token_count_in": 0, "token_count_out": 0}
+
+def get_openai_response(messages: List[Dict[str, Any]], system_prompt: str, tools: List[Dict[str, Any]] | None) -> Dict[str, Any]:
+    """Gets a response from the OpenAI model, handling potential tool calls.
+
+    Args:
+        messages: The chat history (list of dicts with 'role' and 'content', potentially including tool results).
+        system_prompt: The system prompt string.
+        tools: Formatted tool definitions for OpenAI (List[Dict] or None).
+
+    Returns:
+        A dictionary containing:
+            - 'content': The textual response (str) or None.
+            - 'tool_calls': A list of requested tool calls ([{'name':..., 'arguments':...}]) or None.
+            - 'token_count_in': Input tokens (prompt_tokens).
+            - 'token_count_out': Output tokens (completion_tokens).
+    """
+    configure_llms()  # Ensure client is configured
+    if not openai_client:
+        return {"content": "Error: OpenAI client not configured. Check API key.", "tool_calls": None, "token_count_in": 0, "token_count_out": 0}
+
+    # Use configured model from config.py
+    model = config.OPENAI_MODEL
+
+    # --- Prepare messages for OpenAI API --- 
+    openai_messages = []
+    if system_prompt:
+        openai_messages.append({"role": "system", "content": system_prompt})
+
+    for msg in messages:
+        role = msg.get("role")
+        content = msg.get("content")
+
+        # Check if the message is a tool result string added by app.py
+        is_tool_result_message = (
+            role == "assistant"
+            and isinstance(content, str)
+            and content.startswith("Tool call")
+            and "Result:" in content
+        )
+
+        if is_tool_result_message:
+            # Attempt to parse the tool result and format for OpenAI 'tool' role
+            try:
+                # Basic parsing: Extract tool name and JSON result
+                lines = content.split('\n', 2) # Split into max 3 parts: tool line, Result line, rest
+                tool_name_line = lines[0]
+                tool_name = tool_name_line.split("'")[1] # Extract name between single quotes
+                
+                result_part = lines[2] # The part after "Result:\n"
+                
+                # Extract JSON string, assuming it's within ```json ... ``` markers
+                json_start_marker = "```json"
+                json_end_marker = "```"
+                start_index = result_part.find(json_start_marker)
+                end_index = result_part.rfind(json_end_marker)
+                
+                if start_index != -1 and end_index != -1 and start_index < end_index:
+                    result_json_str = result_part[start_index + len(json_start_marker):end_index].strip()
+                else:
+                     # Fallback if markers aren't found - try finding json between {} 
+                     start_index = result_part.find('{') 
+                     end_index = result_part.rfind('}') 
+                     if start_index != -1 and end_index != -1: 
+                          result_json_str = result_part[start_index : end_index + 1] 
+                     else: 
+                          raise ValueError("Could not extract JSON result from tool message: " + result_part)
+
+                parsed_result = json.loads(result_json_str)
+
+                # Add message with 'tool' role for OpenAI
+                # WARNING: tool_call_id is missing. OpenAI might struggle without it.
+                openai_messages.append({
+                    "role": "tool",
+                    "tool_call_id": "PLACEHOLDER_ID", # Needs real ID from the request
+                    "name": tool_name,
+                    "content": json.dumps(parsed_result), # Tool result content must be a JSON string
+                })
+            except Exception as parse_error:
+                print(f"ERROR [get_openai_response]: Failed to parse/convert tool result message: {parse_error}. Appending as plain assistant text.")
+                # Fallback: Append the original string content as assistant message
+                openai_messages.append({"role": "assistant", "content": str(content)})
+        
+        elif role == "assistant" and msg.get("tool_calls"):
+            # Handle messages that already contain OpenAI-formatted tool *requests*
+            openai_messages.append(msg) # Add the whole message dict
+        
+        elif role in ["user", "assistant"]:
+            # Regular user/assistant text message
+            openai_messages.append({"role": role, "content": str(content)})
+        
+        # Ignore other roles or message formats
+
+    # --- Make API Call --- 
+    try:
+        api_response = openai_client.chat.completions.create(
+            model=model,
+            messages=openai_messages,
+            tools=tools if tools else None,
+            tool_choice="auto" if tools else None,
+        )
+
+        response_message = api_response.choices[0].message
+        response_content = response_message.content
+        openai_tool_calls = response_message.tool_calls # Original OpenAI tool calls list (or None)
+
+        # Token counts
+        token_count_in = api_response.usage.prompt_tokens if api_response.usage else 0
+        token_count_out = api_response.usage.completion_tokens if api_response.usage else 0
+
+        # --- Prepare Return Value for app.py (simplified tool_calls structure) --- 
+        processed_tool_calls = None
+        if openai_tool_calls:
+            processed_tool_calls = []
+            for tc in openai_tool_calls:
+                # Extract structure expected by app.py: {"name": ..., "arguments": ...}
+                # WARNING: Losing tool_call.id here!
+                print(f"WARNING [get_openai_response]: OpenAI tool call ID '{tc.id}' is not being explicitly passed back to app.py's loop logic.")
+                try:
+                    arguments = json.loads(tc.function.arguments)
+                except json.JSONDecodeError:
+                    print(f"Warning: Could not JSON decode arguments for tool call {tc.function.name}: {tc.function.arguments}")
+                    arguments = {"_raw_arguments": tc.function.arguments} # Pass raw string if decode fails
+                
+                processed_tool_calls.append({
+                    "name": tc.function.name,
+                    "arguments": arguments
+                })
+
+        final_response = {
+            "content": response_content,
+            "tool_calls": processed_tool_calls, # Simplified list for app.py loop
+            "token_count_in": token_count_in,
+            "token_count_out": token_count_out,
+        }
+        return final_response
+
+    except Exception as e:
+        st.error(f"Error calling OpenAI API: {e}")
+        print(f"ERROR [get_openai_response]: OpenAI API call failed: {e}", file=sys.stderr)
+        if hasattr(e, 'response') and e.response:
+            try:
+                print(f"OpenAI API Error Details: {e.response.text}", file=sys.stderr)
+            except Exception:
+                pass
+        # Ensure all expected keys are present even in error case
+        return {"content": f"Error communicating with OpenAI: {e}", "tool_calls": None, "token_count_in": 0, "token_count_out": 0}
+
+# --- (Potentially other helper functions) --- 

@@ -6,6 +6,8 @@ import requests # Use requests for HTTP calls
 import json
 from typing import List, Dict, Any, Optional
 import os
+import logging # Add this import
+from google.protobuf.internal.containers import MessageMap # Import the type if possible
 
 # --- Configuration --- #
 # URL for the FastAPI server
@@ -19,7 +21,18 @@ API_BASE_URL = "http://localhost:8000"
 def execute_mcp_tool(tool_name: str, params: dict) -> dict | str:
     """Executes a tool call via the REST API."""
     url = f"{API_BASE_URL}/tools/{tool_name}"
-    payload = {"arguments": params}
+
+    # Convert MapComposite to dict before creating payload
+    processed_params = {}
+    for key, value in params.items():
+        # Check if the object is an instance of MapComposite
+        # Using type name check as a fallback if direct import is tricky
+        if isinstance(value, MessageMap) or type(value).__name__ == 'MapComposite': 
+            processed_params[key] = dict(value)
+        else:
+            processed_params[key] = value
+
+    payload = {"arguments": processed_params} # Use processed params
     print(f"Making POST request to {url} with payload: {payload}")
     
     try:
@@ -42,28 +55,28 @@ def execute_mcp_tool(tool_name: str, params: dict) -> dict | str:
             error_detail = e.response.text # Use raw text if not JSON
             
         error_message = f"API Error executing tool '{tool_name}': {e.response.status_code} - {error_detail}"
-        print(error_message)
+        logging.error(error_message) # Use logging
         st.error(error_message)
         return error_message # Return the error string
         
     except requests.exceptions.ConnectionError as e:
         error_message = f"Connection Error: Could not connect to the MCP API server at {API_BASE_URL}. Is it running?"
-        print(f"{error_message} ({e})")
+        logging.error(f"{error_message} ({e})") # Use logging
         st.error(error_message)
         return error_message
         
     except requests.exceptions.Timeout:
         error_message = f"Timeout connecting to MCP API server for tool '{tool_name}'."
-        print(error_message)
+        logging.error(error_message) # Use logging
         st.error(error_message)
         return error_message
         
     except Exception as e:
         # Catch other unexpected errors (e.g., JSON decoding of success response)
-        error_message = f"Unexpected error during tool execution API call: {e}"
-        print(error_message, exc_info=True)
-        st.error(error_message)
-        return error_message
+        error_message = f"Unexpected error during tool execution API call for '{tool_name}'"
+        logging.exception(error_message) # Use logging.exception to include traceback
+        st.error(f"{error_message}: {e}") # Also show brief error in UI
+        return f"{error_message}: {e}" # Return error string
 
 # --- Tool Definitions (Synchronous HTTP) --- #
 def get_available_tools() -> list[dict]:
@@ -93,25 +106,25 @@ def get_available_tools() -> list[dict]:
             error_detail = e.response.text
             
         error_message = f"API Error fetching tools: {e.response.status_code} - {error_detail}"
-        print(error_message)
+        logging.error(error_message) # Use logging
         st.error(error_message)
         return [] # Return empty list on error
         
     except requests.exceptions.ConnectionError as e:
         error_message = f"Connection Error: Could not connect to the MCP API server at {API_BASE_URL} to get tools. Is it running?"
-        print(f"{error_message} ({e})")
+        logging.error(f"{error_message} ({e})") # Use logging
         st.error(error_message)
         return []
         
     except requests.exceptions.Timeout:
         error_message = f"Timeout connecting to MCP API server to get tools."
-        print(error_message)
+        logging.error(error_message) # Use logging
         st.error(error_message)
         return []
         
     except Exception as e:
         error_message = f"Unexpected error during get_tools API call: {e}"
-        print(error_message, exc_info=True)
+        logging.exception(error_message) # Use logging.exception
         st.error(error_message)
         return []
 

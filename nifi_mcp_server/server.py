@@ -4,6 +4,7 @@ import signal # Add signal import for cleanup
 from typing import List, Dict, Optional, Any
 import json
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Body
+from fastapi.responses import JSONResponse # Import JSONResponse
 from dotenv import load_dotenv
 from fastapi.middleware.cors import CORSMiddleware
 import os
@@ -23,6 +24,9 @@ from nifi_mcp_server.flow_documenter import (
 
 # Import MCP server components (Corrected for v1.6.0)
 from mcp.server import FastMCP
+# Remove non-existent imports
+# from mcp.context import ToolContext 
+# from mcp.shared.types import ToolExecutionResult
 # Corrected error import path based on file inspection for v1.6.0
 from mcp.shared.exceptions import McpError # Base error
 from mcp.server.fastmcp.exceptions import ToolError # Tool-specific errors
@@ -682,7 +686,7 @@ class ToolExecutionPayload(BaseModel):
     arguments: Dict[str, Any]
 
 @app.post("/tools/{tool_name}")
-async def execute_tool(tool_name: str, payload: ToolExecutionPayload):
+async def execute_tool(tool_name: str, payload: ToolExecutionPayload, context: Any | None = None) -> Dict[str, Any]:
     """Execute a specified MCP tool with the given arguments via ToolManager."""
     logger.info(f"Received request to execute tool '{tool_name}' via ToolManager with arguments: {payload.arguments}")
     
@@ -700,11 +704,6 @@ async def execute_tool(tool_name: str, payload: ToolExecutionPayload):
         # Ensure NiFi client is authenticated before execution
         await ensure_authenticated() 
         
-        # Get context. This might be tricky outside a real MCP request.
-        # Try getting a default/dummy context or passing None if allowed.
-        # context = mcp.get_context() # This might fail if no request context exists
-        context = None # Simplest assumption: maybe context is optional for call_tool?
-        
         # Call the ToolManager's call_tool method
         result = await tool_manager.call_tool(tool_name, payload.arguments, context=context)
             
@@ -716,25 +715,40 @@ async def execute_tool(tool_name: str, payload: ToolExecutionPayload):
         return {"result": result}
         
     except ToolError as e:
-        # Assuming ToolManager.call_tool raises ToolError for tool-specific issues (like not found)
-        logger.error(f"ToolError executing tool '{tool_name}' via ToolManager: {e.message} (Code: {e.code})", exc_info=True)
-        # Check if it's a 'tool not found' type error if ToolManager provides specific exceptions
-        # if isinstance(e, ToolNotFoundError): # Hypothetical specific exception
-        #     raise HTTPException(status_code=404, detail=f"Tool '{tool_name}' not found.")
-        raise HTTPException(status_code=400, detail=f"Error executing tool '{tool_name}': {e.message} (Code: {e.code})")
+        # Log the specific ToolError details
+        # Use str(e) to get the message and remove e.code as it might not exist
+        logger.error(f"ToolError executing tool '{tool_name}' via ToolManager: {str(e)}", exc_info=True) 
+        # Return 422 Unprocessable Entity for tool execution errors caused by bad input/state
+        return JSONResponse(
+            status_code=422, # Use 422 for semantic errors in the request
+            content={"detail": f"Tool execution failed: {str(e)}"} # Use 'detail' key
+        )
     except NiFiAuthenticationError as e:
          logger.error(f"NiFi Authentication Error during tool '{tool_name}' execution: {e}", exc_info=True)
-         raise HTTPException(status_code=503, detail=f"NiFi authentication failed: {e}") # 503 Service Unavailable
+         # For auth errors, 503 Service Unavailable might be suitable, or 401/403 if it's client-fixable
+         # Let's stick with a client-side error code if the user needs to fix env vars.
+         # Using 401 Unauthorized might imply the client needs to send credentials, which isn't the case here.
+         # Using 403 Forbidden might be better if the server credentials are just wrong.
+         # Let's use 403 for now.
+         # raise HTTPException(status_code=503, detail=f"NiFi authentication failed: {e}") # 503 Service Unavailable
+         return JSONResponse(
+             status_code=403, 
+             content={"detail": f"NiFi authentication failed: {str(e)}. Check server credentials."}
+        ) 
     except Exception as e:
         logger.error(f"Unexpected error executing tool '{tool_name}' via ToolManager: {e}", exc_info=True)
         # Check if it's a context-related error
         if "Context is not available outside of a request" in str(e):
              logger.error(f"Tool '{tool_name}' likely requires context, which is unavailable in this REST setup.")
-             raise HTTPException(status_code=501, detail=f"Tool '{tool_name}' cannot be executed via REST API as it requires MCP context.")
+             # 501 Not Implemented is appropriate here
+             return JSONResponse(status_code=501, detail=f"Tool '{tool_name}' cannot be executed via REST API as it requires MCP context.")
         # Catch potential argument mismatches or other runtime errors
         if isinstance(e, TypeError) and ("required positional argument" in str(e) or "unexpected keyword argument" in str(e)):
-             raise HTTPException(status_code=422, detail=f"Invalid arguments for tool '{tool_name}': {e}")
-        raise HTTPException(status_code=500, detail=f"Internal server error executing tool '{tool_name}'.")
+             # 422 is also appropriate for invalid arguments
+             return JSONResponse(status_code=422, detail=f"Invalid arguments for tool '{tool_name}': {e}")
+        # For truly unexpected errors, use 500
+        # raise HTTPException(status_code=500, detail=f"Internal server error executing tool '{tool_name}'.")
+        return JSONResponse(status_code=500, detail=f"Internal server error executing tool '{tool_name}'.")
 
 @mcp.tool()
 async def document_nifi_flow(
