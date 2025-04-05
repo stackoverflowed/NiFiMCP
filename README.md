@@ -25,8 +25,9 @@ To set up the development environment and install all dependencies, follow these
      ```
 
 4. **Install Dependencies:**
+   Use `uv` to install dependencies based on `pyproject.toml` and `uv.lock`:
    ```bash
-   pip install -r requirements.txt
+   uv sync
    ```
 
 5. **Update the .env file with Nifi and LLM API keys**

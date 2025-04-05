@@ -6,7 +6,9 @@ import requests # Use requests for HTTP calls
 import json
 from typing import List, Dict, Any, Optional
 import os
-import logging # Add this import
+# Remove standard logging import
+# import logging 
+from loguru import logger # Import Loguru logger
 from google.protobuf.internal.containers import MessageMap # Import the type if possible
 
 # --- Configuration --- #
@@ -18,9 +20,20 @@ API_BASE_URL = "http://localhost:8000"
 # (Helpers like get_server_params, run_async_in_thread removed)
 
 # --- Tool Execution (Synchronous HTTP) --- #
-def execute_mcp_tool(tool_name: str, params: dict) -> dict | str:
+def execute_mcp_tool(
+    tool_name: str, 
+    params: dict,
+    user_request_id: str | None = None, # Added context ID
+    action_id: str | None = None # Added context ID
+) -> dict | str:
     """Executes a tool call via the REST API."""
+    # Bind context IDs for logging within this function call
+    bound_logger = logger.bind(user_request_id=user_request_id, action_id=action_id)
+    
     url = f"{API_BASE_URL}/tools/{tool_name}"
+
+    # Log context IDs explicitly for debugging
+    bound_logger.debug(f"Tool execution context: user_request_id={user_request_id}, action_id={action_id}")
 
     # Convert MapComposite to dict before creating payload
     processed_params = {}
@@ -32,70 +45,140 @@ def execute_mcp_tool(tool_name: str, params: dict) -> dict | str:
         else:
             processed_params[key] = value
 
-    payload = {"arguments": processed_params} # Use processed params
-    print(f"Making POST request to {url} with payload: {payload}")
+    # Add context IDs to the payload
+    payload = {
+        "arguments": processed_params,
+        "context": {
+            "user_request_id": user_request_id or "-",
+            "action_id": action_id or "-"
+        }
+    }
+
+    # Create headers with context IDs
+    headers = {
+        "X-Request-ID": user_request_id or "-",
+        "X-Action-ID": action_id or "-",
+        "Content-Type": "application/json"
+    }
+    
+    bound_logger.info(f"Executing tool '{tool_name}' via API: {url}")
+    bound_logger.debug(f"Payload for tool '{tool_name}': {payload}")
+    bound_logger.debug(f"Headers for tool '{tool_name}': {headers}")
+    
+    # --- Log MCP Request ---
+    bound_logger.bind(
+        interface="mpc", 
+        direction="request", 
+        data={"url": url, "payload": payload, "headers": headers}
+    ).debug("Sending request to MCP API")
+    # -----------------------
     
     try:
-        response = requests.post(url, json=payload, timeout=60) # Add timeout
+        response = requests.post(url, json=payload, headers=headers, timeout=60) # Add timeout
         response.raise_for_status() # Raise exception for bad status codes (4xx or 5xx)
         
-        # Assuming the server returns {"result": ...} on success
         result_data = response.json()
-        print(f"Received successful response from API: {result_data}")
-        # Return the inner result directly if it exists, else the whole dict
+        bound_logger.info(f"Received successful response from API for tool '{tool_name}'.")
+        bound_logger.debug(f"API Response data: {result_data}")
+        
+        # --- Log MCP Response (Success) ---
+        bound_logger.bind(
+            interface="mpc", 
+            direction="response", 
+            data={"status_code": response.status_code, "body": result_data}
+        ).debug("Received successful response from MCP API")
+        # --------------------------------
+        
         return result_data.get("result", result_data) 
 
     except requests.exceptions.HTTPError as e:
-        # Handle 4xx/5xx errors from the API
         error_detail = "Unknown API error"
+        error_body = None
         try:
-            # Try to parse detail from response body
-            error_detail = e.response.json().get("detail", e.response.text)
+            error_body = e.response.json()
+            error_detail = error_body.get("detail", e.response.text)
         except json.JSONDecodeError:
-            error_detail = e.response.text # Use raw text if not JSON
+            error_detail = e.response.text 
+            error_body = {"raw_text": error_detail} # Store raw text if not JSON
             
         error_message = f"API Error executing tool '{tool_name}': {e.response.status_code} - {error_detail}"
-        logging.error(error_message) # Use logging
-        st.error(error_message)
+        bound_logger.error(error_message)
+        
+        # --- Log MCP Response (Error) ---
+        bound_logger.bind(
+            interface="mpc", 
+            direction="response", 
+            data={"status_code": e.response.status_code, "body": error_body}
+        ).debug("Received error response from MCP API")
+        # -------------------------------
+        
+        st.error(error_message) # Keep UI error
         return error_message # Return the error string
         
     except requests.exceptions.ConnectionError as e:
         error_message = f"Connection Error: Could not connect to the MCP API server at {API_BASE_URL}. Is it running?"
-        logging.error(f"{error_message} ({e})") # Use logging
-        st.error(error_message)
+        # Replace logging with logger
+        bound_logger.error(f"{error_message} ({e})")
+        # logging.error(f"{error_message} ({e})") # Use logging
+        st.error(error_message) # Keep UI error
         return error_message
         
     except requests.exceptions.Timeout:
         error_message = f"Timeout connecting to MCP API server for tool '{tool_name}'."
-        logging.error(error_message) # Use logging
-        st.error(error_message)
+        # Replace logging with logger
+        bound_logger.error(error_message)
+        # logging.error(error_message) # Use logging
+        st.error(error_message) # Keep UI error
         return error_message
         
     except Exception as e:
         # Catch other unexpected errors (e.g., JSON decoding of success response)
         error_message = f"Unexpected error during tool execution API call for '{tool_name}'"
-        logging.exception(error_message) # Use logging.exception to include traceback
+        # Replace logging.exception with logger.exception
+        bound_logger.exception(error_message) # Includes traceback
+        # logging.exception(error_message) # Use logging.exception to include traceback
         st.error(f"{error_message}: {e}") # Also show brief error in UI
         return f"{error_message}: {e}" # Return error string
 
 # --- Tool Definitions (Synchronous HTTP) --- #
-def get_available_tools() -> list[dict]:
+# @st.cache_data # Consider caching this
+def get_available_tools(
+    user_request_id: str | None = None,
+    action_id: str | None = None
+) -> list[dict]:
     """Fetches tool definitions from the REST API."""
     url = f"{API_BASE_URL}/tools"
-    print(f"Making GET request to {url}")
+    
+    # Bind context IDs for logging within this function call
+    bound_logger = logger.bind(user_request_id=user_request_id, action_id=action_id)
+    
+    # Use logger instead of print
+    bound_logger.info(f"Fetching available tools from API: {url}")
     
     try:
-        response = requests.get(url, timeout=30) # Add timeout
+        # Create headers with context IDs
+        headers = {
+            "X-Request-ID": user_request_id or "-",
+            "X-Action-ID": action_id or "-",
+            "Content-Type": "application/json"
+        }
+        
+        # Log headers for debugging
+        bound_logger.debug(f"Headers for tools request: {headers}")
+        
+        response = requests.get(url, headers=headers, timeout=30) # Add timeout and headers
         response.raise_for_status() # Raise exception for bad status codes
         
         tools = response.json() # Expecting a list of tool dicts
         if isinstance(tools, list):
-            print(f"Successfully retrieved {len(tools)} tool definitions from API.")
+            # Use logger instead of print
+            bound_logger.info(f"Successfully retrieved {len(tools)} tool definitions from API.")
             return tools
         else:
             error_message = f"API Error: Unexpected format received for tools list (expected list, got {type(tools)})."
-            print(error_message)
-            st.error(error_message)
+            # Use logger instead of print
+            bound_logger.error(error_message)
+            st.error(error_message) # Keep UI error
             return []
             
     except requests.exceptions.HTTPError as e:
@@ -106,26 +189,34 @@ def get_available_tools() -> list[dict]:
             error_detail = e.response.text
             
         error_message = f"API Error fetching tools: {e.response.status_code} - {error_detail}"
-        logging.error(error_message) # Use logging
-        st.error(error_message)
-        return [] # Return empty list on error
+        # Replace logging with logger
+        bound_logger.error(error_message)
+        # logging.error(error_message) # Use logging
+        st.error(error_message) # Keep UI error
+        return []
         
     except requests.exceptions.ConnectionError as e:
         error_message = f"Connection Error: Could not connect to the MCP API server at {API_BASE_URL} to get tools. Is it running?"
-        logging.error(f"{error_message} ({e})") # Use logging
-        st.error(error_message)
+        # Replace logging with logger
+        bound_logger.error(f"{error_message} ({e})")
+        # logging.error(f"{error_message} ({e})") # Use logging
+        st.error(error_message) # Keep UI error
         return []
         
     except requests.exceptions.Timeout:
         error_message = f"Timeout connecting to MCP API server to get tools."
-        logging.error(error_message) # Use logging
-        st.error(error_message)
+        # Replace logging with logger
+        bound_logger.error(error_message)
+        # logging.error(error_message) # Use logging
+        st.error(error_message) # Keep UI error
         return []
         
     except Exception as e:
         error_message = f"Unexpected error during get_tools API call: {e}"
-        logging.exception(error_message) # Use logging.exception
-        st.error(error_message)
+        # Replace logging.exception with logger.exception
+        bound_logger.exception(error_message)
+        # logging.exception(error_message) # Use logging.exception
+        st.error(error_message) # Keep UI error
         return []
 
 # Ensure streamlit UI code calls these synchronous functions directly.

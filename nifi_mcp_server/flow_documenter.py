@@ -1,10 +1,12 @@
 import re
-import logging
+# Remove standard logging import
+# import logging
+from loguru import logger # Import Loguru logger
 from typing import Dict, List, Any, Set, Tuple, Optional
 
-# Set up logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# Set up logging - REMOVED
+# logging.basicConfig(level=logging.INFO)
+# logger = logging.getLogger(__name__)
 
 # Define important properties for common processor types
 IMPORTANT_PROPERTIES = {
