@@ -27,8 +27,8 @@ llm_debug_file:
   rotation: null # Overwrite on start
   # Format is handled by _serialize_record function in logging_setup.py
 
-mpc_debug_file:
-  path: "{log_directory}/mpc_debug.log"
+mcp_debug_file:
+  path: "{log_directory}/mcp_debug.log"
   level: "DEBUG"
   rotation: null # Overwrite on start
   # Format is handled by _serialize_record function in logging_setup.py

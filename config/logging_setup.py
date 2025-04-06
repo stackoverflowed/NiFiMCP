@@ -23,7 +23,7 @@ except ImportError:
             'client_file': {'enabled': False},
             'server_file': {'enabled': False},
             'llm_debug_file': {},
-            'mpc_debug_file': {},
+            'mcp_debug_file': {},
             'nifi_debug_file': {}
         }
 
@@ -193,7 +193,7 @@ def setup_logging():
 """
         for interface_key, interface_name in [
             ('llm_debug_file', 'llm'),
-            ('mpc_debug_file', 'mpc'),
+            ('mcp_debug_file', 'mpc'),
             ('nifi_debug_file', 'nifi')
         ]:
             debug_config = config.get(interface_key, {})

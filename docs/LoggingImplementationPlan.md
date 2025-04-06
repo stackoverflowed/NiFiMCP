@@ -69,7 +69,7 @@
       rotation: null # Overwrite on start
       # Special handler/formatter needed for JSON pretty printing
 
-    mpc_debug_file:
+    mcp_debug_file:
       path: "{log_directory}/mpc_debug.log"
       level: "DEBUG"
       rotation: null # Overwrite on start

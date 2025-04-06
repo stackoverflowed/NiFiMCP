@@ -4,7 +4,7 @@ from loguru import logger # Import Loguru logger
 import httpx
 from dotenv import load_dotenv
 import uuid # Import uuid for client ID generation
-from typing import Optional, Dict, Any # Add typing imports
+from typing import Optional, Dict, Any, Union, List # Add Union and List
 
 # Load environment variables from .env file
 load_dotenv()
@@ -340,6 +340,35 @@ class NiFiClient:
             logger.error(f"An unexpected error occurred deleting processor {processor_id}: {e}", exc_info=True)
             raise ConnectionError(f"An unexpected error occurred deleting processor: {e}") from e
 
+    async def get_connection(self, connection_id: str) -> dict:
+        """Fetches the details of a specific connection."""
+        if not self._token:
+            raise NiFiAuthenticationError("Client is not authenticated. Call authenticate() first.")
+
+        client = await self._get_client()
+        endpoint = f"/connections/{connection_id}"
+        try:
+            logger.info(f"Fetching details for connection {connection_id} from {self.base_url}{endpoint}")
+            response = await client.get(endpoint)
+            response.raise_for_status()
+            connection_details = response.json()
+            logger.info(f"Successfully fetched details for connection {connection_id}")
+            return connection_details
+
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                logger.warning(f"Connection with ID {connection_id} not found.")
+                raise ValueError(f"Connection with ID {connection_id} not found.") from e
+            else:
+                logger.error(f"Failed to get details for connection {connection_id}: {e.response.status_code} - {e.response.text}")
+                raise ConnectionError(f"Failed to get connection details: {e.response.status_code}, {e.response.text}") from e
+        except (httpx.RequestError, ValueError) as e:
+            logger.error(f"Error getting details for connection {connection_id}: {e}")
+            raise ConnectionError(f"Error getting connection details: {e}") from e
+        except Exception as e:
+            logger.error(f"An unexpected error occurred getting connection details for {connection_id}: {e}", exc_info=True)
+            raise ConnectionError(f"An unexpected error occurred getting connection details: {e}") from e
+
     async def list_connections(self, process_group_id: str) -> list[dict]:
         """Lists connections within a specified process group."""
         if not self._token:
@@ -367,17 +396,17 @@ class NiFiClient:
             logger.error(f"An unexpected error occurred listing connections: {e}", exc_info=True)
             raise ConnectionError(f"An unexpected error occurred listing connections: {e}") from e
 
-    async def delete_connection(self, connection_id: str, version: int) -> bool:
-        """Deletes a connection given its ID and current revision version."""
+    async def delete_connection(self, connection_id: str, version_number: int) -> bool:
+        """Deletes a connection given its ID and current revision version number."""
         if not self._token:
             raise NiFiAuthenticationError("Client is not authenticated. Call authenticate() first.")
 
         client = await self._get_client()
-        # The version must be passed as a query parameter, along with the client ID
-        endpoint = f"/connections/{connection_id}?version={version}&clientId={self._client_id}"
+        # Use the integer version number in the query parameter
+        endpoint = f"/connections/{connection_id}?version={version_number}&clientId={self._client_id}"
 
         try:
-            logger.info(f"Attempting to delete connection {connection_id} (version {version}) using {self.base_url}{endpoint}")
+            logger.info(f"Attempting to delete connection {connection_id} (version {version_number}) using {self.base_url}{endpoint}")
             response = await client.delete(endpoint)
             response.raise_for_status() # Raises HTTPStatusError for 4xx/5xx
 
@@ -393,8 +422,8 @@ class NiFiClient:
                  logger.warning(f"Connection {connection_id} not found for deletion.")
                  return False
             elif e.response.status_code == 409:
-                 logger.error(f"Conflict deleting connection {connection_id}. Check revision version ({version}). Response: {e.response.text}")
-                 raise ValueError(f"Conflict deleting connection {connection_id}. Ensure correct version ({version}) is used.") from e
+                 logger.error(f"Conflict deleting connection {connection_id}. Check revision version ({version_number}). Response: {e.response.text}")
+                 raise ValueError(f"Conflict deleting connection {connection_id}. Ensure correct version ({version_number}) is used.") from e
             else:
                  logger.error(f"Failed to delete connection {connection_id}: {e.response.status_code} - {e.response.text}")
                  raise ConnectionError(f"Failed to delete connection: {e.response.status_code}, {e.response.text}") from e
@@ -408,12 +437,17 @@ class NiFiClient:
     async def update_processor_config(
         self,
         processor_id: str,
-        config_properties: Dict[str, Any],
-        # state: Optional[str] = None # Optional: Allow changing state (RUNNING, STOPPED) too?
+        update_type: str,
+        update_data: Union[Dict[str, Any], List[str]]
     ) -> dict:
-        """Updates the configuration properties of a specific processor."""
+        """Updates specific parts of a processor's component configuration (properties or auto-terminated relationships)."""
         if not self._token:
             raise NiFiAuthenticationError("Client is not authenticated. Call authenticate() first.")
+
+        # Validate update_type
+        valid_update_types = ["properties", "relationships"]
+        if update_type not in valid_update_types:
+            raise ValueError(f"Invalid update_type '{update_type}'. Must be one of {valid_update_types}")
 
         # 1. Get current processor entity to obtain the latest revision
         logger.info(f"Fetching current details for processor {processor_id} before update.")
@@ -423,27 +457,46 @@ class NiFiClient:
             current_component = current_entity["component"]
         except (ValueError, ConnectionError) as e:
             logger.error(f"Failed to fetch processor {processor_id} for update: {e}")
-            raise # Re-raise the error (could be ValueError for not found, or ConnectionError)
+            raise
 
         # 2. Prepare the update payload
-        # Start with the essential component details we need to preserve
-        # (like id, parentGroupId, position - NiFi API often requires these)
+        # Start with essential component details
         update_component = {
             "id": current_component["id"],
+            # Keep existing name, position etc. unless explicitly changed later
             "name": current_component.get("name"),
             "position": current_component.get("position"),
-            # Add other fields if necessary, but config is the focus
-            "config": {
-                "properties": config_properties
-                # Consider adding scheduling strategy, period, etc. if needed later
-            }
+            # Copy existing config first, then overwrite specific part
+            "config": current_component.get("config", {}).copy(),
         }
-        # Add state change if provided (e.g., "RUNNING" or "STOPPED")
-        # if state and state.upper() in ["RUNNING", "STOPPED"]:
-        #     update_component["state"] = state.upper()
 
+        # Apply the specific update based on update_type
+        log_message_part = "unknown configuration part"
+        if update_type == "properties":
+            if not isinstance(update_data, dict):
+                raise TypeError("update_data must be a dictionary when update_type is 'properties'.")
+            # Ensure config key exists
+            if "config" not in update_component:
+                 update_component["config"] = {}
+            update_component["config"]["properties"] = update_data
+            log_message_part = f"properties: {update_data}"
+
+        elif update_type == "relationships":
+            # Expect a list of strings (relationship names)
+            if not isinstance(update_data, list) or not all(isinstance(item, str) for item in update_data):
+                 raise TypeError("update_data must be a list of strings (relationship names) when update_type is 'relationships'.")
+            
+            # Ensure config key exists
+            if "config" not in update_component:
+                 update_component["config"] = {}
+                 
+            # Assign to component.config.autoTerminatedRelationships based on UI capture
+            update_component["config"]["autoTerminatedRelationships"] = update_data
+            log_message_part = f"config.autoTerminatedRelationships: {update_data}"
+
+        # Construct final payload
         update_payload = {
-            "revision": current_revision, # Use the fetched revision
+            "revision": current_revision,
             "component": update_component
         }
 
@@ -451,11 +504,11 @@ class NiFiClient:
         client = await self._get_client()
         endpoint = f"/processors/{processor_id}"
         try:
-            logger.info(f"Updating configuration for processor {processor_id} (Version: {current_revision.get('version')}). New props: {config_properties}")
+            logger.info(f"Updating processor {processor_id} (Version: {current_revision.get('version')}). Updating {log_message_part}")
             response = await client.put(endpoint, json=update_payload)
             response.raise_for_status()
             updated_entity = response.json()
-            logger.info(f"Successfully updated configuration for processor {processor_id}. New revision: {updated_entity.get('revision', {}).get('version')}")
+            logger.info(f"Successfully updated processor {processor_id}. New revision: {updated_entity.get('revision', {}).get('version')}")
             return updated_entity
 
         except httpx.HTTPStatusError as e:

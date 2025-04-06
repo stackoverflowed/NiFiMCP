@@ -67,7 +67,7 @@ def execute_mcp_tool(
     
     # --- Log MCP Request ---
     bound_logger.bind(
-        interface="mpc", 
+        interface="mcp", 
         direction="request", 
         data={"url": url, "payload": payload, "headers": headers}
     ).debug("Sending request to MCP API")
@@ -83,7 +83,7 @@ def execute_mcp_tool(
         
         # --- Log MCP Response (Success) ---
         bound_logger.bind(
-            interface="mpc", 
+            interface="mcp", 
             direction="response", 
             data={"status_code": response.status_code, "body": result_data}
         ).debug("Received successful response from MCP API")
@@ -106,7 +106,7 @@ def execute_mcp_tool(
         
         # --- Log MCP Response (Error) ---
         bound_logger.bind(
-            interface="mpc", 
+            interface="mcp", 
             direction="response", 
             data={"status_code": e.response.status_code, "body": error_body}
         ).debug("Received error response from MCP API")
