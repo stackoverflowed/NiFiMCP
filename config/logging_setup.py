@@ -193,7 +193,7 @@ def setup_logging():
 """
         for interface_key, interface_name in [
             ('llm_debug_file', 'llm'),
-            ('mcp_debug_file', 'mpc'),
+            ('mcp_debug_file', 'mcp'),
             ('nifi_debug_file', 'nifi')
         ]:
             debug_config = config.get(interface_key, {})
