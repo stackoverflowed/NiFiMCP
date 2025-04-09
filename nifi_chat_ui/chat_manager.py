@@ -152,17 +152,43 @@ def get_formatted_tool_definitions(
         for tool in tools:
             if tool.get("type") == "function" and isinstance(tool.get("function"), dict):
                 function_def = tool["function"]
+                tool_name = function_def.get("name", "") # Get tool name for specific fixes
+                
                 # Clean up parameters if present
                 if "parameters" in function_def and isinstance(function_def["parameters"], dict):
-                    # Remove additionalProperties field which might cause issues
-                    if "additionalProperties" in function_def["parameters"]:
-                        del function_def["parameters"]["additionalProperties"]
+                    params = function_def["parameters"]
+                    # Remove top-level additionalProperties field which might cause issues
+                    params.pop("additionalProperties", None)
                     
-                    # Also clean properties if present
-                    if "properties" in function_def["parameters"] and isinstance(function_def["parameters"]["properties"], dict):
-                        for prop_name, prop_value in function_def["parameters"]["properties"].items():
-                            if isinstance(prop_value, dict) and "additionalProperties" in prop_value:
-                                del prop_value["additionalProperties"]
+                    # Clean individual properties
+                    if "properties" in params and isinstance(params["properties"], dict):
+                        props = params["properties"]
+                        for prop_name, prop_value in props.items():
+                            # Ensure prop_value is a dict before cleaning
+                            if isinstance(prop_value, dict):
+                                prop_value.pop("additionalProperties", None)
+                            # If prop_value is not a dict or becomes empty after cleaning, set default type
+                            if not isinstance(prop_value, dict) or not prop_value:
+                                bound_logger.debug(f"Setting default type 'string' for empty/invalid property '{prop_name}' in tool '{tool_name}'")
+                                props[prop_name] = {"type": "string"} # Default to string type
+                                prop_value = props[prop_name] # Update prop_value for subsequent checks
+                            
+                            # --- SPECIFIC FIX for update_nifi_processor_config.update_data --- 
+                            if tool_name == "update_nifi_processor_config" and prop_name == "update_data":
+                                bound_logger.debug(f"Applying specific schema fix for {tool_name}.{prop_name}")
+                                props[prop_name] = {
+                                    # Keep original description if available
+                                    "description": prop_value.get("description", "A dictionary (for 'properties') or list (for 'relationships') representing the update."),
+                                    # Use anyOf to represent Union[Dict, List]
+                                    "anyOf": [
+                                        { "type": "object" },
+                                        { 
+                                            "type": "array",
+                                            "items": { "type": "string" } # Specify items are strings
+                                        }
+                                    ]
+                                }
+                            # --- END SPECIFIC FIX --- 
                 
                 cleaned_tools.append(tool)
         
@@ -510,7 +536,7 @@ def get_gemini_response(
                     # candidate_count=1, # Defaults to 1
                     # stop_sequences=['...'],
                     # max_output_tokens=2048,
-                    temperature=0.7, # Adjust creativity/predictability
+                    temperature=0.3, # Adjust creativity/predictability - REDUCED from 0.7
                 )
             )
             bound_logger.info("Received response from Gemini model.")
@@ -664,7 +690,7 @@ def get_gemini_response(
                             args_str = "{}"
                         
                         response_tool_calls.append({
-                            "id": f"call_{uuid.uuid4()}", # Generate an ID
+                            "id": str(uuid.uuid4()), # Generate shorter ID (just UUID)
                             "type": "function",
                             "function": {
                                 "name": fc.name,
@@ -763,6 +789,7 @@ def get_openai_response(
             return {"error": f"OpenAI client verification failed: {str(verify_error)}"}
         
         # Now attempt the actual completions API call
+        bound_logger.debug(f"Sending messages to OpenAI: {json.dumps(openai_messages, indent=2)}") # Log the exact payload
         response = openai_client.chat.completions.create(
             model=config.OPENAI_MODEL,
             messages=openai_messages,
@@ -882,9 +909,25 @@ def get_openai_response(
         }
 
     except Exception as e:
-        bound_logger.error(f"Error during OpenAI API call: {e}", exc_info=True)
-        st.error(f"An error occurred while communicating with the OpenAI API: {e}")
-        return {"error": str(e)}
+        # Log the type of the exception for better debugging
+        bound_logger.error(f"Caught exception of type: {type(e).__name__}")
+        
+        # Try to extract more details if it's an OpenAI API error
+        error_details = str(e)
+        if hasattr(e, 'response'): # Check if it might be an httpx.HTTPStatusError or similar
+            try:
+                response_content = e.response.text
+                error_details = f"{str(e)} - Response: {response_content[:500]}" # Limit response length
+            except Exception as inner_e:
+                bound_logger.warning(f"Could not extract response details from exception: {inner_e}")
+        elif hasattr(e, 'body'): # Check for OpenAI specific error body
+             error_details = f"{str(e)} - Body: {getattr(e, 'body', None)}" 
+        
+        # Log the potentially more detailed error
+        bound_logger.error(f"Error during OpenAI API call: {error_details}", exc_info=True)
+        st.error(f"An error occurred while communicating with the OpenAI API: {error_details}")
+        # Return the more detailed error string if available
+        return {"error": error_details}
 
 def candidate_to_dict(candidate):
     # Helper to convert Candidate object safely for logging

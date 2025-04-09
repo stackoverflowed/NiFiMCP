@@ -9,7 +9,7 @@ console:
 client_file:
   enabled: true
   path: "{log_directory}/client.log"
-  level: "INFO"
+  level: "DEBUG"
   rotation: null # Overwrite on start
   format: "{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {message} | {name}:{function}:{line} | Req:{extra[user_request_id]} | Act:{extra[action_id]}"
 

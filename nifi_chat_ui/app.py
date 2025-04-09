@@ -86,17 +86,6 @@ with st.sidebar:
         # If provider changed, reconfigure LLM clients
         if provider != previous_provider:
             try:
-                # Force reimport of OpenAI to ensure clean state when switching providers
-                if provider == "OpenAI" and previous_provider == "Gemini":
-                    logger.info("Switching from Gemini to OpenAI - performing complete client reset")
-                    import importlib
-                    import openai
-                    importlib.reload(openai)
-                    from openai import OpenAI
-                    # Update the module reference in chat_manager
-                    import chat_manager
-                    chat_manager.OpenAI = OpenAI
-                
                 # Now configure with clean clients
                 configure_llms()
                 st.session_state["previous_provider"] = provider
@@ -295,21 +284,21 @@ if prompt := st.chat_input("What would you like to do with NiFi?"):
 
             # --- Handle Tool Calls (if any) --- 
             if tool_calls:
-                # Display indication that tools are being called (using the text content part if available)
+                # Display indication that tools are being called 
+                # We add the full message (content + tool calls) to history ABOVE, 
+                # but only display the tool call indicator here to avoid duplicate text display.
                 with st.chat_message("assistant"):
-                    display_content = llm_content if llm_content else "" # Show text part
+                    # display_content = llm_content if llm_content else "" # REMOVED: Don't display text content here
                     tool_names = [tc.get('function', {}).get('name', 'unknown') for tc in tool_calls]
-                    st.markdown(f"{display_content}\n⚙️ Calling tool(s): `{', '.join(tool_names)}`...")
+                    # ONLY display the tool indicator
+                    st.markdown(f"⚙️ Calling tool(s): `{', '.join(tool_names)}`...") 
                     
                     # Display token counts
                     token_count_in = response_data.get("token_count_in", 0)
-                    token_count_out = response_data.get("token_count_out", 0)
-                    if token_count_in or token_count_out:
-                        st.caption(f"Tokens: In={token_count_in}, Out={token_count_out}")
-                
-                # Execute tools and append results directly to history
+
+                # --- Execute Tools and Append Results --- 
                 for tool_call in tool_calls:
-                    # --- Generate Action ID --- 
+                    # --- Generate Action ID ---
                     action_id = str(uuid.uuid4())
                     tool_logger = current_loop_logger.bind(action_id=action_id) # Bind action_id
                     # --------------------------
@@ -318,7 +307,7 @@ if prompt := st.chat_input("What would you like to do with NiFi?"):
                     function_info = tool_call.get("function", {})
                     tool_name = function_info.get("name")
                     tool_args_str = function_info.get("arguments")
-                    
+
                     tool_logger.info(f"Processing tool call: ID={tool_call_id}, Name={tool_name}") # Log tool call
 
                     if not tool_call_id or not tool_name or tool_args_str is None:
@@ -345,7 +334,7 @@ if prompt := st.chat_input("What would you like to do with NiFi?"):
                             "content": f"Error: Failed to parse JSON arguments: {tool_args_str}"
                         })
                         continue
-                        
+
                     # Execute the tool
                     try:
                         with st.spinner(f"Executing tool: `{tool_name}`..."):
@@ -382,10 +371,10 @@ if prompt := st.chat_input("What would you like to do with NiFi?"):
                              "tool_call_id": tool_call_id,
                              "content": f"Error: Failed to execute tool '{tool_name}'. Exception: {e}"
                         })
-                        # Continue the loop, feeding the error back to the LLM via the history
-                
-                # --- Loop continues automatically after processing tool calls --- 
-                current_loop_logger.info("Finished processing tool calls for this iteration.")
+                        # Execution stops here due to rerun, loop effectively processes one tool per run
+
+                # The loop implicitly continues on the next Streamlit run triggered by st.rerun()
+                # No need for the 'Finished processing...' log or explicit continue here anymore.
 
             # --- Handle Final Response (No Tool Calls in this iteration) --- 
             elif llm_content: # Only display if there was content and NO tool calls
