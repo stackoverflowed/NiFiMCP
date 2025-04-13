@@ -11,6 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import os
 import sys
 from loguru import logger # Import Loguru logger
+from docstring_parser import parse # <<< ADD IMPORT HERE
 
 # --- Setup Logging --- 
 try:
@@ -116,10 +117,6 @@ def _format_processor_summary(processors_data):
             status = proc.get('status', {})
             # Use the existing filter function for consistency, can enhance later
             basic_info = filter_processor_data(proc) 
-            # Add some status info if available in list response (might vary by NiFi version)
-            basic_info['active_thread_count'] = status.get('aggregateSnapshot', {}).get('activeThreadCount') # Check nesting
-            basic_info['queued_count'] = status.get('aggregateSnapshot', {}).get('flowFilesQueued')
-            basic_info['queued_size'] = status.get('aggregateSnapshot', {}).get('bytesQueued')
             formatted.append(basic_info)
     return formatted
 
@@ -130,10 +127,6 @@ def _format_connection_summary(connections_data):
         for conn in connections_data:
              # Use existing filter function
             basic_info = filter_connection_data(conn)
-            # Add status if available
-            status = conn.get('status', {})
-            basic_info['queued_count'] = status.get('aggregateSnapshot', {}).get('flowFilesQueued')
-            basic_info['queued_size'] = status.get('aggregateSnapshot', {}).get('bytesQueued')
             formatted.append(basic_info)
     return formatted
 
@@ -410,27 +403,27 @@ async def list_nifi_objects(
     search_scope: Literal["current_group", "recursive"] = "current_group" # Updated parameter
 ) -> Union[List[Dict], Dict]:
     """
-    Lists NiFi objects (processors, connections, ports, or process groups)
-    within a specified process group, or provides a hierarchy view for process groups.
+    Lists NiFi objects or provides a hierarchy view for process groups within a specified scope.
 
-    Args:
-        object_type: The type of NiFi objects to list.
-            - 'processors': Lists processors with basic details and status.
-            - 'connections': Lists connections with basic details and status.
-            - 'ports': Lists input and output ports with basic details and status.
-            - 'process_groups': Lists child process groups under the target group.
-        process_group_id: The UUID of the process group to inspect. Defaults to the root group if None.
-        search_scope: Determines the scope of the listing.
-            - 'current_group' (default): Lists objects only within the specified process_group_id.
-            - 'recursive': For processors/connections/ports, lists objects in the specified group and all nested subgroups.
-                         For process_groups, provides the full nested hierarchy with counts.
+    Parameters
+    ----------
+    object_type : Literal["processors", "connections", "ports", "process_groups"]
+        The type of NiFi objects to list.
+        - 'processors': Lists processors with basic details and status.
+        - 'connections': Lists connections with basic details and status.
+        - 'ports': Lists input and output ports with basic details and status.
+        - 'process_groups': Lists child process groups under the target group (see search_scope).
+    process_group_id : str | None, optional
+        The UUID of the process group to inspect. If None or omitted, defaults to the root process group. (default is None)
+    search_scope : Literal["current_group", "recursive"], optional
+        Determines the scope of the listing. Defaults to 'current_group'.
+        - 'current_group': Lists objects only within the specified `process_group_id`. For 'process_groups', shows only immediate children with counts.
+        - 'recursive': For 'processors', 'connections', or 'ports', lists objects in the specified group and all nested subgroups. For 'process_groups', provides the full nested hierarchy including children of children, with counts at each level. (default is "current_group")
 
-    Returns:
-        - For 'processors', 'connections', 'ports' with scope 'current_group': A list of dictionaries representing the objects.
-        - For 'processors', 'connections', 'ports' with scope 'recursive': A list of dictionaries, each containing process group info and a list of objects found within it.
-        - For 'process_groups' with scope 'current_group': A dictionary representing the parent and its *immediate* children with counts.
-        - For 'process_groups' with scope 'recursive': A dictionary representing the parent and the *full nested hierarchy* of children with counts.
-        Raises ToolError if an API error occurs or the object_type is invalid.
+    Returns
+    -------
+    Union[List[Dict], Dict]
+        A list or dictionary depending on the object_type and search_scope. See Args descriptions for specifics. Raises ToolError if an API error occurs.
     """
     local_logger = logger.bind(tool_name="list_nifi_objects", object_type=object_type, search_scope=search_scope)
     await ensure_authenticated()
@@ -555,17 +548,22 @@ async def list_nifi_objects(
 
 def filter_processor_data(processor):
     """Extract only the essential fields from a processor object"""
+    component = processor.get("component", {}) # Added safety get
+    status = processor.get("status", {}) # Added safety get
+    config = component.get("config", {}) # Get config dict
+    properties = config.get("properties", {}) # Get properties from config
+
     return {
         "id": processor.get("id"),
-        "name": processor.get("component", {}).get("name"),
-        "type": processor.get("component", {}).get("type"),
-        "state": processor.get("component", {}).get("state"),
+        "name": component.get("name"),
+        "type": component.get("type"),
+        "state": component.get("state"),
         "position": processor.get("position"),
-        "runStatus": processor.get("status", {}).get("runStatus"),
-        "validationStatus": processor.get("component", {}).get("validationStatus"),
-        "relationships": [rel.get("name") for rel in processor.get("component", {}).get("relationships", [])],
-        "inputRequirement": processor.get("component", {}).get("inputRequirement"),
-        "bundle": processor.get("component", {}).get("bundle"),
+        "runStatus": status.get("runStatus"), # Use the safer status get
+        "validationStatus": component.get("validationStatus"),
+        "validationErrors": component.get("validationErrors", []),
+        "relationships": component.get("relationships", []), # Use safer component get
+        "properties": properties, # Add properties here
 
     }
 
@@ -602,6 +600,8 @@ def filter_connection_data(connection_entity):
         "destinationType": destination.get("type"),
         "destinationName": destination.get("name"),
         "name": component.get("name"), # Get connection name safely
+        "selectedRelationships": component.get("selectedRelationships"),
+        "availableRelationships": component.get("availableRelationships"),
     }
 
 def filter_port_data(port_entity):
@@ -762,18 +762,19 @@ async def create_nifi_processor(
 @mcp.tool()
 async def create_nifi_connection(
     source_id: str,
-    source_relationship: str,
+    relationships: List[str], # ADDED: List of relationship names
     target_id: str,
     # process_group_id: str | None = None, # REMOVED: Automatically determined
     # Add more options like selected_relationships if needed
 ) -> Dict:
     """
-    Creates a connection between two components (processors or ports) within the same NiFi process group.
+    Creates a connection between two components (processors or ports) within the same NiFi process group,
+    selecting one or more relationships from the source component.
     The process group is automatically determined based on the parent group of the source and target components.
 
     Args:
         source_id: The UUID of the source component (processor, input port, or output port).
-        source_relationship: The name of the relationship originating from the source component.
+        relationships: A non-empty list of relationship names originating from the source component that should be selected for this connection.
         target_id: The UUID of the target component (processor, input port, or output port).
         # process_group_id: REMOVED - The UUID of the process group containing the components.
 
@@ -781,8 +782,16 @@ async def create_nifi_connection(
         A dictionary representing the created connection entity. Raises ToolError if components are not found,
         are in different process groups, or if the API call fails.
     """
-    local_logger = logger.bind(tool_name="create_nifi_connection", source_id=source_id, target_id=target_id, source_relationship=source_relationship)
+    # Update logger binding
+    local_logger = logger.bind(tool_name="create_nifi_connection", source_id=source_id, target_id=target_id, relationships=relationships)
     await ensure_authenticated()
+
+    # --- Input Validation ---
+    if not relationships:
+        raise ToolError("The 'relationships' list cannot be empty. At least one relationship must be provided.")
+    if not isinstance(relationships, list) or not all(isinstance(item, str) for item in relationships):
+        raise ToolError("Invalid 'relationships' elements. Expected a non-empty list of strings (relationship names).")
+    # ------------------------
 
     source_entity = None
     source_type = None
@@ -830,7 +839,8 @@ async def create_nifi_connection(
                 except ValueError: # Not found as any type
                      raise ToolError(f"Target component with ID {target_id} not found or is not a connectable type (Processor, Input Port, Output Port).")
 
-        # --- 3. Extract and Validate Parent Process Group IDs ---
+        # --- 3. Extract and Validate Parent Process Group IDs --- # REMOVED: Moved inside try block below
+
         source_parent_pg_id = source_entity.get("component", {}).get("parentGroupId")
         target_parent_pg_id = target_entity.get("component", {}).get("parentGroupId")
 
@@ -856,9 +866,60 @@ async def create_nifi_connection(
          raise ToolError(f"An unexpected error occurred while fetching component details: {e}")
 
 
-    # --- 4. Call NiFi Client to Create Connection ---
-    relationships = [source_relationship] # API expects a list
-    local_logger.info(f"Executing create_nifi_connection: From {source_id} ({source_type}, {source_relationship}) To {target_id} ({target_type}) in derived group {common_parent_pg_id}")
+    # --- 4. Check for Existing Connections (Duplicate Prevention) ---
+    local_logger.info(f"Checking for existing connections between {source_id} and {target_id} in group {common_parent_pg_id}...")
+    try:
+        # --- Log NiFi Request (List Connections) ---
+        nifi_list_req = {"operation": "list_connections", "process_group_id": common_parent_pg_id}
+        local_logger.bind(interface="nifi", direction="request", data=nifi_list_req).debug("Calling NiFi API (for duplicate check)")
+        # ------------------------------------------
+        existing_connections = await nifi_api_client.list_connections(common_parent_pg_id)
+        # --- Log NiFi Response (List Connections) ---
+        nifi_list_resp = {"connection_count": len(existing_connections)}
+        local_logger.bind(interface="nifi", direction="response", data=nifi_list_resp).debug("Received from NiFi API (for duplicate check)")
+        # -------------------------------------------
+        
+        for existing_conn_entity in existing_connections:
+            existing_comp = existing_conn_entity.get("component", {})
+            existing_source = existing_comp.get("source", {})
+            existing_dest = existing_comp.get("destination", {})
+            
+            if existing_source.get("id") == source_id and existing_dest.get("id") == target_id:
+                # Duplicate found!
+                existing_conn_id = existing_conn_entity.get("id")
+                local_logger.warning(f"Duplicate connection detected. Existing connection ID: {existing_conn_id}")
+                
+                # Get details of the existing connection to report relationships
+                try:
+                    existing_conn_details = await nifi_api_client.get_connection(existing_conn_id)
+                    existing_relationships = existing_conn_details.get("component", {}).get("selectedRelationships", [])
+                except Exception as detail_err:
+                    local_logger.error(f"Could not fetch details for existing connection {existing_conn_id} during duplicate check: {detail_err}")
+                    existing_relationships = ["<error retrieving>"] # Placeholder
+                
+                error_msg = (
+                    f"A connection already exists between source '{source_id}' and target '{target_id}'. "
+                    f"Existing connection ID: {existing_conn_id}. "
+                    f"Currently selected relationships: {existing_relationships}. "
+                    f"Use the 'update_nifi_connection' tool to modify the relationships if needed."
+                )
+                return {"status": "error", "message": error_msg, "entity": None} # Return error, do not create
+                
+        local_logger.info("No duplicate connection found. Proceeding with creation.")
+        
+    except (NiFiAuthenticationError, ConnectionError, ValueError) as e:
+        local_logger.error(f"API error listing connections during duplicate check: {e}", exc_info=True)
+        local_logger.bind(interface="nifi", direction="response", data={"error": str(e)}).debug("Received error from NiFi API (for duplicate check)")
+        # Raise ToolError to signal failure during the check phase
+        raise ToolError(f"Failed to check for existing connections before creation: {e}")
+    except Exception as e:
+        local_logger.error(f"Unexpected error listing connections during duplicate check: {e}", exc_info=True)
+        local_logger.bind(interface="nifi", direction="response", data={"error": str(e)}).debug("Received error from NiFi API (for duplicate check)")
+        raise ToolError(f"An unexpected error occurred while checking for existing connections: {e}")
+
+    # --- 5. Call NiFi Client to Create Connection --- (Renumbered step)
+    # relationships is already a list from the input parameter
+    local_logger.info(f"Executing create_nifi_connection: From {source_id} ({source_type}, {relationships}) To {target_id} ({target_type}) in derived group {common_parent_pg_id}")
 
     try:
         # --- Log NiFi Request (Create Connection) ---
@@ -867,19 +928,19 @@ async def create_nifi_connection(
             "process_group_id": common_parent_pg_id,
             "source_id": source_id,
             "target_id": target_id,
-            "relationships": relationships,
-            "source_type": source_type, # Pass inferred type
-            "target_type": target_type  # Pass inferred type
+            "relationships": relationships, # Pass the list directly
+            "source_type": source_type,
+            "target_type": target_type
         }
         local_logger.bind(interface="nifi", direction="request", data=nifi_create_req).debug("Calling NiFi API")
         # ------------------------------------------
         connection_entity = await nifi_api_client.create_connection(
-            process_group_id=common_parent_pg_id, # Use derived ID
+            process_group_id=common_parent_pg_id,
             source_id=source_id,
             target_id=target_id,
-            relationships=relationships,
-            source_type=source_type, # Pass inferred type
-            target_type=target_type  # Pass inferred type
+            relationships=relationships, # Pass the list directly
+            source_type=source_type,
+            target_type=target_type
         )
         # --- Log NiFi Response (Create Connection) ---
         # Log the full entity, might be large but useful for debug
@@ -1013,21 +1074,16 @@ async def delete_nifi_object(
     object_id: str
 ) -> Dict:
     """
-    Deletes a specific NiFi object (processor, connection, port, or process group).
+    Deletes a specific NiFi object after fetching its current revision.
 
-    IMPORTANT: 
-    - This tool first fetches the object's details to get the latest revision for deletion.
-    - Deleting a process group will only succeed if it is empty and stopped.
-    - Deleting processors or ports may fail if they are running or have active connections.
+    IMPORTANT: Deletion preconditions apply (e.g., process groups must be empty, components stopped/disconnected).
 
     Args:
-        object_type: The type of object to delete ('processor', 'connection', 'port', 'process_group').
+        object_type: The type of object to delete ('processor', 'connection', 'port', 'process_group'). Ports are handled automatically (input/output). Process groups must be empty and stopped. Processors/ports should ideally be stopped and disconnected.
         object_id: The UUID of the object to delete.
 
     Returns:
-        A dictionary indicating success or failure, e.g., 
-        {'status': 'success', 'message': 'Processor xyz deleted.'} or 
-        {'status': 'error', 'message': 'Failed to delete... Reason...'}
+        A dictionary indicating success or failure status and a message.
     """
     local_logger = logger.bind(tool_name="delete_nifi_object", object_type=object_type, object_id=object_id)
     await ensure_authenticated()
@@ -1151,10 +1207,14 @@ async def delete_nifi_object(
         # --------------------------------
         # Construct helpful message
         base_message = f"Failed to delete {object_type} {object_id}: {e}" 
-        if object_type == "port":
-            # Add specific hint for ports
-            port_hint = " Ensure the port is stopped and has no incoming/outgoing connections."
-            base_message += port_hint
+        if object_type in ["processor", "port", "connection"]:
+            # Add specific hint for components that need to be stopped/disconnected
+            hint = " Ensure the object and any connected components (processors/ports) are stopped and connections are empty before deletion."
+            base_message += hint
+        elif object_type == "process_group":
+            hint = " Ensure the process group is stopped and completely empty (no processors, connections, ports, or child groups)."
+            base_message += hint
+            
         return {"status": "error", "message": base_message} # Include conflict reason and hint
     except (NiFiAuthenticationError, ConnectionError) as e:
         local_logger.error(f"API error deleting {object_type} {object_id}: {e}", exc_info=True)
@@ -1171,119 +1231,490 @@ async def delete_nifi_object(
 
 
 @mcp.tool()
-async def update_nifi_processor_config(
+async def update_nifi_processor_properties(
     processor_id: str,
-    update_type: str,
-    update_data: Union[Dict[str, Any], List[str]]
+    processor_config_properties: Dict[str, Any] # Renamed argument
 ) -> Dict:
     """
-    Updates specific parts of a processor's configuration by replacing the existing values.
+    Updates a processor's configuration properties by *replacing* the existing property dictionary.
 
-    IMPORTANT: This tool modifies the processor component based on `update_type`.
-    - For 'properties', it *replaces* the entire `component.config.properties` dictionary.
-    - For 'auto-terminatedrelationships', it *replaces* the entire `component.config.autoTerminatedRelationships` list with the list of relationship names provided in `update_data`.
-    
-    It is crucial to fetch the current configuration first using `get_nifi_processor_details` to understand the existing structure before attempting an update.
-
-    To safely update configuration:
-    1. Use the `get_nifi_processor_details` tool to fetch the current processor entity.
-    2. If updating/adding 'properties': Extract `component.config.properties`, modify it, and provide the complete modified dictionary as `update_data`.
-    2. If deleting a 'property': include the property name with a value of null ni `update_data`. e.g. {"property_name": null}
-    3. If updating 'auto-terminated relationships': Extract the relevent relationship names from `component.relationships`
-      a) all relationships that should be auto-terminated must be provided as a list of strings in `update_data`. e.g. ["success", "failure"]
-      b) all relationships that should not be auto-terminated must not be included in `update_data`. To remove all auto-terminated relationships, provide an empty list, e.g. [].
-    4. Call *this* tool (`update_nifi_processor_config`) specifying the correct `update_type` and `update_data`.
+    It is crucial to fetch the current configuration first using `get_nifi_object_details`
+    to understand the existing structure before attempting an update.
 
     Args:
         processor_id: The UUID of the processor to update.
-        update_type: The type of configuration to update. Must be either 'properties' (targets component.config.properties)
-                     or 'relationships' (targets component.config.autoTerminatedRelationships).
-        update_data: A *complete* dictionary (for 'properties') or list of relationship *names* (strings) (for 'relationships') 
-                     representing the desired update. If empty or None, the tool will raise an error.
+        processor_config_properties: A complete dictionary representing the desired final state of all properties. e.g. {"Property1": "0", "Property2": "${filename:equalsIgnoreCase('hello.txt')} "}
+                                     Cannot be empty.
 
     Returns:
-        A dictionary representing the updated processor entity or an error status.
+        A dictionary representing the updated processor entity or an error status. Includes validation status.
     """
-    local_logger = logger.bind(tool_name="update_nifi_processor_config")
+    local_logger = logger.bind(tool_name="update_nifi_processor_properties")
     await ensure_authenticated()
 
     # --- Input Validation ---
-    valid_update_types = ["properties", "auto-terminatedrelationships"]
-    if update_type not in valid_update_types:
-        raise ToolError(f"Invalid 'update_type' specified: '{update_type}'. Must be one of {valid_update_types}.")
-        
-    if not update_data:
-        error_msg = f"The 'update_data' argument cannot be empty for update_type '{update_type}'. Please use 'get_nifi_processor_details' first to fetch the current configuration, modify it, and then provide the complete desired data structure to this tool."
-        local_logger.warning(f"Validation failed for update_nifi_processor_config (processor_id={processor_id}): {error_msg}")
+    if not processor_config_properties: # Updated check
+        error_msg = "The 'processor_config_properties' argument cannot be empty. Please use 'get_nifi_object_details' first to fetch the current configuration, modify it, and then provide the complete desired property dictionary to this tool."
+        local_logger.warning(f"Validation failed for update_nifi_processor_properties (processor_id={processor_id}): {error_msg}")
         raise ToolError(error_msg)
-        
-    # Type validation based on update_type
-    if update_type == "properties" and not isinstance(update_data, dict):
-         raise ToolError(f"Invalid 'update_data' type for update_type 'properties'. Expected a dictionary, got {type(update_data)}.")
-    elif update_type == "auto-terminatedrelationships" and not isinstance(update_data, list):
-         raise ToolError(f"Invalid 'update_data' type for update_type 'auto-terminatedrelationships'. Expected a list, got {type(update_data)}.")
-    # Add check for list elements being strings
-    elif update_type == "auto-terminatedrelationships" and not all(isinstance(item, str) for item in update_data):
-        raise ToolError(f"Invalid 'update_data' elements for update_type 'auto-terminatedrelationships'. Expected a list of strings (relationship names).")
+
+    if not isinstance(processor_config_properties, dict): # Updated check
+         raise ToolError(f"Invalid 'processor_config_properties' type. Expected a dictionary, got {type(processor_config_properties)}.")
     # ------------------------
 
-    local_logger.info(f"Executing update_nifi_processor_config for ID: {processor_id}, type: '{update_type}', data: {update_data}")
+    # --- Correction for nested 'properties' key ---
+    if isinstance(processor_config_properties, dict) and \
+       list(processor_config_properties.keys()) == ["properties"] and \
+       isinstance(processor_config_properties["properties"], dict):
+        
+        original_input = processor_config_properties # Keep original for logging
+        processor_config_properties = processor_config_properties["properties"]
+        local_logger.warning(f"Detected nested 'properties' key in input for processor {processor_id}. Correcting structure. Original input: {original_input}")
+    # --------------------------------------------
+
+    local_logger.info(f"Executing update_nifi_processor_properties for ID: {processor_id}, properties: {processor_config_properties}") # Updated log
     try:
+        # --- Get current details for revision and state check ---
+        local_logger.info(f"Fetching current details for processor {processor_id} before update.")
+        nifi_get_req = {"operation": "get_processor_details", "processor_id": processor_id}
+        local_logger.bind(interface="nifi", direction="request", data=nifi_get_req).debug("Calling NiFi API")
+        current_entity = await nifi_api_client.get_processor_details(processor_id)
+        component_precheck = current_entity.get("component", {})
+        current_state = component_precheck.get("state")
+        current_revision = current_entity.get("revision") # Get revision here
+        # Log minimal necessary info from pre-check
+        precheck_resp = {"id": processor_id, "state": current_state, "version": current_revision.get('version') if current_revision else None}
+        local_logger.bind(interface="nifi", direction="response", data=precheck_resp).debug("Received from NiFi API (for pre-check)")
+        
+        # --- State Pre-check ---
+        if current_state == "RUNNING":
+            error_msg = f"Processor '{component_precheck.get('name', processor_id)}' ({processor_id}) is currently RUNNING. It must be stopped before its properties can be updated."
+            local_logger.warning(error_msg)
+            return {"status": "error", "message": error_msg, "entity": None}
+        # ----------------------
+        
+        # Check if revision was obtained
+        if not current_revision:
+             raise ToolError(f"Could not retrieve revision for processor {processor_id}.")
+             
         # --- Log NiFi Request (Update Config) ---
-        # Note: Logging full update_data might be verbose for large configs/lists
         nifi_update_req = {
-            "operation": "update_processor_config", 
+            "operation": "update_processor_config",
             "processor_id": processor_id,
-            "update_type": update_type,
-            "update_data": update_data
+            "update_type": "properties", # Hardcoded
+            "update_data": processor_config_properties # Updated data passed
         }
         local_logger.bind(interface="nifi", direction="request", data=nifi_update_req).debug("Calling NiFi API (update processor component)")
         # ----------------------------------------
         updated_entity = await nifi_api_client.update_processor_config(
             processor_id=processor_id,
-            update_type=update_type,     # Pass type
-            update_data=update_data      # Pass data
+            update_type="properties",     # Pass type
+            update_data=processor_config_properties # Updated data passed
         )
-        # --- Log NiFi Response (Update Config) --- 
+        # --- Log NiFi Response (Update Config) ---
         filtered_updated_entity = filter_created_processor_data(updated_entity) # Reuse filter
         local_logger.bind(interface="nifi", direction="response", data=filtered_updated_entity).debug("Received from NiFi API (update processor component)")
         # -----------------------------------------
-        
-        local_logger.info(f"Successfully updated configuration for processor {processor_id}")
-        
+
+        local_logger.info(f"Successfully updated properties for processor {processor_id}")
+
         # ... (Validation check and return logic as before) ...
-        component = updated_entity.get("component", {}) 
+        component = updated_entity.get("component", {})
         validation_status = component.get("validationStatus", "UNKNOWN")
         validation_errors = component.get("validationErrors", [])
-        name = component.get("name", processor_id) 
-        
+        name = component.get("name", processor_id)
+
         if validation_status == "VALID":
             return {
                 "status": "success",
-                "message": f"Processor '{name}' configuration updated successfully.",
+                "message": f"Processor '{name}' properties updated successfully.",
                 "entity": filtered_updated_entity
             }
         else:
             error_msg_snippet = f" ({validation_errors[0]})" if validation_errors else ""
-            local_logger.warning(f"Processor '{name}' configuration updated, but validation status is {validation_status}{error_msg_snippet}.")
+            local_logger.warning(f"Processor '{name}' properties updated, but validation status is {validation_status}{error_msg_snippet}.")
             return {
                 "status": "warning",
-                "message": f"Processor '{name}' configuration updated, but validation status is {validation_status}{error_msg_snippet}. Check configuration.",
+                "message": f"Processor '{name}' properties updated, but validation status is {validation_status}{error_msg_snippet}. Check configuration.",
                 "entity": filtered_updated_entity
             }
 
     except ValueError as e: # Catch 'not found' or 'conflict'
-        local_logger.warning(f"Error updating processor config {processor_id}: {e}")
+        local_logger.warning(f"Error updating processor properties {processor_id}: {e}")
         local_logger.bind(interface="nifi", direction="response", data={"error": str(e)}).debug("Received error from NiFi API (update processor component)")
-        return {"status": "error", "message": f"Error updating config for processor {processor_id}: {e}", "entity": None}
+        return {"status": "error", "message": f"Error updating properties for processor {processor_id}: {e}", "entity": None}
     except (NiFiAuthenticationError, ConnectionError) as e:
-        local_logger.error(f"API error updating processor config: {e}", exc_info=True)
+        local_logger.error(f"API error updating processor properties: {e}", exc_info=True)
         local_logger.bind(interface="nifi", direction="response", data={"error": str(e)}).debug("Received error from NiFi API (update processor component)")
-        return {"status": "error", "message": f"Failed to update NiFi processor config: {e}", "entity": None}
+        return {"status": "error", "message": f"Failed to update NiFi processor properties: {e}", "entity": None}
     except Exception as e:
-        local_logger.error(f"Unexpected error updating processor config: {e}", exc_info=True)
+        local_logger.error(f"Unexpected error updating processor properties: {e}", exc_info=True)
         local_logger.bind(interface="nifi", direction="response", data={"error": str(e)}).debug("Received error from NiFi API (update processor component)")
-        return {"status": "error", "message": f"An unexpected error occurred during processor config update: {e}", "entity": None}
+        return {"status": "error", "message": f"An unexpected error occurred during processor properties update: {e}", "entity": None}
+
+
+@mcp.tool()
+async def delete_nifi_processor_properties(
+    processor_id: str,
+    property_names_to_delete: List[str]
+) -> Dict:
+    """
+    Deletes specific properties from a processor's configuration by setting their values to null.
+
+    This tool fetches the current configuration, marks the specified properties for deletion,
+    and then submits the update.
+
+    Args:
+        processor_id: The UUID of the processor to modify.
+        property_names_to_delete: A non-empty list of property names (strings) to delete from the processor's configuration.
+
+    Returns:
+        A dictionary representing the updated processor entity or an error status. Includes validation status.
+    """
+    local_logger = logger.bind(tool_name="delete_nifi_processor_properties", processor_id=processor_id)
+    await ensure_authenticated()
+
+    # --- Input Validation ---
+    if not property_names_to_delete:
+        raise ToolError("The 'property_names_to_delete' list cannot be empty.")
+    if not isinstance(property_names_to_delete, list) or not all(isinstance(item, str) for item in property_names_to_delete):
+        raise ToolError("Invalid 'property_names_to_delete' type. Expected a non-empty list of strings.")
+    # ------------------------
+
+    local_logger.info(f"Preparing to delete properties {property_names_to_delete} for processor {processor_id}")
+
+    try:
+        # 1. Get current processor entity to obtain the latest revision and properties
+        local_logger.info(f"Fetching current details for processor {processor_id} before deleting properties.")
+        # --- Log NiFi Request (Get Details) ---
+        nifi_get_req = {"operation": "get_processor_details", "processor_id": processor_id}
+        local_logger.bind(interface="nifi", direction="request", data=nifi_get_req).debug("Calling NiFi API")
+        # ------------------------------------------
+        current_entity = await nifi_api_client.get_processor_details(processor_id)
+        # --- Log NiFi Response (Get Details) ---
+        # Log full entity as we need config
+        local_logger.bind(interface="nifi", direction="response", data=current_entity).debug("Received from NiFi API (full details)")
+        # -------------------------------------------
+
+        current_revision = current_entity.get("revision")
+        current_component = current_entity.get("component", {})
+        current_config = current_component.get("config", {})
+        current_properties = current_config.get("properties", {})
+        current_state = current_component.get("state") # Get current state
+
+        # --- State Pre-check ---
+        if current_state == "RUNNING":
+            error_msg = f"Processor '{current_component.get('name', processor_id)}' ({processor_id}) is currently RUNNING. It must be stopped before its properties can be deleted."
+            local_logger.warning(error_msg)
+            return {"status": "error", "message": error_msg, "entity": None}
+        # ----------------------
+        
+        if not current_revision:
+             raise ToolError(f"Could not retrieve revision for processor {processor_id}.")
+
+        # 2. Prepare the modified properties dictionary
+        modified_properties = current_properties.copy()
+        properties_actually_deleted = []
+        for prop_name in property_names_to_delete:
+            if prop_name in modified_properties:
+                modified_properties[prop_name] = None # Set to None for deletion via NiFi API
+                properties_actually_deleted.append(prop_name)
+            else:
+                local_logger.warning(f"Property '{prop_name}' requested for deletion was not found in the current configuration of processor {processor_id}. Skipping.")
+
+        if not properties_actually_deleted:
+            local_logger.warning(f"None of the requested properties {property_names_to_delete} were found for deletion. No update will be sent.")
+            # Return a success-like status indicating nothing needed to be done
+            filtered_current_entity = filter_created_processor_data(current_entity) # Reuse filter
+            return {
+                "status": "success",
+                "message": f"No properties needed deletion for processor '{current_component.get('name', processor_id)}'. Properties requested ({property_names_to_delete}) were not found.",
+                "entity": filtered_current_entity
+            }
+            
+        # 3. Call the update config method with the modified properties
+        local_logger.info(f"Attempting to delete properties: {properties_actually_deleted}")
+        # --- Log NiFi Request (Update Config) ---
+        nifi_update_req = {
+            "operation": "update_processor_config",
+            "processor_id": processor_id,
+            "update_type": "properties",
+            "update_data": modified_properties # Send the dict with None values
+        }
+        local_logger.bind(interface="nifi", direction="request", data=nifi_update_req).debug("Calling NiFi API (update processor component)")
+        # ----------------------------------------
+        updated_entity = await nifi_api_client.update_processor_config(
+            processor_id=processor_id,
+            update_type="properties",
+            update_data=modified_properties
+        )
+        # --- Log NiFi Response (Update Config) ---
+        filtered_updated_entity = filter_created_processor_data(updated_entity) # Reuse filter
+        local_logger.bind(interface="nifi", direction="response", data=filtered_updated_entity).debug("Received from NiFi API (update processor component)")
+        # -----------------------------------------
+
+        local_logger.info(f"Successfully submitted update to delete properties for processor {processor_id}")
+
+        # 4. Check validation status and return
+        component = updated_entity.get("component", {})
+        validation_status = component.get("validationStatus", "UNKNOWN")
+        validation_errors = component.get("validationErrors", [])
+        name = component.get("name", processor_id)
+
+        if validation_status == "VALID":
+            return {
+                "status": "success",
+                "message": f"Processor '{name}' properties ({properties_actually_deleted}) deleted successfully.",
+                "entity": filtered_updated_entity
+            }
+        else:
+            error_msg_snippet = f" ({validation_errors[0]})" if validation_errors else ""
+            local_logger.warning(f"Processor '{name}' properties deleted, but validation status is {validation_status}{error_msg_snippet}.")
+            return {
+                "status": "warning",
+                "message": f"Processor '{name}' properties ({properties_actually_deleted}) deleted, but validation status is {validation_status}{error_msg_snippet}. Check configuration.",
+                "entity": filtered_updated_entity
+            }
+
+    except ValueError as e: # Catch 'not found' or 'conflict'
+        local_logger.warning(f"Error deleting processor properties {processor_id}: {e}")
+        local_logger.bind(interface="nifi", direction="response", data={"error": str(e)}).debug("Received error from NiFi API (update processor component)")
+        # Distinguish between not found and conflict
+        if "not found" in str(e).lower():
+             return {"status": "error", "message": f"Processor {processor_id} not found.", "entity": None}
+        elif "conflict" in str(e).lower() or "revision mismatch" in str(e).lower():
+             return {"status": "error", "message": f"Conflict deleting properties for processor {processor_id}. Revision mismatch: {e}", "entity": None}
+        else:
+            return {"status": "error", "message": f"Error deleting properties for processor {processor_id}: {e}", "entity": None}
+    except (NiFiAuthenticationError, ConnectionError) as e:
+        local_logger.error(f"API error deleting processor properties: {e}", exc_info=True)
+        local_logger.bind(interface="nifi", direction="response", data={"error": str(e)}).debug("Received error from NiFi API (update processor component)")
+        return {"status": "error", "message": f"Failed to delete NiFi processor properties: {e}", "entity": None}
+    except Exception as e:
+        local_logger.error(f"Unexpected error deleting processor properties: {e}", exc_info=True)
+        local_logger.bind(interface="nifi", direction="response", data={"error": str(e)}).debug("Received error from NiFi API (update processor component)")
+        return {"status": "error", "message": f"An unexpected error occurred during processor properties deletion: {e}", "entity": None}
+
+
+@mcp.tool()
+async def update_nifi_processor_relationships(
+    processor_id: str,
+    auto_terminated_relationships: List[str]
+) -> Dict:
+    """
+    Updates a processor's auto-terminated relationships list by *replacing* the existing list.
+
+    It is crucial to fetch the current configuration first using `get_nifi_object_details`
+    to understand the existing structure before attempting an update.
+
+    Args:
+        processor_id: The UUID of the processor to update.
+        auto_terminated_relationships: A list containing only the names (strings) of the relationships
+                                       that *should* be auto-terminated. Relationships not included
+                                       in the list will *not* be auto-terminated. Provide an empty
+                                       list `[]` to remove all auto-terminations.
+
+    Returns:
+        A dictionary representing the updated processor entity or an error status. Includes validation status.
+    """
+    local_logger = logger.bind(tool_name="update_nifi_processor_relationships")
+    await ensure_authenticated()
+
+    # --- Input Validation ---
+    if not isinstance(auto_terminated_relationships, list):
+         raise ToolError(f"Invalid 'auto_terminated_relationships' type. Expected a list, got {type(auto_terminated_relationships)}.")
+    # Add check for list elements being strings
+    if not all(isinstance(item, str) for item in auto_terminated_relationships):
+        raise ToolError("Invalid 'auto_terminated_relationships' elements. Expected a list of strings (relationship names).")
+    # ------------------------
+
+    local_logger.info(f"Executing update_nifi_processor_relationships for ID: {processor_id}, relationships: {auto_terminated_relationships}")
+    try:
+        # --- Get current details for revision and state check ---
+        local_logger.info(f"Fetching current details for processor {processor_id} before update.")
+        nifi_get_req = {"operation": "get_processor_details", "processor_id": processor_id}
+        local_logger.bind(interface="nifi", direction="request", data=nifi_get_req).debug("Calling NiFi API")
+        current_entity = await nifi_api_client.get_processor_details(processor_id)
+        component_precheck = current_entity.get("component", {})
+        current_state = component_precheck.get("state")
+        current_revision = current_entity.get("revision") # Get revision here too
+        # Log minimal necessary info from pre-check
+        precheck_resp = {"id": processor_id, "state": current_state, "version": current_revision.get('version') if current_revision else None} # Use processor_id
+        local_logger.bind(interface="nifi", direction="response", data=precheck_resp).debug("Received from NiFi API (for pre-check)")
+        
+        # --- State Pre-check ---
+        if current_state == "RUNNING":
+            error_msg = f"Processor '{component_precheck.get('name', processor_id)}' ({processor_id}) is currently RUNNING. It must be stopped before its relationships can be updated."
+            local_logger.warning(error_msg)
+            return {"status": "error", "message": error_msg, "entity": None}
+        # ----------------------
+
+        # Check if revision was obtained
+        if not current_revision:
+            raise ToolError(f"Could not retrieve revision for processor {processor_id}.")
+            
+        # --- Log NiFi Request (Update Config) ---
+        nifi_update_req = {
+            "operation": "update_processor_config",
+            "processor_id": processor_id,
+            "update_type": "auto-terminatedrelationships", # Hardcoded
+            "update_data": auto_terminated_relationships
+        }
+        local_logger.bind(interface="nifi", direction="request", data=nifi_update_req).debug("Calling NiFi API (update processor component)")
+        # ----------------------------------------
+        updated_entity = await nifi_api_client.update_processor_config(
+            processor_id=processor_id,
+            update_type="auto-terminatedrelationships", # Pass type
+            update_data=auto_terminated_relationships   # Pass data
+        )
+        # --- Log NiFi Response (Update Config) ---
+        filtered_updated_entity = filter_created_processor_data(updated_entity) # Reuse filter
+        local_logger.bind(interface="nifi", direction="response", data=filtered_updated_entity).debug("Received from NiFi API (update processor component)")
+        # -----------------------------------------
+
+        local_logger.info(f"Successfully updated auto-terminated relationships for processor {processor_id}")
+
+        # ... (Validation check and return logic as before) ...
+        component = updated_entity.get("component", {})
+        validation_status = component.get("validationStatus", "UNKNOWN")
+        validation_errors = component.get("validationErrors", [])
+        name = component.get("name", processor_id)
+
+        if validation_status == "VALID":
+            return {
+                "status": "success",
+                "message": f"Processor '{name}' auto-terminated relationships updated successfully.",
+                "entity": filtered_updated_entity
+            }
+        else:
+            # Usually relationship changes don't cause validation errors, but check just in case
+            error_msg_snippet = f" ({validation_errors[0]})" if validation_errors else ""
+            local_logger.warning(f"Processor '{name}' auto-terminated relationships updated, but validation status is {validation_status}{error_msg_snippet}.")
+            return {
+                "status": "warning", # Keep as warning if validation is not VALID
+                "message": f"Processor '{name}' auto-terminated relationships updated, but validation status is {validation_status}{error_msg_snippet}.",
+                "entity": filtered_updated_entity
+            }
+
+    except ValueError as e: # Catch 'not found' or 'conflict'
+        local_logger.warning(f"Error updating processor relationships {processor_id}: {e}")
+        local_logger.bind(interface="nifi", direction="response", data={"error": str(e)}).debug("Received error from NiFi API (update processor component)")
+        return {"status": "error", "message": f"Error updating relationships for processor {processor_id}: {e}", "entity": None}
+    except (NiFiAuthenticationError, ConnectionError) as e:
+        local_logger.error(f"API error updating processor relationships: {e}", exc_info=True)
+        local_logger.bind(interface="nifi", direction="response", data={"error": str(e)}).debug("Received error from NiFi API (update processor component)")
+        return {"status": "error", "message": f"Failed to update NiFi processor relationships: {e}", "entity": None}
+    except Exception as e:
+        local_logger.error(f"Unexpected error updating processor relationships: {e}", exc_info=True)
+        local_logger.bind(interface="nifi", direction="response", data={"error": str(e)}).debug("Received error from NiFi API (update processor component)")
+        return {"status": "error", "message": f"An unexpected error occurred during processor relationships update: {e}", "entity": None}
+
+
+@mcp.tool()
+async def update_nifi_connection(
+    connection_id: str,
+    relationships: List[str]
+) -> Dict:
+    """
+    Updates the selected relationships for a NiFi connection by *replacing* the existing list.
+
+    It is crucial to fetch the current connection details first using `get_nifi_object_details` 
+    to ensure the relationships provided are valid for the source component.
+
+    Args:
+        connection_id: The UUID of the connection to update.
+        relationships: A non-empty list containing the names (strings) of the relationships that *should*
+                       be selected for this connection. NiFi requires at least one relationship to be selected.
+                       To remove the connection entirely (deselecting all relationships), use the `delete_nifi_object` tool instead.
+
+    Returns:
+        A dictionary representing the updated connection entity or an error status.
+    """
+    local_logger = logger.bind(tool_name="update_nifi_connection", connection_id=connection_id)
+    await ensure_authenticated()
+
+    # --- Input Validation ---
+    if not isinstance(relationships, list):
+         raise ToolError(f"Invalid 'relationships' type. Expected a list, got {type(relationships)}.")
+    if not all(isinstance(item, str) for item in relationships):
+        raise ToolError("Invalid 'relationships' elements. Expected a list of strings (relationship names).")
+    # Add validation to prevent empty list
+    if not relationships:
+        raise ToolError("The 'relationships' list cannot be empty. NiFi connections require at least one selected relationship. To remove the connection, use the 'delete_nifi_object' tool.")
+    # Note: We cannot easily validate relationship names here without knowing the source processor type/details.
+    # The NiFi API will handle validation on the PUT request.
+    # ------------------------
+
+    local_logger.info(f"Executing update_nifi_connection for ID: {connection_id}, relationships: {relationships}")
+
+    try:
+        # 1. Get current connection entity to obtain the latest revision and component details
+        local_logger.info(f"Fetching current details for connection {connection_id} before update.")
+        # --- Log NiFi Request (Get Connection) ---
+        nifi_get_req = {"operation": "get_connection", "connection_id": connection_id}
+        local_logger.bind(interface="nifi", direction="request", data=nifi_get_req).debug("Calling NiFi API")
+        # ------------------------------------------
+        current_entity = await nifi_api_client.get_connection(connection_id)
+        # --- Log NiFi Response (Get Connection) ---
+        local_logger.bind(interface="nifi", direction="response", data=current_entity).debug("Received from NiFi API (full details)")
+        # -------------------------------------------
+        current_revision = current_entity["revision"]
+        current_component = current_entity["component"]
+
+        # 2. Prepare the update payload
+        # Copy the existing component data and modify only selectedRelationships
+        update_component = current_component.copy()
+        update_component["selectedRelationships"] = relationships
+        
+        # Construct the full update payload with the fetched revision
+        update_payload = {
+            "revision": current_revision,
+            "component": update_component
+        }
+
+        # 3. Make the PUT request using the client method
+        local_logger.info(f"Attempting to update connection {connection_id} with new relationships.")
+        # --- Log NiFi Request (Update Connection) ---
+        nifi_update_req = {
+            "operation": "update_connection",
+            "connection_id": connection_id,
+            # Don't log full payload again, just relationships
+            "selectedRelationships": relationships 
+        }
+        local_logger.bind(interface="nifi", direction="request", data=nifi_update_req).debug("Calling NiFi API (update connection)")
+        # -----------------------------------------
+        updated_entity = await nifi_api_client.update_connection(connection_id, update_payload)
+        # --- Log NiFi Response (Update Connection) ---
+        filtered_updated_entity = filter_connection_data(updated_entity) # Reuse filter
+        local_logger.bind(interface="nifi", direction="response", data=filtered_updated_entity).debug("Received from NiFi API (update connection)")
+        # ------------------------------------------
+
+        local_logger.info(f"Successfully updated relationships for connection {connection_id}")
+
+        return {
+            "status": "success",
+            "message": f"Connection '{connection_id}' relationships updated successfully.",
+            "entity": filtered_updated_entity
+        }
+
+    except ValueError as e: # Catches 'not found' or 'conflict' from get/update calls
+        local_logger.warning(f"Error updating connection {connection_id}: {e}")
+        local_logger.bind(interface="nifi", direction="response", data={"error": str(e)}).debug("Received error from NiFi API (update connection)")
+        # Distinguish between not found and conflict
+        if "not found" in str(e).lower():
+            return {"status": "error", "message": f"Connection {connection_id} not found.", "entity": None}
+        elif "conflict" in str(e).lower() or "revision mismatch" in str(e).lower():
+             return {"status": "error", "message": f"Conflict updating connection {connection_id}. Revision mismatch or invalid relationships provided: {e}", "entity": None}
+        else:
+             return {"status": "error", "message": f"Error updating connection {connection_id}: {e}", "entity": None}
+    except (NiFiAuthenticationError, ConnectionError) as e:
+        local_logger.error(f"API error updating connection relationships: {e}", exc_info=True)
+        local_logger.bind(interface="nifi", direction="response", data={"error": str(e)}).debug("Received error from NiFi API (update connection)")
+        return {"status": "error", "message": f"Failed to update NiFi connection relationships: {e}", "entity": None}
+    except Exception as e:
+        local_logger.error(f"Unexpected error updating connection relationships: {e}", exc_info=True)
+        local_logger.bind(interface="nifi", direction="response", data={"error": str(e)}).debug("Received error from NiFi API (update connection)")
+        return {"status": "error", "message": f"An unexpected error occurred during connection relationships update: {e}", "entity": None}
 
 
 @mcp.tool()
@@ -1317,42 +1748,163 @@ async def operate_nifi_object(
         operation_name_for_log = f"update_{object_type}_state"
 
         if object_type == "processor":
-        # --- Log NiFi Request (Update State) --- 
+            # --- Pre-check for starting a processor ---
+            if operation_type == "start":
+                local_logger.info(f"Performing pre-checks for starting processor {object_id}...")
+                try:
+                    # Fetch details to check validation status and current state
+                    # --- Log NiFi Request (Get Details for Pre-check) ---
+                    nifi_get_req = {"operation": "get_processor_details", "processor_id": object_id}
+                    local_logger.bind(interface="nifi", direction="request", data=nifi_get_req).debug("Calling NiFi API (for pre-check)")
+                    # ---------------------------------------------------
+                    proc_details = await nifi_api_client.get_processor_details(object_id)
+                    # --- Log NiFi Response (Get Details for Pre-check) ---
+                    # Log only relevant parts for pre-check
+                    component_precheck = proc_details.get("component", {})
+                    precheck_resp = {
+                        "id": object_id,
+                        "validationStatus": component_precheck.get("validationStatus"),
+                        "state": component_precheck.get("state")
+                    }
+                    local_logger.bind(interface="nifi", direction="response", data=precheck_resp).debug("Received from NiFi API (for pre-check)")
+                    # ----------------------------------------------------
+                    
+                    component = proc_details.get("component", {})
+                    validation_status = component.get("validationStatus")
+                    current_state = component.get("state")
+                    validation_errors = component.get("validationErrors", [])
+                    name = component.get("name", object_id)
+
+                    if validation_status != "VALID":
+                        error_list_str = ", ".join(validation_errors) if validation_errors else "No specific errors listed."
+                        error_msg = f"Processor '{name}' ({object_id}) cannot be started because its validation status is {validation_status}. Errors: [{error_list_str}]"
+                        local_logger.warning(error_msg)
+                        return {"status": "error", "message": error_msg, "entity": None}
+                        
+                    if current_state == "DISABLED":
+                        error_msg = f"Processor '{name}' ({object_id}) cannot be started because it is currently DISABLED. Enable it first."
+                        local_logger.warning(error_msg)
+                        return {"status": "error", "message": error_msg, "entity": None}
+                        
+                    local_logger.info(f"Processor {object_id} pre-checks passed (Validation: {validation_status}, State: {current_state}). Proceeding with start request.")
+
+                except ValueError as e: # Handle processor not found during pre-check
+                    local_logger.warning(f"Processor {object_id} not found during start pre-check: {e}")
+                    local_logger.bind(interface="nifi", direction="response", data={"error": str(e)}).debug("Received error from NiFi API (for pre-check)")
+                    return {"status": "error", "message": f"Processor {object_id} not found.", "entity": None}
+                except Exception as e:
+                    local_logger.error(f"Error during start pre-check for processor {object_id}: {e}", exc_info=True)
+                    local_logger.bind(interface="nifi", direction="response", data={"error": str(e)}).debug("Received error from NiFi API (for pre-check)")
+                    return {"status": "error", "message": f"Failed pre-start check for processor {object_id}: {e}", "entity": None}
+            # --- End of Pre-check ---
+            
+            # Proceed with the actual state update API call
+            # --- Log NiFi Request (Update State) --- 
             nifi_update_req = {"operation": operation_name_for_log, "processor_id": object_id, "state": target_state}
             local_logger.bind(interface="nifi", direction="request", data=nifi_update_req).debug("Calling NiFi API")
-        # ---------------------------------------
+            # ---------------------------------------
             updated_entity = await nifi_api_client.update_processor_state(object_id, target_state)
 
         elif object_type == "port":
+            # --- Pre-check for starting a port ---
+            port_details_for_check = None
+            if operation_type == "start":
+                local_logger.info(f"Performing pre-checks for starting port {object_id}...")
+                try:
+                    # Fetch details to check validation status and current state
+                    # Try input first
+                    try:
+                        # --- Log NiFi Request (Get Details for Pre-check) ---
+                        nifi_get_req = {"operation": "get_input_port_details", "port_id": object_id}
+                        local_logger.bind(interface="nifi", direction="request", data=nifi_get_req).debug("Calling NiFi API (trying input port for pre-check)")
+                        # ---------------------------------------------------
+                        port_details_for_check = await nifi_api_client.get_input_port_details(object_id)
+                        port_type_found = "input"
+                    except ValueError: # Not input, try output
+                        # --- Log NiFi Response (Input Not Found Pre-check) ---
+                        local_logger.bind(interface="nifi", direction="response", data={"error": "Input port not found"}).debug("Received error from NiFi API (for pre-check)")
+                        # -----------------------------------------------------
+                        # --- Log NiFi Request (Get Details for Pre-check) ---
+                        nifi_get_req = {"operation": "get_output_port_details", "port_id": object_id}
+                        local_logger.bind(interface="nifi", direction="request", data=nifi_get_req).debug("Calling NiFi API (trying output port for pre-check)")
+                        # ----------------------------------------------------
+                        port_details_for_check = await nifi_api_client.get_output_port_details(object_id)
+                        port_type_found = "output"
+                        
+                    # --- Log NiFi Response (Get Details for Pre-check) ---
+                    component_precheck = port_details_for_check.get("component", {})
+                    precheck_resp = {
+                        "id": object_id,
+                        "type": port_type_found,
+                        "validationStatus": component_precheck.get("validationStatus"),
+                        "state": component_precheck.get("state")
+                    }
+                    local_logger.bind(interface="nifi", direction="response", data=precheck_resp).debug("Received from NiFi API (for pre-check)")
+                    # ----------------------------------------------------
+                    
+                    component = port_details_for_check.get("component", {})
+                    validation_status = component.get("validationStatus")
+                    current_state = component.get("state")
+                    validation_errors = component.get("validationErrors", [])
+                    name = component.get("name", object_id)
+
+                    if validation_status != "VALID":
+                        error_list_str = ", ".join(validation_errors) if validation_errors else "No specific errors listed."
+                        error_msg = f"Port '{name}' ({object_id}) cannot be started because its validation status is {validation_status}. Errors: [{error_list_str}]"
+                        local_logger.warning(error_msg)
+                        return {"status": "error", "message": error_msg, "entity": None}
+                        
+                    if current_state == "DISABLED":
+                        error_msg = f"Port '{name}' ({object_id}) cannot be started because it is currently DISABLED. Enable it first."
+                        local_logger.warning(error_msg)
+                        return {"status": "error", "message": error_msg, "entity": None}
+
+                    local_logger.info(f"Port {object_id} pre-checks passed (Validation: {validation_status}, State: {current_state}). Proceeding with start request.")
+
+                except ValueError as e: # Handle port not found during pre-check (should cover both input/output attempts)
+                    local_logger.warning(f"Port {object_id} not found during start pre-check: {e}")
+                    local_logger.bind(interface="nifi", direction="response", data={"error": str(e)}).debug("Received error from NiFi API (for pre-check)")
+                    return {"status": "error", "message": f"Port {object_id} not found.", "entity": None}
+                except Exception as e:
+                    local_logger.error(f"Error during start pre-check for port {object_id}: {e}", exc_info=True)
+                    local_logger.bind(interface="nifi", direction="response", data={"error": str(e)}).debug("Received error from NiFi API (for pre-check)")
+                    return {"status": "error", "message": f"Failed pre-start check for port {object_id}: {e}", "entity": None}
+            # --- End of Port Pre-check ---
+            
             # Need to determine if input or output port first to call correct API
             # This also implicitly fetches the revision needed by the update state methods
-            local_logger.info("Determining port type (input/output) before changing state...")
-            try:
-                # Try input first (fetches revision implicitly)
-                _ = await nifi_api_client.get_input_port_details(object_id) 
-                port_type_found = "input"
+            # We might have already found the port type during pre-check
+            if port_type_found is None: # If not starting, or pre-check failed unexpectedly, find type now
+                local_logger.info("Determining port type (input/output) before changing state...")
+                try:
+                    _ = await nifi_api_client.get_input_port_details(object_id) 
+                    port_type_found = "input"
+                    local_logger.info(f"Port {object_id} identified as INPUT port.")
+                except ValueError: # Not found as input
+                    local_logger.warning(f"Port {object_id} not found as input, trying output.")
+                    try:
+                        _ = await nifi_api_client.get_output_port_details(object_id) 
+                        port_type_found = "output"
+                        local_logger.info(f"Port {object_id} identified as OUTPUT port.")
+                    except ValueError: # Not found as output either
+                        raise ToolError(f"Port with ID {object_id} not found (checked input and output). Cannot change state.")
+
+            # Call the appropriate state update method
+            if port_type_found == "input":
                 operation_name_for_log = "update_input_port_state"
-                local_logger.info(f"Port {object_id} identified as INPUT port.")
                 # --- Log NiFi Request (Update State) --- 
                 nifi_update_req = {"operation": operation_name_for_log, "port_id": object_id, "state": target_state}
                 local_logger.bind(interface="nifi", direction="request", data=nifi_update_req).debug("Calling NiFi API")
                 # ---------------------------------------
                 updated_entity = await nifi_api_client.update_input_port_state(object_id, target_state)
-            except ValueError: # Not found as input
-                local_logger.warning(f"Port {object_id} not found as input, trying output.")
-                try:
-                     # Try output (fetches revision implicitly)
-                    _ = await nifi_api_client.get_output_port_details(object_id) 
-                    port_type_found = "output"
-                    operation_name_for_log = "update_output_port_state"
-                    local_logger.info(f"Port {object_id} identified as OUTPUT port.")
-                    # --- Log NiFi Request (Update State) --- 
-                    nifi_update_req = {"operation": operation_name_for_log, "port_id": object_id, "state": target_state}
-                    local_logger.bind(interface="nifi", direction="request", data=nifi_update_req).debug("Calling NiFi API")
-                    # ---------------------------------------
-                    updated_entity = await nifi_api_client.update_output_port_state(object_id, target_state)
-                except ValueError: # Not found as output either
-                    raise ToolError(f"Port with ID {object_id} not found (checked input and output). Cannot change state.")
+            elif port_type_found == "output":
+                operation_name_for_log = "update_output_port_state"
+                # --- Log NiFi Request (Update State) --- 
+                nifi_update_req = {"operation": operation_name_for_log, "port_id": object_id, "state": target_state}
+                local_logger.bind(interface="nifi", direction="request", data=nifi_update_req).debug("Calling NiFi API")
+                # ---------------------------------------
+                updated_entity = await nifi_api_client.update_output_port_state(object_id, target_state)
+            # No else needed, port_type_found guaranteed if we reach here
         else:
             raise ToolError(f"Invalid object_type specified: {object_type}. Must be 'processor' or 'port'.")
 
@@ -1413,24 +1965,25 @@ async def document_nifi_flow(
     include_descriptions: bool = True
 ) -> Dict[str, Any]:
     """
-    Documents a NiFi flow by traversing processors and their connections.
+    Documents a NiFi flow by traversing processors and connections within a specified process group.
 
-    Args:
-        process_group_id: The UUID of the process group to document. Defaults to the root group if None.
-        starting_processor_id: The UUID of the processor to start the traversal from.
-            If None, documents all processors in the process group.
-        max_depth: Maximum depth to traverse from the starting processor. Defaults to 10.
-        include_properties: Whether to include processor properties in the documentation. Defaults to True.
-        include_descriptions: Whether to include processor descriptions in the documentation. Defaults to True.
+    Parameters
+    ----------
+    process_group_id : str | None, optional
+        The UUID of the process group to document. If None or omitted, defaults to the root process group. (default is None)
+    starting_processor_id : str | None, optional
+        Optional. The UUID of a processor to begin traversal from. If provided, documentation will be limited to components reachable within `max_depth` steps (incoming and outgoing) from this processor. If None, documents all components directly within the `process_group_id`. (default is None)
+    max_depth : int, optional
+        Maximum depth to traverse connections when `starting_processor_id` is specified. Defaults to 10. Ignored if `starting_processor_id` is None. (default is 10)
+    include_properties : bool, optional
+        Whether to include extracted key processor properties, dynamic properties, and expression analysis in the documentation. Defaults to True. (default is True)
+    include_descriptions : bool, optional
+        Whether to include processor description/comment fields in the documentation. Defaults to True. (default is True)
 
-    Returns:
-        A dictionary containing the flow documentation, including:
-        - processors: A list of processors and their configurations
-        - connections: A list of connections between processors
-        - graph_structure: The graph structure for traversal
-        - common_paths: Pre-identified paths through the flow
-        - decision_points: Branching points in the flow
-        - parameters: Parameter context information (if available)
+    Returns
+    -------
+    Dict[str, Any]
+        A dictionary containing the flow documentation, including processors, connections, graph structure summary, identified paths, decision points, and parameter context (if `include_properties` is True).
     """
     local_logger = logger.bind(tool_name="document_nifi_flow") # Add bound logger
     await ensure_authenticated()
@@ -1651,7 +2204,22 @@ async def get_tools(request: Request):
             
             for tool_info in tools_info: 
                 tool_name = getattr(tool_info, 'name', 'unknown')
-                tool_description = getattr(tool_info, 'description', '')
+                # Get the full docstring (seems to be stored in 'description' by MCP here)
+                raw_docstring = getattr(tool_info, 'description', '')
+                # Parse the docstring
+                parsed_docstring = parse(raw_docstring)
+                # Extract just the short description for the main tool description
+                base_description = parsed_docstring.short_description or raw_docstring.split('\n\n')[0]
+                returns_description = ""
+                if parsed_docstring.returns and parsed_docstring.returns.description:
+                    # Format the returns section nicely
+                    returns_description = f"\n\n**Returns:**\n{parsed_docstring.returns.description}"
+                    
+                tool_description = f"{base_description}{returns_description}"
+                
+                # Create a map of param name -> parsed description
+                param_descriptions = {p.arg_name: p.description for p in parsed_docstring.params}
+                
                 # Extract only the necessary parts for the schema
                 raw_params_schema = getattr(tool_info, 'parameters', {})
                 
@@ -1673,6 +2241,10 @@ async def get_tools(request: Request):
                             cleaned_schema.pop('anyOf', None) 
                             cleaned_schema.pop('title', None)
                             cleaned_schema.pop('default', None)  # Also remove default values
+                            
+                            # Add parsed description
+                            cleaned_schema['description'] = param_descriptions.get(prop_name, '')
+                            
                             cleaned_properties[prop_name] = cleaned_schema
                         else:
                             # Handle cases where a property schema isn't a dict
@@ -1789,7 +2361,12 @@ async def execute_tool(tool_name: str, payload: ToolExecutionPayload, request: R
         
     except ToolError as e:
         # Log the specific ToolError details with bound context
-        bound_logger.error(f"ToolError executing tool '{tool_name}' via ToolManager: {str(e)}", exc_info=True) 
+        bound_logger.error(
+            "ToolError executing tool '{tool_name}' via ToolManager: {error_details}", 
+            tool_name=tool_name, 
+            error_details=str(e), 
+            exc_info=True
+        )
         return JSONResponse(
             status_code=422,
             content={"detail": f"Tool execution failed: {str(e)}"}
@@ -1801,15 +2378,21 @@ async def execute_tool(tool_name: str, payload: ToolExecutionPayload, request: R
              content={"detail": f"NiFi authentication failed: {str(e)}. Check server credentials."}
         ) 
     except Exception as e:
-        bound_logger.error(f"Unexpected error executing tool '{tool_name}' via ToolManager: {e}", exc_info=True)
+        # Catch missing/invalid arguments specifically
+        if isinstance(e, TypeError) and (
+            "required positional argument" in str(e) or 
+            "missing" in str(e) and "required argument" in str(e) or # More robust check for missing args
+            "unexpected keyword argument" in str(e)
+        ):
+             bound_logger.warning(f"Invalid arguments provided for tool '{tool_name}': {e}") # Log as warning
+             return JSONResponse(status_code=422, detail=f"Invalid or missing arguments for tool '{tool_name}': {e}")
+
+        bound_logger.error(f"Unexpected error executing tool '{tool_name}' via ToolManager: {e}", exc_info=True) # Log other errors as error
         # Check if it's a context-related error
         if "Context is not available outside of a request" in str(e):
              bound_logger.error(f"Tool '{tool_name}' likely requires context, which is unavailable in this REST setup.")
              return JSONResponse(status_code=501, detail=f"Tool '{tool_name}' cannot be executed via REST API as it requires MCP context.")
-        # Catch potential argument mismatches or other runtime errors
-        if isinstance(e, TypeError) and ("required positional argument" in str(e) or "unexpected keyword argument" in str(e)):
-             return JSONResponse(status_code=422, detail=f"Invalid arguments for tool '{tool_name}': {e}")
-        # For truly unexpected errors, use 500
+        # For other truly unexpected errors, return 500
         return JSONResponse(status_code=500, detail=f"Internal server error executing tool '{tool_name}'.")
 
 @mcp.tool()
@@ -2012,16 +2595,14 @@ async def lookup_nifi_processor_type(
 ) -> Union[List[Dict], Dict]:
     """
     Looks up available NiFi processor types by display name, returning key details including the full class name.
-    Performs a case-insensitive search on the processor name.
-    Optionally filters by bundle artifact name.
 
     Args:
-        processor_name: The display name of the processor to search for (e.g., 'GenerateFlowFile', 'RouteOnAttribute').
-        bundle_artifact_filter: Optional. The artifact name of the bundle to filter by (e.g., 'nifi-standard-nar', 'nifi-update-attribute-nar').
+        processor_name: The display name (often the 'title' in NiFi UI, not the full Java class) of the processor type to search for (e.g., 'GenerateFlowFile', 'RouteOnAttribute'). Case-insensitive search.
+        bundle_artifact_filter: Optional. Filters results to only include types from a specific bundle artifact (e.g., 'nifi-standard-nar', 'nifi-update-attribute-nar'). Case-insensitive search.
 
     Returns:
         - If one match found: A dictionary with details ('type', 'bundle_*', 'description', 'tags').
-        - If multiple matches found: A list of dictionaries, each representing a match.
+        - If multiple matches found: A list of matching dictionaries.
         - If no matches found: An empty list.
     """
     local_logger = logger.bind(tool_name="lookup_nifi_processor_type", processor_name=processor_name, bundle_artifact_filter=bundle_artifact_filter)
@@ -2074,6 +2655,289 @@ async def lookup_nifi_processor_type(
         local_logger.error(f"Unexpected error looking up processor types: {e}", exc_info=True)
         local_logger.bind(interface="nifi", direction="response", data={"error": str(e)}).debug("Received unexpected error from NiFi API")
         raise ToolError(f"An unexpected error occurred looking up processor types: {e}")
+
+@mcp.tool()
+async def create_nifi_flow(
+    nifi_objects: List[Dict[str, Any]],
+    process_group_id: str | None = None
+) -> List[Dict[str, Any]]:
+    """
+    Creates multiple NiFi components (processors, connections) within a specified process group based on a list of definitions.
+
+    This tool attempts to create components sequentially: processors first, then connections.
+    If a component fails to create, an error is recorded for that component, but the tool attempts to create subsequent components.
+    Connection definitions MUST use the 'name' of the source/target processors defined earlier in the 'nifi_objects' list for 'source_id' and 'target_id'.
+
+    Args:
+        nifi_objects: (Required) A list where each dictionary defines a component to create.
+                      This list must contain the definitions for ALL components (processors, connections) intended for the new flow.
+                      Required fields per component type:
+                      - Processor: `type="processor"`, `name` (str), `processor_type` (str, e.g., "org.apache.nifi.processors.standard.GenerateFlowFile"), `position` (dict{"x": int, "y": int}), `properties` (dict, optional).
+                      - Connection: `type="connection"`, `source_id` (str, refers to the 'name' of a processor in this list), `target_id` (str, refers to the 'name' of a processor in this list), `relationships` (List[str]).
+        process_group_id: The UUID of the process group where the flow should be created. Defaults to the root group if None.
+
+    Example Payload for `nifi_objects`:
+    ```json
+    [
+      {
+        "type": "processor",
+        "name": "Input Generator",
+        "processor_type": "org.apache.nifi.processors.standard.GenerateFlowFile",
+        "position": {"x": 0, "y": 0},
+        "properties": {
+          "File Size": "1 B",
+          "Batch Size": "1"
+        }
+      },
+      {
+        "type": "processor",
+        "name": "Output Logger",
+        "processor_type": "org.apache.nifi.processors.standard.LogAttribute",
+        "position": {"x": 400, "y": 0},
+        "properties": {
+          "Log Level": "info",
+          "Attributes to Log": "uuid"
+        }
+      },
+      {
+        "type": "connection",
+        "source_id": "Input Generator",  // Refers to the 'name' above
+        "target_id": "Output Logger",    // Refers to the 'name' above
+        "relationships": ["success"]
+      }
+    ]
+    ```
+
+    Returns:
+        A list containing the results for each object defined in `nifi_objects`, in the same order.
+        Each item will be either:
+        - A dictionary with filtered details of the successfully created component (similar to 'list_nifi_objects').
+        - A dictionary with `{"status": "error", "message": "..."}` indicating why creation failed for that specific component.
+    """
+    local_logger = logger.bind(tool_name="create_nifi_flow")
+    await ensure_authenticated()
+
+    # --- Input Validation (Basic) ---
+    if not isinstance(nifi_objects, list) or not nifi_objects:
+        raise ToolError("The 'nifi_objects' argument must be a non-empty list.")
+    for i, obj_def in enumerate(nifi_objects):
+        if not isinstance(obj_def, dict) or "type" not in obj_def:
+            raise ToolError(f"Invalid definition at index {i}: Each object must be a dictionary with a 'type' key.")
+        obj_type = obj_def.get("type")
+        if obj_type == "processor":
+            if not all(k in obj_def for k in ["name", "processor_type", "position"]):
+                 raise ToolError(f"Invalid processor definition at index {i}: Missing required keys ('name', 'processor_type', 'position').")
+            if not isinstance(obj_def.get("position"), dict) or not all(k in obj_def["position"] for k in ["x", "y"]):
+                 raise ToolError(f"Invalid processor definition at index {i}: 'position' must be a dict with 'x' and 'y'.")
+        elif obj_type == "connection":
+            if not all(k in obj_def for k in ["source_id", "target_id", "relationships"]):
+                raise ToolError(f"Invalid connection definition at index {i}: Missing required keys ('source_id', 'target_id', 'relationships').")
+            if not isinstance(obj_def.get("relationships"), list) or not obj_def["relationships"]:
+                 raise ToolError(f"Invalid connection definition at index {i}: 'relationships' must be a non-empty list.")
+        # Add checks for other types if supported later (ports, PGs)
+        elif obj_type not in ["processor", "connection"]:
+             raise ToolError(f"Invalid definition at index {i}: Unsupported object 'type': {obj_type}.")
+    # -----------------------------
+
+    # --- Determine Target PG ---
+    target_pg_id = process_group_id
+    if target_pg_id is None:
+        local_logger.info("No process_group_id provided, fetching root process group ID.")
+        try:
+            nifi_get_req = {"operation": "get_root_process_group_id"}
+            local_logger.bind(interface="nifi", direction="request", data=nifi_get_req).debug("Calling NiFi API")
+            target_pg_id = await nifi_api_client.get_root_process_group_id()
+            nifi_get_resp = {"root_pg_id": target_pg_id}
+            local_logger.bind(interface="nifi", direction="response", data=nifi_get_resp).debug("Received from NiFi API")
+        except Exception as e:
+            local_logger.error(f"Failed to get root process group ID: {e}", exc_info=True)
+            local_logger.bind(interface="nifi", direction="response", data={"error": str(e)}).debug("Received error from NiFi API")
+            # If we can't get the root PG, we can't proceed
+            raise ToolError(f"Failed to determine root process group ID: {e}")
+    local_logger = local_logger.bind(process_group_id=target_pg_id)
+    # ---------------------------
+
+    id_mapping = {} # Maps input 'name' to generated NiFi UUID
+    # Initialize results list with None placeholders, same length as input
+    results_list = [None] * len(nifi_objects) 
+
+    # --- Phase 1: Create Processors ---
+    local_logger.info("Starting Phase 1: Creating Processors...")
+    for index, obj_def in enumerate(nifi_objects):
+        if obj_def.get("type") == "processor":
+            name = obj_def["name"]
+            proc_type = obj_def["processor_type"]
+            position = obj_def["position"]
+            properties = obj_def.get("properties", {}) # Optional
+            
+            # Ensure properties is a dict
+            if properties is None: properties = {}
+            if not isinstance(properties, dict):
+                 err_msg = f"Processor '{name}' (index {index}): 'properties' must be a dictionary or null."
+                 local_logger.warning(err_msg)
+                 results_list[index] = {"status": "error", "message": err_msg}
+                 continue # Skip this processor
+
+            local_logger.info(f"Attempting to create processor '{name}' (Type: {proc_type}) at index {index}")
+            try:
+                # --- Log NiFi Request ---
+                nifi_create_req = {
+                    "operation": "create_processor", 
+                    "process_group_id": target_pg_id,
+                    "processor_type": proc_type,
+                    "name": name,
+                    "position": position,
+                    "config": {"properties": properties} if properties else None
+                }
+                local_logger.bind(interface="nifi", direction="request", data=nifi_create_req).debug("Calling NiFi API")
+                # -----------------------
+                processor_entity = await nifi_api_client.create_processor(
+                    process_group_id=target_pg_id,
+                    processor_type=proc_type,
+                    name=name,
+                    position=position,
+                    config=properties # Pass properties dict directly
+                )
+                # --- Log NiFi Response ---
+                filtered_processor = filter_processor_data(processor_entity) # Use the filter that includes properties
+                local_logger.bind(interface="nifi", direction="response", data=filtered_processor).debug("Received from NiFi API")
+                # -----------------------
+                
+                created_id = processor_entity.get("id")
+                if created_id:
+                    id_mapping[name] = created_id # Map name to generated ID
+                    local_logger.info(f"Successfully created processor '{name}' with ID: {created_id}. Mapping name to ID.")
+                    results_list[index] = filtered_processor # Store filtered success result
+                else:
+                     # Should not happen if create_processor was successful, but handle defensively
+                     err_msg = f"Processor '{name}' (index {index}): Creation reported success but no ID found in response."
+                     local_logger.error(err_msg)
+                     results_list[index] = {"status": "error", "message": err_msg}
+            
+            except (NiFiAuthenticationError, ConnectionError, ValueError, ToolError) as e:
+                err_msg = f"Processor '{name}' (index {index}): Failed to create - {type(e).__name__}: {e}"
+                local_logger.error(err_msg, exc_info=True)
+                local_logger.bind(interface="nifi", direction="response", data={"error": str(e)}).debug("Received error from NiFi API")
+                results_list[index] = {"status": "error", "message": err_msg}
+            except Exception as e:
+                err_msg = f"Processor '{name}' (index {index}): Unexpected error during creation - {type(e).__name__}: {e}"
+                local_logger.error(err_msg, exc_info=True)
+                local_logger.bind(interface="nifi", direction="response", data={"error": str(e)}).debug("Received error from NiFi API")
+                results_list[index] = {"status": "error", "message": err_msg}
+
+    # --- Phase 2: Create Connections ---
+    local_logger.info("Starting Phase 2: Creating Connections...")
+    # Get all connections once for duplicate checking
+    all_existing_connections = []
+    try:
+        all_existing_connections = await nifi_api_client.list_connections(target_pg_id)
+    except Exception as e:
+        local_logger.warning(f"Could not list existing connections for duplicate check in {target_pg_id}: {e}. Duplicate check skipped.")
+
+    for index, obj_def in enumerate(nifi_objects):
+         if obj_def.get("type") == "connection":
+            source_name = obj_def["source_id"] # This is the logical name from input
+            target_name = obj_def["target_id"] # This is the logical name from input
+            relationships = obj_def["relationships"]
+            
+            local_logger.info(f"Attempting to create connection from '{source_name}' to '{target_name}' (index {index})")
+
+            # Resolve IDs using the map
+            source_uuid = id_mapping.get(source_name)
+            target_uuid = id_mapping.get(target_name)
+
+            if not source_uuid:
+                err_msg = f"Connection (index {index}): Source processor '{source_name}' not found or failed creation. Cannot create connection."
+                local_logger.warning(err_msg)
+                results_list[index] = {"status": "error", "message": err_msg}
+                continue # Skip this connection
+
+            if not target_uuid:
+                err_msg = f"Connection (index {index}): Target processor '{target_name}' not found or failed creation. Cannot create connection."
+                local_logger.warning(err_msg)
+                results_list[index] = {"status": "error", "message": err_msg}
+                continue # Skip this connection
+                
+            local_logger.debug(f"Resolved connection IDs: {source_name} -> {source_uuid}, {target_name} -> {target_uuid}")
+
+            # --- Duplicate Check ---
+            duplicate_found = False
+            for existing_conn_entity in all_existing_connections:
+                existing_comp = existing_conn_entity.get("component", {})
+                existing_source = existing_comp.get("source", {})
+                existing_dest = existing_comp.get("destination", {})
+                if existing_source.get("id") == source_uuid and existing_dest.get("id") == target_uuid:
+                    duplicate_found = True
+                    existing_conn_id = existing_conn_entity.get("id")
+                    existing_rels = existing_comp.get("selectedRelationships", [])
+                    err_msg = (
+                        f"Connection (index {index}): A connection already exists between source '{source_name}' ({source_uuid}) "
+                        f"and target '{target_name}' ({target_uuid}). Existing ID: {existing_conn_id}, Relationships: {existing_rels}. "
+                        f"Skipping creation."
+                    )
+                    local_logger.warning(err_msg)
+                    results_list[index] = {"status": "error", "message": err_msg}
+                    break # Stop checking for duplicates for this pair
+            if duplicate_found:
+                continue # Skip to the next object in nifi_objects
+            # --- End Duplicate Check ---
+
+            try:
+                # Assuming processors are the only connectable types for now
+                # If ports/PGs are added, need to determine source/target type
+                source_type = "PROCESSOR"
+                target_type = "PROCESSOR"
+                
+                 # --- Log NiFi Request ---
+                nifi_create_req = {
+                    "operation": "create_connection",
+                    "process_group_id": target_pg_id,
+                    "source_id": source_uuid,
+                    "target_id": target_uuid,
+                    "relationships": relationships,
+                    "source_type": source_type,
+                    "target_type": target_type
+                }
+                local_logger.bind(interface="nifi", direction="request", data=nifi_create_req).debug("Calling NiFi API")
+                # -----------------------
+                connection_entity = await nifi_api_client.create_connection(
+                    process_group_id=target_pg_id,
+                    source_id=source_uuid,
+                    target_id=target_uuid,
+                    relationships=relationships,
+                    source_type=source_type,
+                    target_type=target_type
+                )
+                # --- Log NiFi Response ---
+                filtered_connection = filter_connection_data(connection_entity)
+                local_logger.bind(interface="nifi", direction="response", data=filtered_connection).debug("Received from NiFi API")
+                # -----------------------
+                
+                local_logger.info(f"Successfully created connection from '{source_name}' to '{target_name}'.")
+                results_list[index] = filtered_connection # Store success result
+
+            except (NiFiAuthenticationError, ConnectionError, ValueError, ToolError) as e:
+                err_msg = f"Connection from '{source_name}' to '{target_name}' (index {index}): Failed to create - {type(e).__name__}: {e}"
+                local_logger.error(err_msg, exc_info=True)
+                local_logger.bind(interface="nifi", direction="response", data={"error": str(e)}).debug("Received error from NiFi API")
+                results_list[index] = {"status": "error", "message": err_msg}
+            except Exception as e:
+                err_msg = f"Connection from '{source_name}' to '{target_name}' (index {index}): Unexpected error during creation - {type(e).__name__}: {e}"
+                local_logger.error(err_msg, exc_info=True)
+                local_logger.bind(interface="nifi", direction="response", data={"error": str(e)}).debug("Received error from NiFi API")
+                results_list[index] = {"status": "error", "message": err_msg}
+
+    # --- Final Result ---
+    # Replace any remaining None placeholders with an error (shouldn't happen if logic is correct)
+    for i, result in enumerate(results_list):
+        if result is None:
+             obj_type = nifi_objects[i].get("type", "unknown")
+             err_msg = f"Object at index {i} (type: {obj_type}) was not processed."
+             local_logger.error(err_msg) # Log internal error
+             results_list[i] = {"status": "error", "message": err_msg}
+
+    local_logger.info("Finished creating NiFi flow components.")
+    return results_list
 
 # Run with uvicorn if this module is run directly
 if __name__ == "__main__":

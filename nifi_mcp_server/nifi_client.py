@@ -434,6 +434,46 @@ class NiFiClient:
             logger.error(f"An unexpected error occurred deleting connection {connection_id}: {e}", exc_info=True)
             raise ConnectionError(f"An unexpected error occurred deleting connection: {e}") from e
 
+    async def update_connection(self, connection_id: str, update_payload: Dict[str, Any]) -> Dict:
+        """Updates a specific connection using the provided payload (including revision and component)."""
+        if not self._token:
+            raise NiFiAuthenticationError("Client is not authenticated. Call authenticate() first.")
+
+        client = await self._get_client()
+        endpoint = f"/connections/{connection_id}"
+        revision = update_payload.get("revision", {})
+        version = revision.get("version", "UNKNOWN")
+
+        try:
+            logger.info(f"Updating connection {connection_id} (Version: {version}).")
+            # Log selected relationships being set
+            selected_relationships = update_payload.get("component", {}).get("selectedRelationships")
+            if selected_relationships is not None:
+                logger.debug(f"Setting selectedRelationships to: {selected_relationships}")
+                
+            response = await client.put(endpoint, json=update_payload)
+            response.raise_for_status()
+            updated_entity = response.json()
+            logger.info(f"Successfully updated connection {connection_id}. New revision: {updated_entity.get('revision', {}).get('version')}")
+            return updated_entity
+
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                logger.warning(f"Connection {connection_id} not found for update.")
+                raise ValueError(f"Connection with ID {connection_id} not found.") from e
+            elif e.response.status_code == 409:
+                logger.error(f"Conflict updating connection {connection_id}. Revision ({version}) likely stale. Response: {e.response.text}")
+                raise ValueError(f"Conflict updating connection {connection_id}. Revision mismatch.") from e
+            else:
+                logger.error(f"Failed to update connection {connection_id}: {e.response.status_code} - {e.response.text}")
+                raise ConnectionError(f"Failed to update connection: {e.response.status_code}, {e.response.text}") from e
+        except (httpx.RequestError, ValueError) as e:
+            logger.error(f"Error updating connection {connection_id}: {e}")
+            raise ConnectionError(f"Error updating connection: {e}") from e
+        except Exception as e:
+            logger.error(f"An unexpected error occurred updating connection {connection_id}: {e}", exc_info=True)
+            raise ConnectionError(f"An unexpected error occurred updating connection: {e}") from e
+
     async def update_processor_config(
         self,
         processor_id: str,

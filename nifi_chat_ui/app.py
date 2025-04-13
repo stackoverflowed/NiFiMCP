@@ -125,9 +125,24 @@ with st.sidebar:
                     st.markdown("**Parameters:**")
                     for param_name, param_info in properties.items():
                         required = "✳️ " if param_name in required_params else ""
-                        # param_info might not be a dict if schema is unusual
-                        param_desc = param_info.get('description', 'No description') if isinstance(param_info, dict) else 'Invalid parameter info'
-                        st.markdown(f"- {required}`{param_name}`: {param_desc}")
+                        
+                        # Split description into lines for better formatting
+                        desc_lines = param_info.get('description', 'No description').split('\n')
+                        first_line = desc_lines[0]
+                        other_lines = desc_lines[1:]
+                        
+                        # Display the first line with the parameter name
+                        st.markdown(f"- {required}`{param_name}`: {first_line}")
+                        
+                        # Display subsequent lines indented
+                        if other_lines:
+                            # Use columns to manage layout and prevent excessive width
+                            col1, col2 = st.columns([0.05, 0.95]) # Small indent column, main content column
+                            with col2:
+                                for line in other_lines:
+                                    # Render each subsequent line using markdown
+                                    # Stripping leading/trailing whitespace is important
+                                    st.markdown(f"{line.strip()}")
                 else:
                     st.markdown("_(No parameters specified)_")
     else:
@@ -143,16 +158,23 @@ for message in st.session_state.messages:
         continue
         
     with st.chat_message(message["role"]):
-        # Safely handle messages without content (like tool call messages)
-        if "content" in message:
-            st.markdown(message["content"])
-        elif "tool_calls" in message:
-            # Display tool calls summary if no content
+        # If it's an assistant message with tool calls, only display the tool call indicator
+        if message["role"] == "assistant" and "tool_calls" in message:
             tool_names = [tc.get('function', {}).get('name', 'unknown') for tc in message.get("tool_calls", [])]
             if tool_names:
                 st.markdown(f"⚙️ Calling tool(s): `{', '.join(tool_names)}`...")
             else:
                 st.markdown("_(Tool call with no details)_")
+        # Otherwise, display content if it exists (for user messages and final assistant messages)
+        elif "content" in message:
+            st.markdown(message["content"])
+        # Handle old assistant messages that might only have tool_calls (less likely now)
+        elif message["role"] == "assistant" and "tool_calls" in message and "content" not in message:
+             tool_names = [tc.get('function', {}).get('name', 'unknown') for tc in message.get("tool_calls", [])]
+             if tool_names:
+                 st.markdown(f"⚙️ Calling tool(s): `{', '.join(tool_names)}`...")
+             else:
+                 st.markdown("_(Tool call with no details)_")
                 
         # Display token counts if available in message metadata
         token_count_in = message.get("token_count_in", 0)
