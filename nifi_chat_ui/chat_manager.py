@@ -128,22 +128,24 @@ def configure_llms():
 # @st.cache_data(ttl=3600) # Consider caching if MCP calls are slow
 def get_formatted_tool_definitions(
     provider: str,
-    user_request_id: str | None = None # Added context ID
+    raw_tools: list[dict] | None, # Accept raw tools as input
+    user_request_id: str | None = None
 ) -> List[Dict[str, Any]] | List["genai_types.FunctionDeclaration"] | None:
-    """Gets tool definitions from the MCP server and formats them for the specified LLM provider."""
+    """Formats a given list of raw tool definitions for the specified LLM provider."""
     bound_logger = logger.bind(user_request_id=user_request_id) # Bind context
     global FunctionDeclaration  # Make FunctionDeclaration accessible in function scope
     
     # Convert provider to lowercase for case-insensitive comparison
     provider = provider.lower()
-    bound_logger.debug(f"Fetching and formatting tools for provider: {provider}")
+    bound_logger.debug(f"Formatting tools for provider: {provider}")
     
-    # Pass context ID to get_available_tools
-    tools = get_available_tools(user_request_id=user_request_id)
+    # Use the provided raw_tools list instead of fetching
+    # tools = get_available_tools(user_request_id=user_request_id) # REMOVED fetch
+    tools = raw_tools # Use the passed-in list
     
     if not tools:
-        bound_logger.warning("Failed to retrieve tools from MCP handler.")
-        st.warning("Failed to retrieve tools from MCP handler.") # Keep UI warning
+        bound_logger.warning("No raw tools provided for formatting.")
+        # st.warning("Failed to retrieve tools from MCP handler.") # Don't show UI warning here
         return None # Return None if fetching failed
 
     if provider == "openai":
@@ -760,7 +762,7 @@ def get_openai_response(
             "messages": openai_messages,
             "tools": tools,
             "tool_choice": "auto" if tools else None,
-            "temperature": 0.7,
+            #"temperature": 0.7,
         }
         bound_logger.bind(
             interface="llm", 
@@ -795,7 +797,7 @@ def get_openai_response(
             messages=openai_messages,
             tools=tools if tools else None,
             tool_choice="auto" if tools else None,
-            temperature=0.7,
+            #temperature=0.7,
         )
         bound_logger.info("Received response from OpenAI model.")
         
@@ -910,7 +912,7 @@ def get_openai_response(
 
     except Exception as e:
         # Log the type of the exception for better debugging
-        bound_logger.error(f"Caught exception of type: {type(e).__name__}")
+        bound_logger.error(f"Caught exception of type: {type(e).__name__}, message: {str(e)}")
         
         # Try to extract more details if it's an OpenAI API error
         error_details = str(e)

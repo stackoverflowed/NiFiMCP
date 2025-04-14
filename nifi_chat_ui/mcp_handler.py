@@ -144,16 +144,25 @@ def execute_mcp_tool(
 # @st.cache_data # Consider caching this
 def get_available_tools(
     user_request_id: str | None = None,
-    action_id: str | None = None
+    action_id: str | None = None,
+    phase: str | None = None # Add phase parameter
 ) -> list[dict]:
-    """Fetches tool definitions from the REST API."""
-    url = f"{API_BASE_URL}/tools"
+    """Fetches tool definitions from the REST API, optionally filtered by phase."""
+    # Construct URL with optional phase parameter
+    if phase and phase.lower() != "all":
+        url = f"{API_BASE_URL}/tools?phase={phase}" # Pass phase if specified
+    else:
+        url = f"{API_BASE_URL}/tools"
     
     # Bind context IDs for logging within this function call
     bound_logger = logger.bind(user_request_id=user_request_id, action_id=action_id)
     
     # Use logger instead of print
     bound_logger.info(f"Fetching available tools from API: {url}")
+    
+    # --- ADD LOGGING HERE ---
+    bound_logger.debug(f"Constructed request URL for tools: {url}")
+    # ------------------------
     
     try:
         # Create headers with context IDs

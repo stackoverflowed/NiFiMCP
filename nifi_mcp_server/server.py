@@ -4,7 +4,8 @@ import asyncio
 import signal # Add signal import for cleanup
 from typing import List, Dict, Optional, Any, Union, Literal
 import json
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Body, Request
+import functools # <<< Added for wraps
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Body, Request, Query # <<< Added Query
 from fastapi.responses import JSONResponse # Import JSONResponse
 from dotenv import load_dotenv
 from fastapi.middleware.cors import CORSMiddleware
@@ -103,8 +104,23 @@ async def ensure_authenticated():
             raise ToolError(f"An unexpected error occurred during NiFi authentication: {e}")
     pass # Add pass to avoid syntax error if body is empty
 
+# --- Phase Tagging Decorator ---
+PHASE_TAGS_ATTR = "_tool_phases"
+_tool_phase_registry = {} # Module-level registry
 
-# --- NiFi Tools ---
+def tool_phases(phases: List[str]):
+    """Decorator to tag MCP tools with applicable operational phases."""
+    def decorator(func):
+        # Attach attribute (might still be useful)
+        setattr(func, PHASE_TAGS_ATTR, phases)
+        # Add to registry
+        _tool_phase_registry[func.__name__] = phases
+        logger.trace(f"Registered phases {phases} for tool {func.__name__}")
+        return func
+    return decorator
+# -----------------------------
+
+# --- NiFi Tools (with Phase Tags) --- #
 
 # --- Helper Functions for list_nifi_objects ---
 
@@ -397,6 +413,7 @@ async def _get_process_group_hierarchy(
 
 
 @mcp.tool()
+@tool_phases(["Review", "Build", "Modify", "Operate"])
 async def list_nifi_objects(
     object_type: Literal["processors", "connections", "ports", "process_groups"],
     process_group_id: str | None = None,
@@ -646,6 +663,7 @@ def filter_process_group_data(pg_entity):
     }
 
 @mcp.tool()
+@tool_phases(["Modify"])
 async def create_nifi_processor(
     processor_type: str,
     name: str,
@@ -760,6 +778,7 @@ async def create_nifi_processor(
 
 
 @mcp.tool()
+@tool_phases(["Modify"])
 async def create_nifi_connection(
     source_id: str,
     relationships: List[str], # ADDED: List of relationship names
@@ -964,6 +983,7 @@ async def create_nifi_connection(
 
 
 @mcp.tool()
+@tool_phases(["Review", "Build", "Modify", "Operate"])
 async def get_nifi_object_details(
     object_type: Literal["processor", "connection", "port", "process_group"],
     object_id: str
@@ -1069,6 +1089,7 @@ async def get_nifi_object_details(
 
 
 @mcp.tool()
+@tool_phases(["Modify"])
 async def delete_nifi_object(
     object_type: Literal["processor", "connection", "port", "process_group"],
     object_id: str
@@ -1231,6 +1252,7 @@ async def delete_nifi_object(
 
 
 @mcp.tool()
+@tool_phases(["Modify"])
 async def update_nifi_processor_properties(
     processor_id: str,
     processor_config_properties: Dict[str, Any] # Renamed argument
@@ -1354,6 +1376,7 @@ async def update_nifi_processor_properties(
 
 
 @mcp.tool()
+@tool_phases(["Modify"])
 async def delete_nifi_processor_properties(
     processor_id: str,
     property_names_to_delete: List[str]
@@ -1497,6 +1520,7 @@ async def delete_nifi_processor_properties(
 
 
 @mcp.tool()
+@tool_phases(["Modify"])
 async def update_nifi_processor_relationships(
     processor_id: str,
     auto_terminated_relationships: List[str]
@@ -1611,6 +1635,7 @@ async def update_nifi_processor_relationships(
 
 
 @mcp.tool()
+@tool_phases(["Modify"])
 async def update_nifi_connection(
     connection_id: str,
     relationships: List[str]
@@ -1718,6 +1743,7 @@ async def update_nifi_connection(
 
 
 @mcp.tool()
+@tool_phases(["Operate"])
 async def operate_nifi_object(
     object_type: Literal["processor", "port"],
     object_id: str,
@@ -1957,6 +1983,7 @@ async def operate_nifi_object(
 
 
 @mcp.tool()
+@tool_phases(["Review", "Build", "Modify", "Operate"])
 async def document_nifi_flow(
     process_group_id: str | None = None,
     starting_processor_id: str | None = None,
@@ -2184,113 +2211,132 @@ async def shutdown_event():
 # --- REST API Endpoints --- #
 
 @app.get("/tools", response_model=List[Dict[str, Any]])
-async def get_tools(request: Request):
-    """Retrieve the list of available MCP tools in OpenAI function format."""
-    # Extract context IDs from request state
+async def get_tools(
+    request: Request, 
+    phase: str | None = Query(None) # Add phase query parameter
+):
+    """Retrieve the list of available MCP tools, optionally filtered by phase."""
     user_request_id = request.state.user_request_id
     action_id = request.state.action_id
+    bound_logger = logger.bind(user_request_id=user_request_id, action_id=action_id, requested_phase=phase)
     
-    # Create a bound logger with the context IDs
-    bound_logger = logger.bind(user_request_id=user_request_id, action_id=action_id)
+    # --- ADD LOGGING HERE ---
+    bound_logger.debug(f"/tools endpoint received phase parameter: {phase!r}") # Log the raw value
+    # ------------------------
     
     try:
-        bound_logger.debug(f"Inspecting mcp object attributes: {dir(mcp)}") # Keep debug for now
+        bound_logger.debug(f"Fetching tools, requested phase: '{phase}'")
         formatted_tools = []
-        # Access the ToolManager instance
         tool_manager = getattr(mcp, '_tool_manager', None)
         if tool_manager:
-            # Call the ToolManager's list_tools method
-            tools_info = tool_manager.list_tools() # Assuming this returns ToolInfo objects or similar
+            # Remove dynamic function lookup logic
+            # # Build a map of registered tool names to their function objects
+            # tool_function_map = {}
+            # # ... (introspection logic removed) ...
+            # bound_logger.debug(f"Found {len(tool_function_map)} potential tool functions.")
+
+            tools_info = tool_manager.list_tools()
             
             for tool_info in tools_info: 
                 tool_name = getattr(tool_info, 'name', 'unknown')
-                # Get the full docstring (seems to be stored in 'description' by MCP here)
+                # Look up phases from the registry
+                tool_phases_list = _tool_phase_registry.get(tool_name, [])
+                if not tool_phases_list:
+                     bound_logger.warning(f"Could not find phase tags in registry for tool '{tool_name}'. Assuming it belongs to all phases for safety.")
+                     # Decide default behavior: maybe assign all phases or skip?
+                     # For now, let's assume it belongs everywhere if not found, but log warning.
+                     # tool_phases_list = ["Review", "Build", "Modify", "Operate"] # Or skip? Let's keep it empty and let filter work
+
+                # --- Phase Filtering --- 
+                # Perform case-insensitive check
+                requested_phase_lower = phase.lower() if phase else None
+                tool_phases_lower = [p.lower() for p in tool_phases_list]
+                
+                if requested_phase_lower and requested_phase_lower != "all" and requested_phase_lower not in tool_phases_lower:
+                    bound_logger.trace(f"Skipping tool '{tool_name}' due to phase mismatch (requested: {phase}, tool phases: {tool_phases_list})")
+                    continue # Skip this tool if phase doesn't match
+
+                # --- Tool Formatting (same as before) ---
                 raw_docstring = getattr(tool_info, 'description', '')
-                # Parse the docstring
                 parsed_docstring = parse(raw_docstring)
-                # Extract just the short description for the main tool description
-                base_description = parsed_docstring.short_description or raw_docstring.split('\n\n')[0]
                 returns_description = ""
                 if parsed_docstring.returns and parsed_docstring.returns.description:
-                    # Format the returns section nicely
                     returns_description = f"\n\n**Returns:**\n{parsed_docstring.returns.description}"
-                    
+
+                # --- Description Extraction using parsed components --- 
+                base_description_parts = []
+                if parsed_docstring.short_description:
+                    base_description_parts.append(parsed_docstring.short_description)
+                
+                # Check if long_description exists and add it with separation
+                if parsed_docstring.long_description:
+                    base_description_parts.append("\n\n" + parsed_docstring.long_description) # Add separation
+
+                if base_description_parts:
+                    base_description = "".join(base_description_parts)
+                    bound_logger.trace(f"Using parsed short/long description for tool '{tool_name}'")
+                else:
+                    # Fallback if parsing somehow yields nothing (shouldn't happen with raw_docstring)
+                    base_description = raw_docstring.split('\n\n')[0] # Original fallback
+                    bound_logger.trace(f"Falling back to basic description for tool '{tool_name}' (parsing empty?)")
+                # ---------------------------------------------------
+
+                # Combine base description and returns description
                 tool_description = f"{base_description}{returns_description}"
-                
-                # Create a map of param name -> parsed description
+
+                # --- REMOVE Special Handling for create_nifi_flow --- 
+                # (Now covered by the generalized approach above)
+                # ----------------------------------------------
+
                 param_descriptions = {p.arg_name: p.description for p in parsed_docstring.params}
-                
-                # Extract only the necessary parts for the schema
                 raw_params_schema = getattr(tool_info, 'parameters', {})
-                
-                # Build the schema explicitly for OpenAI/Gemini compatibility
-                parameters_schema = {
-                    "type": "object",
-                    "properties": {}, # Initialize empty properties
-                }
+                parameters_schema = {"type": "object", "properties": {}}
                 raw_properties = raw_params_schema.get('properties', {})
-                
-                # Iterate through properties and clean them
                 cleaned_properties = {}
                 if isinstance(raw_properties, dict):
                     for prop_name, prop_schema in raw_properties.items():
                         if isinstance(prop_schema, dict):
-                            # Create a copy to avoid modifying the original
                             cleaned_schema = prop_schema.copy()
-                            # Remove problematic fields: anyOf, title, default, etc.
-                            cleaned_schema.pop('anyOf', None) 
+                            cleaned_schema.pop('anyOf', None)
                             cleaned_schema.pop('title', None)
-                            cleaned_schema.pop('default', None)  # Also remove default values
-                            
-                            # Add parsed description
+                            cleaned_schema.pop('default', None)
                             cleaned_schema['description'] = param_descriptions.get(prop_name, '')
-                            
                             cleaned_properties[prop_name] = cleaned_schema
                         else:
-                            # Handle cases where a property schema isn't a dict
                             logger.warning(f"Property '{prop_name}' in tool '{tool_name}' has non-dict schema: {prop_schema}. Skipping property.")
-                
                 parameters_schema["properties"] = cleaned_properties
-                
-                # Only include required if it's non-empty and properties exist
                 required_list = raw_params_schema.get('required', [])
-                if required_list and cleaned_properties: # Only add required if there are properties
+                if required_list and cleaned_properties:
                      parameters_schema["required"] = required_list
                 elif "required" in parameters_schema: # Clean up just in case
                      del parameters_schema["required"]
-
-                # Remove properties/required fields entirely if properties dict is empty
                 if not parameters_schema["properties"]:
                      del parameters_schema["properties"]
                      if "required" in parameters_schema: del parameters_schema["required"]
-
-                # Make required properties all strings for now for schema compatibility
-                # Check if 'required' exists before trying to list it
                 if 'required' in raw_params_schema:
                     parameters_schema["required"] = list(raw_params_schema['required'])
-                
-                # Fix enum values to be valid strings
-                # Check if properties exist before iterating
                 if 'properties' in parameters_schema:
                     for prop_name, prop_data in parameters_schema['properties'].items():
                         if isinstance(prop_data, dict) and 'enum' in prop_data:
                             prop_data['enum'] = [str(val) for val in prop_data['enum']]
-
+                # --- End Tool Formatting ---
+                
                 formatted_tools.append({
                     "type": "function",
                     "function": {
                         "name": tool_name,
                         "description": tool_description,
-                        "parameters": parameters_schema # Use the cleaned schema
-                    }
+                        "parameters": parameters_schema
+                    },
+                    "phases": tool_phases_list # Include phases in the response
                 })
-            bound_logger.info(f"Returning {len(formatted_tools)} tool definitions via ToolManager.")
+            bound_logger.info(f"Returning {len(formatted_tools)} tool definitions (Phase: {phase or 'All'}).")
             return formatted_tools
         else:
             bound_logger.warning("Could not find ToolManager (_tool_manager) on MCP instance.")
             return []
     except Exception as e:
-        bound_logger.error(f"Error retrieving tool definitions via ToolManager: {e}", exc_info=True)
+        bound_logger.error(f"Error retrieving tool definitions: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error retrieving tools.")
 
 # Define a Pydantic model for the request body with context support
@@ -2396,6 +2442,7 @@ async def execute_tool(tool_name: str, payload: ToolExecutionPayload, request: R
         return JSONResponse(status_code=500, detail=f"Internal server error executing tool '{tool_name}'.")
 
 @mcp.tool()
+@tool_phases(["Modify"])
 async def create_nifi_port(
     port_type: Literal["input", "output"],
     name: str,
@@ -2499,6 +2546,7 @@ async def create_nifi_port(
 
 
 @mcp.tool()
+@tool_phases(["Modify"])
 async def create_nifi_process_group(
     name: str,
     position_x: int,
@@ -2589,6 +2637,7 @@ def _format_processor_type_summary(processor_type_data: Dict) -> Dict:
     }
 
 @mcp.tool()
+@tool_phases(["Build", "Modify"])
 async def lookup_nifi_processor_type(
     processor_name: str,
     bundle_artifact_filter: str | None = None
@@ -2657,52 +2706,85 @@ async def lookup_nifi_processor_type(
         raise ToolError(f"An unexpected error occurred looking up processor types: {e}")
 
 @mcp.tool()
+@tool_phases(["Build"])
 async def create_nifi_flow(
     nifi_objects: List[Dict[str, Any]],
-    process_group_id: str | None = None
+    process_group_id: str | None = None,
+    create_process_group: Optional[Dict[str, Any]] = None
 ) -> List[Dict[str, Any]]:
     """
-    Creates multiple NiFi components (processors, connections) within a specified process group based on a list of definitions.
+    Creates multiple NiFi components (processors, connections) based on a list of definitions.
+    Optionally creates a new containing process group first and places the components inside.
 
-    This tool attempts to create components sequentially: processors first, then connections.
-    If a component fails to create, an error is recorded for that component, but the tool attempts to create subsequent components.
-    Connection definitions MUST use the 'name' of the source/target processors defined earlier in the 'nifi_objects' list for 'source_id' and 'target_id'.
+    **IMPORTANT:** The `nifi_objects` list requires a precise structure defined below.
+    Attempts to create components sequentially: processors first, then connections.
+    If a component fails to create, an error is recorded, but the tool attempts subsequent components.
+    Connection definitions MUST use the 'name' of the source/target processors defined earlier in the 'nifi_objects' list for 'source_name' and 'target_name'.
+
+    **Processor Definition Structure:**
+    ```python
+    {
+        "type": "processor",          # MUST be the literal string "processor"
+        "name": "Your Processor Name", # String: Unique name for this processor within the list
+        "java_class_name": "org.apache.nifi.processors.standard.MyProcessor", # String: Full Java class name (MUST use this key, NOT 'type' or 'class')
+        "position": {"x": 100, "y": 100}, # Dict: { "x": int, "y": int }
+        "properties": { ... }         # Optional Dict: Processor-specific properties { "prop_name": "prop_value" }
+    }
+    ```
+    **DO NOT USE 'component' or 'class' keys for processors.**
+
+    **Connection Definition Structure:**
+    ```python
+    {
+        "type": "connection",             # MUST be the literal string "connection"
+        "source_name": "NameOfSourceProcessor", # String: MUST use 'source_name', refers to a processor 'name' in this list
+        "target_name": "NameOfTargetProcessor", # String: MUST use 'target_name', refers to a processor 'name' in this list
+        "relationships": ["rel_name"]     # List[str]: Non-empty list of relationship names from the source processor
+    }
+    ```
+    **DO NOT USE 'source', 'destination', or 'relationship' keys for connections.**
 
     Args:
-        nifi_objects: (Required) A list where each dictionary defines a component to create.
+        nifi_objects: (Required) A list where each dictionary defines a component to create according to the structures defined above.
                       This list must contain the definitions for ALL components (processors, connections) intended for the new flow.
-                      Required fields per component type:
-                      - Processor: `type="processor"`, `name` (str), `processor_type` (str, e.g., "org.apache.nifi.processors.standard.GenerateFlowFile"), `position` (dict{"x": int, "y": int}), `properties` (dict, optional).
-                      - Connection: `type="connection"`, `source_id` (str, refers to the 'name' of a processor in this list), `target_id` (str, refers to the 'name' of a processor in this list), `relationships` (List[str]).
-        process_group_id: The UUID of the process group where the flow should be created. Defaults to the root group if None.
+                      See structure examples above and the full payload example below.
+        process_group_id: The UUID of the process group where the flow components should be created, OR where the new containing process group should be created if `create_process_group` is provided. Defaults to the root group if None.
+                          Example: `"a1b2c3d4-01e2-1000-ffff-abcdef123456"`
+        create_process_group: (Optional) If provided, a new process group will be created first.
+                              Should be a dictionary with keys: `name` (str) and `position` (dict: {"x": int, "y": int}).
+                              The components from `nifi_objects` will be created inside this new group.
+                              If this is used, `process_group_id` acts as the parent for this new group.
+                              Example: `{ "name": "My New Flow Group", "position": {"x": 100, "y": 100} }`
 
     Example Payload for `nifi_objects`:
     ```json
     [
       {
         "type": "processor",
-        "name": "Input Generator",
-        "processor_type": "org.apache.nifi.processors.standard.GenerateFlowFile",
-        "position": {"x": 0, "y": 0},
+        "name": "Generate Data",
+        "java_class_name": "org.apache.nifi.processors.standard.GenerateFlowFile",
+        "position": {"x": 100, "y": 100},
         "properties": {
-          "File Size": "1 B",
-          "Batch Size": "1"
+          "File Size": "1 KB",
+          "Batch Size": "1",
+          "Data Format": "Text"
         }
       },
       {
         "type": "processor",
-        "name": "Output Logger",
-        "processor_type": "org.apache.nifi.processors.standard.LogAttribute",
-        "position": {"x": 400, "y": 0},
+        "name": "Log Data Attributes",
+        "java_class_name": "org.apache.nifi.processors.standard.LogAttribute",
+        "position": {"x": 500, "y": 100},
         "properties": {
           "Log Level": "info",
-          "Attributes to Log": "uuid"
+          "Attributes to Log": "filename, uuid",
+          "Log Payload": "false"
         }
       },
       {
         "type": "connection",
-        "source_id": "Input Generator",  // Refers to the 'name' above
-        "target_id": "Output Logger",    // Refers to the 'name' above
+        "source_name": "Generate Data",
+        "target_name": "Log Data Attributes",
         "relationships": ["success"]
       }
     ]
@@ -2711,8 +2793,8 @@ async def create_nifi_flow(
     Returns:
         A list containing the results for each object defined in `nifi_objects`, in the same order.
         Each item will be either:
-        - A dictionary with filtered details of the successfully created component (similar to 'list_nifi_objects').
-        - A dictionary with `{"status": "error", "message": "..."}` indicating why creation failed for that specific component.
+        - A dictionary with filtered details of the successfully created component.
+        - A dictionary with `{"status": "error", "message": "..."}` indicating why creation failed.
     """
     local_logger = logger.bind(tool_name="create_nifi_flow")
     await ensure_authenticated()
@@ -2720,100 +2802,156 @@ async def create_nifi_flow(
     # --- Input Validation (Basic) ---
     if not isinstance(nifi_objects, list) or not nifi_objects:
         raise ToolError("The 'nifi_objects' argument must be a non-empty list.")
+    # ... (Existing nifi_objects validation remains the same) ...
     for i, obj_def in enumerate(nifi_objects):
         if not isinstance(obj_def, dict) or "type" not in obj_def:
             raise ToolError(f"Invalid definition at index {i}: Each object must be a dictionary with a 'type' key.")
         obj_type = obj_def.get("type")
         if obj_type == "processor":
-            if not all(k in obj_def for k in ["name", "processor_type", "position"]):
-                 raise ToolError(f"Invalid processor definition at index {i}: Missing required keys ('name', 'processor_type', 'position').")
+            # Use java_class_name here
+            if not all(k in obj_def for k in ["name", "java_class_name", "position"]):
+                 raise ToolError(f"Invalid processor definition at index {i}: Missing required keys ('name', 'java_class_name', 'position').")
             if not isinstance(obj_def.get("position"), dict) or not all(k in obj_def["position"] for k in ["x", "y"]):
                  raise ToolError(f"Invalid processor definition at index {i}: 'position' must be a dict with 'x' and 'y'.")
         elif obj_type == "connection":
-            if not all(k in obj_def for k in ["source_id", "target_id", "relationships"]):
-                raise ToolError(f"Invalid connection definition at index {i}: Missing required keys ('source_id', 'target_id', 'relationships').")
+             # Use source_name and target_name here
+            if not all(k in obj_def for k in ["source_name", "target_name", "relationships"]):
+                raise ToolError(f"Invalid connection definition at index {i}: Missing required keys ('source_name', 'target_name', 'relationships').")
             if not isinstance(obj_def.get("relationships"), list) or not obj_def["relationships"]:
                  raise ToolError(f"Invalid connection definition at index {i}: 'relationships' must be a non-empty list.")
-        # Add checks for other types if supported later (ports, PGs)
         elif obj_type not in ["processor", "connection"]:
              raise ToolError(f"Invalid definition at index {i}: Unsupported object 'type': {obj_type}.")
+             
+    # Validate create_process_group structure if provided
+    if create_process_group is not None:
+        if not isinstance(create_process_group, dict):
+             raise ToolError("'create_process_group' must be a dictionary.")
+        if not all(k in create_process_group for k in ["name", "position"]):
+            raise ToolError("'create_process_group' dictionary missing required keys ('name', 'position').")
+        if not isinstance(create_process_group.get("position"), dict) or not all(k in create_process_group["position"] for k in ["x", "y"]):
+             raise ToolError("'create_process_group.position' must be a dict with 'x' and 'y'.")
     # -----------------------------
 
-    # --- Determine Target PG ---
-    target_pg_id = process_group_id
-    if target_pg_id is None:
-        local_logger.info("No process_group_id provided, fetching root process group ID.")
+    # --- Determine Parent and Target Process Group IDs ---
+    parent_pg_id = process_group_id # The PG where the *new* group or components will be placed
+    if parent_pg_id is None:
+        local_logger.info("No process_group_id provided, fetching root process group ID to use as parent.")
         try:
             nifi_get_req = {"operation": "get_root_process_group_id"}
             local_logger.bind(interface="nifi", direction="request", data=nifi_get_req).debug("Calling NiFi API")
-            target_pg_id = await nifi_api_client.get_root_process_group_id()
-            nifi_get_resp = {"root_pg_id": target_pg_id}
+            parent_pg_id = await nifi_api_client.get_root_process_group_id()
+            nifi_get_resp = {"root_pg_id": parent_pg_id}
             local_logger.bind(interface="nifi", direction="response", data=nifi_get_resp).debug("Received from NiFi API")
         except Exception as e:
             local_logger.error(f"Failed to get root process group ID: {e}", exc_info=True)
             local_logger.bind(interface="nifi", direction="response", data={"error": str(e)}).debug("Received error from NiFi API")
-            # If we can't get the root PG, we can't proceed
             raise ToolError(f"Failed to determine root process group ID: {e}")
-    local_logger = local_logger.bind(process_group_id=target_pg_id)
-    # ---------------------------
+            
+    target_pg_id = parent_pg_id # Default target for components is the parent
+    local_logger = local_logger.bind(initial_parent_pg_id=parent_pg_id)
+    # -----------------------------------------------------
+
+    # --- Create Containing Process Group (if requested) ---
+    if create_process_group:
+        pg_name = create_process_group["name"]
+        pg_pos = create_process_group["position"]
+        local_logger.info(f"Attempting to create containing Process Group '{pg_name}' within parent {parent_pg_id}")
+        try:
+            # --- Log NiFi Request (Create PG) ---
+            nifi_create_pg_req = {
+                "operation": "create_process_group",
+                "parent_pg_id": parent_pg_id,
+                "name": pg_name,
+                "position": pg_pos
+            }
+            local_logger.bind(interface="nifi", direction="request", data=nifi_create_pg_req).debug("Calling NiFi API")
+            # -------------------------------------
+            new_pg_entity = await nifi_api_client.create_process_group(
+                parent_pg_id=parent_pg_id,
+                name=pg_name,
+                position=pg_pos
+            )
+            # --- Log NiFi Response (Create PG) ---
+            filtered_pg = filter_process_group_data(new_pg_entity)
+            local_logger.bind(interface="nifi", direction="response", data=filtered_pg).debug("Received from NiFi API")
+            # ------------------------------------
+            
+            new_pg_id = new_pg_entity.get("id")
+            if not new_pg_id:
+                # This is a critical failure, stop the flow creation
+                raise ToolError(f"Process Group '{pg_name}' creation reported success but API did not return an ID.")
+            
+            target_pg_id = new_pg_id # <<<< Update the target ID for subsequent components
+            local_logger.info(f"Successfully created containing PG '{pg_name}' (ID: {target_pg_id}). Subsequent components will be placed inside.")
+            # Optionally, store the result: create_pg_result = filtered_pg
+
+        except (NiFiAuthenticationError, ConnectionError, ValueError, ToolError) as e:
+            err_msg = f"Failed to create containing Process Group '{pg_name}': {e}"
+            local_logger.error(err_msg, exc_info=True)
+            local_logger.bind(interface="nifi", direction="response", data={"error": str(e)}).debug("Received error from NiFi API")
+            # Stop execution if the container PG cannot be created
+            raise ToolError(err_msg) 
+        except Exception as e:
+            err_msg = f"Unexpected error creating containing Process Group '{pg_name}': {e}"
+            local_logger.error(err_msg, exc_info=True)
+            local_logger.bind(interface="nifi", direction="response", data={"error": str(e)}).debug("Received error from NiFi API")
+            raise ToolError(err_msg)
+    # -----------------------------------------------------
+    
+    # Update logger context with the final target PG ID
+    local_logger = local_logger.bind(final_target_pg_id=target_pg_id)
 
     id_mapping = {} # Maps input 'name' to generated NiFi UUID
-    # Initialize results list with None placeholders, same length as input
     results_list = [None] * len(nifi_objects) 
 
-    # --- Phase 1: Create Processors ---
-    local_logger.info("Starting Phase 1: Creating Processors...")
+    # --- Phase 1: Create Processors (inside target_pg_id) ---
+    local_logger.info(f"Starting Phase 1: Creating Processors within PG: {target_pg_id}...")
     for index, obj_def in enumerate(nifi_objects):
         if obj_def.get("type") == "processor":
             name = obj_def["name"]
-            proc_type = obj_def["processor_type"]
+            # Use java_class_name here
+            proc_type = obj_def["java_class_name"] 
             position = obj_def["position"]
-            properties = obj_def.get("properties", {}) # Optional
-            
-            # Ensure properties is a dict
+            properties = obj_def.get("properties", {}) 
             if properties is None: properties = {}
             if not isinstance(properties, dict):
                  err_msg = f"Processor '{name}' (index {index}): 'properties' must be a dictionary or null."
                  local_logger.warning(err_msg)
                  results_list[index] = {"status": "error", "message": err_msg}
-                 continue # Skip this processor
+                 continue 
 
-            local_logger.info(f"Attempting to create processor '{name}' (Type: {proc_type}) at index {index}")
+            local_logger.info(f"Attempting to create processor '{name}' (Type: {proc_type}) at index {index} in PG {target_pg_id}")
             try:
-                # --- Log NiFi Request ---
+                # Use target_pg_id for creation
                 nifi_create_req = {
                     "operation": "create_processor", 
                     "process_group_id": target_pg_id,
-                    "processor_type": proc_type,
+                    # Pass the java class name to the client
+                    "processor_type": proc_type, 
                     "name": name,
                     "position": position,
                     "config": {"properties": properties} if properties else None
                 }
                 local_logger.bind(interface="nifi", direction="request", data=nifi_create_req).debug("Calling NiFi API")
-                # -----------------------
                 processor_entity = await nifi_api_client.create_processor(
-                    process_group_id=target_pg_id,
-                    processor_type=proc_type,
+                    process_group_id=target_pg_id, # Use potentially updated target
+                    # Pass the java class name to the client
+                    processor_type=proc_type, 
                     name=name,
                     position=position,
-                    config=properties # Pass properties dict directly
+                    config=properties
                 )
-                # --- Log NiFi Response ---
-                filtered_processor = filter_processor_data(processor_entity) # Use the filter that includes properties
+                filtered_processor = filter_processor_data(processor_entity)
                 local_logger.bind(interface="nifi", direction="response", data=filtered_processor).debug("Received from NiFi API")
-                # -----------------------
-                
                 created_id = processor_entity.get("id")
                 if created_id:
-                    id_mapping[name] = created_id # Map name to generated ID
+                    id_mapping[name] = created_id 
                     local_logger.info(f"Successfully created processor '{name}' with ID: {created_id}. Mapping name to ID.")
-                    results_list[index] = filtered_processor # Store filtered success result
+                    results_list[index] = filtered_processor 
                 else:
-                     # Should not happen if create_processor was successful, but handle defensively
                      err_msg = f"Processor '{name}' (index {index}): Creation reported success but no ID found in response."
                      local_logger.error(err_msg)
                      results_list[index] = {"status": "error", "message": err_msg}
-            
             except (NiFiAuthenticationError, ConnectionError, ValueError, ToolError) as e:
                 err_msg = f"Processor '{name}' (index {index}): Failed to create - {type(e).__name__}: {e}"
                 local_logger.error(err_msg, exc_info=True)
@@ -2825,24 +2963,23 @@ async def create_nifi_flow(
                 local_logger.bind(interface="nifi", direction="response", data={"error": str(e)}).debug("Received error from NiFi API")
                 results_list[index] = {"status": "error", "message": err_msg}
 
-    # --- Phase 2: Create Connections ---
-    local_logger.info("Starting Phase 2: Creating Connections...")
-    # Get all connections once for duplicate checking
+    # --- Phase 2: Create Connections (inside target_pg_id) ---
+    local_logger.info(f"Starting Phase 2: Creating Connections within PG: {target_pg_id}...")
     all_existing_connections = []
     try:
+        # List connections within the final target PG for duplicate check
         all_existing_connections = await nifi_api_client.list_connections(target_pg_id)
     except Exception as e:
         local_logger.warning(f"Could not list existing connections for duplicate check in {target_pg_id}: {e}. Duplicate check skipped.")
 
     for index, obj_def in enumerate(nifi_objects):
          if obj_def.get("type") == "connection":
-            source_name = obj_def["source_id"] # This is the logical name from input
-            target_name = obj_def["target_id"] # This is the logical name from input
+            # Use source_name and target_name here
+            source_name = obj_def["source_name"] 
+            target_name = obj_def["target_name"] 
             relationships = obj_def["relationships"]
-            
-            local_logger.info(f"Attempting to create connection from '{source_name}' to '{target_name}' (index {index})")
+            local_logger.info(f"Attempting to create connection from '{source_name}' to '{target_name}' (index {index}) in PG {target_pg_id}")
 
-            # Resolve IDs using the map
             source_uuid = id_mapping.get(source_name)
             target_uuid = id_mapping.get(target_name)
 
@@ -2850,17 +2987,17 @@ async def create_nifi_flow(
                 err_msg = f"Connection (index {index}): Source processor '{source_name}' not found or failed creation. Cannot create connection."
                 local_logger.warning(err_msg)
                 results_list[index] = {"status": "error", "message": err_msg}
-                continue # Skip this connection
+                continue 
 
             if not target_uuid:
                 err_msg = f"Connection (index {index}): Target processor '{target_name}' not found or failed creation. Cannot create connection."
                 local_logger.warning(err_msg)
                 results_list[index] = {"status": "error", "message": err_msg}
-                continue # Skip this connection
+                continue 
                 
             local_logger.debug(f"Resolved connection IDs: {source_name} -> {source_uuid}, {target_name} -> {target_uuid}")
 
-            # --- Duplicate Check ---
+            # Duplicate Check (using resolved UUIDs)
             duplicate_found = False
             for existing_conn_entity in all_existing_connections:
                 existing_comp = existing_conn_entity.get("component", {})
@@ -2877,18 +3014,15 @@ async def create_nifi_flow(
                     )
                     local_logger.warning(err_msg)
                     results_list[index] = {"status": "error", "message": err_msg}
-                    break # Stop checking for duplicates for this pair
+                    break 
             if duplicate_found:
-                continue # Skip to the next object in nifi_objects
-            # --- End Duplicate Check ---
+                continue 
 
             try:
-                # Assuming processors are the only connectable types for now
-                # If ports/PGs are added, need to determine source/target type
                 source_type = "PROCESSOR"
                 target_type = "PROCESSOR"
                 
-                 # --- Log NiFi Request ---
+                 # Use target_pg_id for creation
                 nifi_create_req = {
                     "operation": "create_connection",
                     "process_group_id": target_pg_id,
@@ -2899,22 +3033,18 @@ async def create_nifi_flow(
                     "target_type": target_type
                 }
                 local_logger.bind(interface="nifi", direction="request", data=nifi_create_req).debug("Calling NiFi API")
-                # -----------------------
                 connection_entity = await nifi_api_client.create_connection(
-                    process_group_id=target_pg_id,
+                    process_group_id=target_pg_id, # Use potentially updated target
                     source_id=source_uuid,
                     target_id=target_uuid,
                     relationships=relationships,
                     source_type=source_type,
                     target_type=target_type
                 )
-                # --- Log NiFi Response ---
                 filtered_connection = filter_connection_data(connection_entity)
                 local_logger.bind(interface="nifi", direction="response", data=filtered_connection).debug("Received from NiFi API")
-                # -----------------------
-                
                 local_logger.info(f"Successfully created connection from '{source_name}' to '{target_name}'.")
-                results_list[index] = filtered_connection # Store success result
+                results_list[index] = filtered_connection 
 
             except (NiFiAuthenticationError, ConnectionError, ValueError, ToolError) as e:
                 err_msg = f"Connection from '{source_name}' to '{target_name}' (index {index}): Failed to create - {type(e).__name__}: {e}"
@@ -2928,12 +3058,12 @@ async def create_nifi_flow(
                 results_list[index] = {"status": "error", "message": err_msg}
 
     # --- Final Result ---
-    # Replace any remaining None placeholders with an error (shouldn't happen if logic is correct)
+    # ... (Final check for None remains the same) ...
     for i, result in enumerate(results_list):
         if result is None:
              obj_type = nifi_objects[i].get("type", "unknown")
              err_msg = f"Object at index {i} (type: {obj_type}) was not processed."
-             local_logger.error(err_msg) # Log internal error
+             local_logger.error(err_msg)
              results_list[i] = {"status": "error", "message": err_msg}
 
     local_logger.info("Finished creating NiFi flow components.")
