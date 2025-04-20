@@ -3,6 +3,10 @@ import json
 import re
 from pathlib import Path
 from loguru import logger
+from contextvars import ContextVar
+
+# Use ContextVar for request-specific context
+request_context = ContextVar('request_context', default={})
 
 # Assuming settings.py is in the same directory or accessible
 try:
@@ -67,9 +71,30 @@ class SafeJsonEncoder(json.JSONEncoder):
         except Exception:
             return f"<Unserializable object of type {type(obj).__name__}>"
 
+# --- Patcher function to add context --- #
+def context_patcher(record):
+    """Patches log records with context from ContextVar.
+       Only updates if the context var has non-default values.
+    """
+    ctx = request_context.get()
+    # Only overwrite if the context var has a non-default value
+    req_id_from_ctx = ctx.get("user_request_id", "-")
+    if req_id_from_ctx != "-":
+        record["extra"]["user_request_id"] = req_id_from_ctx
+        
+    act_id_from_ctx = ctx.get("action_id", "-")
+    if act_id_from_ctx != "-":
+        record["extra"]["action_id"] = act_id_from_ctx
+    # Return not strictly needed if called internally by another patcher
+# ------------------------------------ #
+
 # Define a middleware handler for interface logging to pre-process the data
 def interface_logger_middleware(record):
     """Middleware to pre-process the log record for interface logging."""
+    # --- Call context_patcher first --- #
+    context_patcher(record)
+    # ---------------------------------- #
+    
     # Only process records with 'interface' in extra
     if record["extra"].get("interface") is not None:
         # Extract the data we want to log from the record
@@ -88,6 +113,7 @@ def interface_logger_middleware(record):
             # If anything fails during preprocessing, log it and continue
             record["extra"]["json_data"] = json.dumps({"error": f"Failed to serialize data: {str(e)}"})
     
+    # Return the modified record
     return record
 
 def is_client_module(record):
@@ -114,10 +140,17 @@ def setup_logging():
     """Configures Loguru based on LOGGING_CONFIG from settings."""
     logger.remove() # Remove default handler
 
-    # Configure logger to add default context IDs
+    # Configure logger to add default context IDs and patchers
     logger.configure(
+        # Keep default extra values for logs outside request context
         extra={"user_request_id": "-", "action_id": "-"},
-        patcher=interface_logger_middleware  # Add the middleware
+        # Chain the patchers: context_patcher runs, then interface_logger_middleware
+        # Ensure context_patcher runs first by applying it to the record before passing to the next
+        # patcher=lambda record: interface_logger_middleware(context_patcher(record))
+        # Note: context_patcher always returns the record, so 'or record' isn't strictly needed
+        
+        # Apply the combined patcher
+        patcher=interface_logger_middleware
     )
 
     config = LOGGING_CONFIG

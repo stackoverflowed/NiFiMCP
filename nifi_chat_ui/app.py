@@ -40,7 +40,6 @@ if not is_initialized:
 # --- Constants ---
 MAX_LOOP_ITERATIONS = 10 # Safety break for the execution loop
 SYSTEM_PROMPT_FILE = "nifi_chat_ui/system_prompt.md"
-HISTORY_CLEAR_MARKER = "--- Max iterations reached. History below this point was cleared for the AI's context. ---"
 
 # --- Session State Initialization ---
 # Initialize chat history
@@ -52,10 +51,10 @@ if "current_objective" not in st.session_state:
     st.session_state.current_objective = ""
     
 # Initialize recovery flags
-if "run_recovery_loop" not in st.session_state:
-    st.session_state.run_recovery_loop = False
-if "history_cleared_for_next_llm_call" not in st.session_state:
-    st.session_state.history_cleared_for_next_llm_call = False
+# if "run_recovery_loop" not in st.session_state:
+#     st.session_state.run_recovery_loop = False
+# if "history_cleared_for_next_llm_call" not in st.session_state:
+#     st.session_state.history_cleared_for_next_llm_call = False
 
 # --- Load System Prompt --- 
 def load_system_prompt():
@@ -76,33 +75,81 @@ base_system_prompt = load_system_prompt()
 with st.sidebar:
     st.title("Settings")
     
-    # --- Provider Selection --- 
-    available_providers = []
-    if config.GOOGLE_API_KEY:
-        available_providers.append("Gemini")
-    if config.OPENAI_API_KEY:
-        available_providers.append("OpenAI")
+    # --- Model Selection (Combined) --- 
+    available_models = []
+    model_to_provider = {}
     
-    if not available_providers:
-        st.error("No API keys configured. Please set GOOGLE_API_KEY and/or OPENAI_API_KEY.")
-        provider = None
+    if config.GOOGLE_API_KEY and config.GEMINI_MODELS:
+        for model in config.GEMINI_MODELS:
+            available_models.append(f"Gemini: {model}")
+            model_to_provider[f"Gemini: {model}"] = ("Gemini", model)
+            
+    if config.OPENAI_API_KEY and config.OPENAI_MODELS:
+        for model in config.OPENAI_MODELS:
+            available_models.append(f"OpenAI: {model}")
+            model_to_provider[f"OpenAI: {model}"] = ("OpenAI", model)
+    
+    selected_model_display_name = None
+    provider = None # Will be derived from selection
+    model_name = None # Will be derived from selection
+
+    if not available_models:
+        st.error("No LLM models configured or API keys missing. Please check your .env file.")
     else:
-        previous_provider = st.session_state.get("previous_provider", None)
-        default_provider = "Gemini" if "Gemini" in available_providers else available_providers[0]
-        provider = st.selectbox("Select LLM Provider:", available_providers, 
-                              index=available_providers.index(default_provider) if default_provider in available_providers else 0,
-                              key="provider_select") # Added key
+        # Determine default selection
+        # Prioritize Gemini if available, otherwise first OpenAI, else first in list
+        default_selection = None
+        if config.GOOGLE_API_KEY and config.GEMINI_MODELS:
+            default_selection = f"Gemini: {config.GEMINI_MODELS[0]}"
+        elif config.OPENAI_API_KEY and config.OPENAI_MODELS:
+             default_selection = f"OpenAI: {config.OPENAI_MODELS[0]}"
         
-        if provider != previous_provider:
-            try:
-                configure_llms()
-                st.session_state["previous_provider"] = provider
-                logger.info(f"Provider changed from {previous_provider} to {provider}, re-configured LLM clients")
-            except Exception as e:
-                logger.error(f"Error reconfiguring clients after provider change: {e}", exc_info=True)
-                st.sidebar.warning(f"Error initializing {provider} client. Some features may not work properly.")
-                st.sidebar.write(f"Error details: {str(e)}")
-                
+        # Ensure default is actually in the list
+        if default_selection not in available_models:
+            default_selection = available_models[0] # Fallback to first item
+        
+        default_index = available_models.index(default_selection)
+        
+        selected_model_display_name = st.selectbox(
+            "Select LLM Model:", 
+            available_models, 
+            index=default_index,
+            key="model_select" # Use a key to track selection
+        )
+        
+        if selected_model_display_name:
+            provider, model_name = model_to_provider[selected_model_display_name]
+            logger.debug(f"Selected Model: {model_name}, Provider: {provider}")
+            
+            # Check if provider changed and reconfigure if needed
+            # (Potentially less critical now if configuration is robust)
+            previous_provider = st.session_state.get("previous_provider", None)
+            if provider != previous_provider:
+                try:
+                    # configure_llms() # Re-configure only if necessary, e.g., client state management
+                    st.session_state["previous_provider"] = provider
+                    logger.info(f"Provider context changed to {provider} based on model selection.")
+                except Exception as e:
+                    logger.error(f"Error during potential reconfiguration for {provider}: {e}", exc_info=True)
+                    # st.sidebar.warning(...) # Optional warning if reconfiguration fails
+        else:
+             # Handle case where selection somehow becomes None (shouldn't happen with selectbox)
+             st.error("No model selected.")
+
+    # --- Phase Selection --- 
+    st.markdown("---") # Add separator
+    phase_options = ["All", "Review", "Build", "Modify", "Operate"]
+    # Initialize session state for selected_phase if it doesn't exist
+    if "selected_phase" not in st.session_state:
+        st.session_state.selected_phase = "All"
+    
+    st.selectbox(
+        "Tool Phase Filter:",
+        phase_options,
+        key="selected_phase", # Bind directly to session state key
+        help="Filter the tools shown below and available to the LLM by operational phase."
+    )
+    
     # --- Tool Display --- 
     st.markdown("---")
     st.subheader("Available MCP Tools")
@@ -148,8 +195,8 @@ with st.sidebar:
         st.session_state.messages = []
         # Clear objective and flags as well
         st.session_state.current_objective = ""
-        st.session_state.run_recovery_loop = False
-        st.session_state.history_cleared_for_next_llm_call = False
+        # st.session_state.run_recovery_loop = False # Removed
+        # st.session_state.history_cleared_for_next_llm_call = False # Removed
         # Reset phase to default
         st.session_state.selected_phase = "All" # Reset phase on clear
         logger.info("Chat history and objective cleared by user.") 
@@ -172,11 +219,13 @@ st.markdown("---")
 for message in st.session_state.messages:
     if message.get("role") == "tool":
         continue
-    elif message.get("role") == "system" and message.get("content") == HISTORY_CLEAR_MARKER:
-        st.info(HISTORY_CLEAR_MARKER)
-        continue
+    # Removed system message check for HISTORY_CLEAR_MARKER
+    # elif message.get("role") == "system" and message.get("content") == HISTORY_CLEAR_MARKER:
+    #     st.info(HISTORY_CLEAR_MARKER)
+    #     continue
         
     with st.chat_message(message["role"]):
+        # Display content or tool call placeholder
         if message["role"] == "assistant" and "tool_calls" in message:
             tool_names = [tc.get('function', {}).get('name', 'unknown') for tc in message.get("tool_calls", [])]
             if tool_names:
@@ -186,19 +235,32 @@ for message in st.session_state.messages:
         elif "content" in message:
             st.markdown(message["content"])
         elif message["role"] == "assistant" and "tool_calls" in message and "content" not in message:
-             tool_names = [tc.get('function', {}).get('name', 'unknown') for tc in message.get("tool_calls", [])]
-             if tool_names:
-                 st.markdown(f"⚙️ Calling tool(s): `{', '.join(tool_names)}`...")
-             else:
-                 st.markdown("_(Tool call with no details)_")
+            tool_names = [tc.get('function', {}).get('name', 'unknown') for tc in message.get("tool_calls", [])]
+            if tool_names:
+                st.markdown(f"⚙️ Calling tool(s): `{', '.join(tool_names)}`...")
+            else:
+                st.markdown("_(Tool call with no details)_")
                 
-        token_count_in = message.get("token_count_in", 0)
-        token_count_out = message.get("token_count_out", 0)
-        if token_count_in or token_count_out:
-            st.caption(f"Tokens: In={token_count_in}, Out={token_count_out}")
+        # Display captions (Tokens, IDs)
+        caption_parts = []
+        if message["role"] == "user":
+            user_req_id = message.get("user_request_id")
+            if user_req_id:
+                caption_parts.append(f"Request ID: `{user_req_id}`")
+        elif message["role"] == "assistant":
+            token_count_in = message.get("token_count_in", 0)
+            token_count_out = message.get("token_count_out", 0)
+            action_id = message.get("action_id")
+            if token_count_in or token_count_out:
+                caption_parts.append(f"Tokens: In={token_count_in}, Out={token_count_out}")
+            if action_id:
+                caption_parts.append(f"Action ID: `{action_id}`")
+                
+        if caption_parts:
+            st.caption(" | ".join(caption_parts))
 
 # --- Refactored Execution Loop Function --- 
-def run_execution_loop(provider: str, base_sys_prompt: str, user_req_id: str):
+def run_execution_loop(provider: str, model_name: str, base_sys_prompt: str, user_req_id: str):
     """Runs the main LLM interaction loop."""
     bound_logger = logger.bind(user_request_id=user_req_id)
     loop_count = 0
@@ -211,23 +273,27 @@ def run_execution_loop(provider: str, base_sys_prompt: str, user_req_id: str):
         messages_for_llm = None
         system_prompt_for_llm = None
         
-        if st.session_state.get("history_cleared_for_next_llm_call", False):
-            current_loop_logger.info("History clear flag set. Preparing recovery context.")
-            messages_for_llm = [st.session_state.messages[-1]] if st.session_state.messages else []
-            system_prompt_for_llm = base_sys_prompt
-            st.session_state.history_cleared_for_next_llm_call = False
+        # Removed history clearing logic based on flag
+        # if st.session_state.get("history_cleared_for_next_llm_call", False):
+        #     current_loop_logger.info("History clear flag set. Preparing recovery context.")
+        #     messages_for_llm = [st.session_state.messages[-1]] if st.session_state.messages else []
+        #     system_prompt_for_llm = base_sys_prompt
+        #     st.session_state.history_cleared_for_next_llm_call = False
+        # else:
+        
+        # Always use current logic for preparing messages
+        current_loop_logger.debug("Using full history and potentially dynamic system prompt.")
+        messages_for_llm = st.session_state.messages
+        current_objective = st.session_state.get("current_objective", "")
+        if current_objective and current_objective.strip():
+            system_prompt_for_llm = f"{base_sys_prompt}\\n\\n## Current Objective\\n{current_objective.strip()}"
+            current_loop_logger.debug("Objective found, appending to system prompt.")
         else:
-            current_loop_logger.debug("Using full history and potentially dynamic system prompt.")
-            messages_for_llm = st.session_state.messages
-            current_objective = st.session_state.get("current_objective", "")
-            if current_objective and current_objective.strip():
-                system_prompt_for_llm = f"{base_sys_prompt}\n\n## Current Objective\n{current_objective.strip()}"
-                current_loop_logger.debug("Objective found, appending to system prompt.")
-            else:
-                system_prompt_for_llm = base_sys_prompt
-                current_loop_logger.debug("No objective set, using base system prompt.")
+            system_prompt_for_llm = base_sys_prompt
+            current_loop_logger.debug("No objective set, using base system prompt.")
         # -----------------------------------------------------------------
 
+        # --- Prepare Tools --- 
         # Get the selected phase
         current_phase = st.session_state.get("selected_phase", "All")
         
@@ -249,26 +315,32 @@ def run_execution_loop(provider: str, base_sys_prompt: str, user_req_id: str):
              except Exception as fmt_e:
                   st.error(f"Error formatting tools for {provider} in loop: {fmt_e}")
                   current_loop_logger.error(f"Error formatting tools for {provider}: {fmt_e}", exc_info=True)
-                  formatted_tools = None
-        else:
-             current_loop_logger.info(f"No tools available for the current phase '{current_phase}'.")
-
-        # Prepare arguments for LLM call
-        llm_args = {
-             "messages": messages_for_llm,
-             "system_prompt": system_prompt_for_llm,
-             "tools": formatted_tools # Pass the phase-filtered and formatted tools
-        }
+                  formatted_tools = None # Ensure it's None if formatting fails
+        # ----------------------
 
         # --- Call LLM --- 
+        # Generate a unique Action ID for this specific LLM call
+        llm_action_id = str(uuid.uuid4())
+        current_loop_logger = current_loop_logger.bind(action_id=llm_action_id) # Bind action_id for loop logging
+
         response_data = None
         with st.spinner(f"Thinking... (Step {loop_count})"):
             try:
-                current_loop_logger.info(f"Calling LLM ({provider})...")
+                current_loop_logger.info(f"Calling LLM ({provider} - {model_name})...")
                 if provider == "Gemini":
-                    response_data = get_gemini_response(**llm_args, user_request_id=user_req_id)
+                    response_data = get_gemini_response(messages=messages_for_llm, 
+                                                        system_prompt=system_prompt_for_llm, 
+                                                        tools=formatted_tools, 
+                                                        model_name=model_name, 
+                                                        user_request_id=user_req_id, 
+                                                        action_id=llm_action_id) # Pass action_id
                 elif provider == "OpenAI":
-                    response_data = get_openai_response(**llm_args, user_request_id=user_req_id)
+                    response_data = get_openai_response(messages=messages_for_llm, 
+                                                        system_prompt=system_prompt_for_llm, 
+                                                        tools=formatted_tools, 
+                                                        model_name=model_name, 
+                                                        user_request_id=user_req_id,
+                                                        action_id=llm_action_id) # Pass action_id
                 else:
                     st.error("Invalid provider selected.")
                     current_loop_logger.error(f"Invalid provider selected: {provider}")
@@ -289,133 +361,127 @@ def run_execution_loop(provider: str, base_sys_prompt: str, user_req_id: str):
         llm_content = response_data.get("content")
         tool_calls = response_data.get("tool_calls")
         error_message = response_data.get("error")
+        token_count_in = response_data.get("token_count_in", 0)
+        token_count_out = response_data.get("token_count_out", 0)
+        
         if error_message:
             current_loop_logger.error(f"LLM returned an error: {error_message}")
             with st.chat_message("assistant"):
                 st.markdown(f"Sorry, I encountered an error: {error_message}")
             st.session_state.messages.append({"role": "assistant", "content": f"Sorry, I encountered an error: {error_message}"})
             break
-        assistant_message_to_add = {"role": "assistant"}
+            
+        # Add assistant message to history (including tool calls if any)
+        assistant_message_to_add = {
+            "role": "assistant", 
+            "token_count_in": token_count_in, 
+            "token_count_out": token_count_out,
+            "action_id": llm_action_id # Add action_id here
+        }
         if llm_content: assistant_message_to_add["content"] = llm_content
         if tool_calls: assistant_message_to_add["tool_calls"] = tool_calls
-        token_count_in = response_data.get("token_count_in", 0)
-        token_count_out = response_data.get("token_count_out", 0)
-        if token_count_in or token_count_out:
-            assistant_message_to_add["token_count_in"] = token_count_in
-            assistant_message_to_add["token_count_out"] = token_count_out
-        if llm_content or tool_calls:
-            current_loop_logger.debug(f"Assistant response: Content={llm_content is not None}, ToolCalls={tool_calls is not None}")
-            st.session_state.messages.append(assistant_message_to_add)
-        else:
-            current_loop_logger.warning("LLM response had neither content nor tool calls.")
+        st.session_state.messages.append(assistant_message_to_add)
+        current_loop_logger.debug(f"Appended assistant message: Content={'present' if llm_content else 'absent'}, ToolCalls={len(tool_calls) if tool_calls else 0}")
+
+        # Display assistant message (or tool call placeholder) generated in this loop iteration
+        with st.chat_message("assistant"):
+            if tool_calls:
+                tool_names = [tc.get('function', {}).get('name', 'unknown') for tc in tool_calls]
+                if tool_names:
+                     st.markdown(f"⚙️ Calling tool(s): `{', '.join(tool_names)}`...")
+                else:
+                     st.markdown("_(Tool call with no details)_") # Should be rare
+            elif llm_content:
+                st.markdown(llm_content)
+            else:
+                st.markdown("_(Assistant provided no content or tool calls)_") # Should be rare
+
+            # Add token counts and action ID caption for this message
+            caption_parts = []
+            if token_count_in or token_count_out:
+                 caption_parts.append(f"Tokens: In={token_count_in}, Out={token_count_out}")
+            if llm_action_id: # Use the ID from this loop
+                 caption_parts.append(f"Action ID: `{llm_action_id}`")
+            if caption_parts:
+                st.caption(" | ".join(caption_parts))
 
         # --- Handle Tool Calls (if any) --- 
-        if tool_calls:
-            with st.chat_message("assistant"):
-                tool_names = [tc.get('function', {}).get('name', 'unknown') for tc in tool_calls]
-                st.markdown(f"⚙️ Calling tool(s): `{', '.join(tool_names)}`...")
+        if not tool_calls:
+            current_loop_logger.info("No tool calls requested by LLM. Checking for TASK COMPLETE.")
+            # If no tool calls and LLM thinks task is done, break the loop
+            if llm_content and "TASK COMPLETE" in llm_content:
+                current_loop_logger.info("TASK COMPLETE detected. Ending execution loop.")
+                break
+            else:
+                # If no tool call and task not complete, this iteration might be done (e.g., clarifying question)
+                # Or it could be an unexpected state. For now, assume the loop should end.
+                current_loop_logger.info("No tool calls and no TASK COMPLETE. Ending loop for this user request.")
+                break # Exit loop if no tools called and not explicitly complete
+        else:
+            current_loop_logger.info(f"Processing {len(tool_calls)} tool call(s)...")
+            # Process tool calls one by one
             for tool_call in tool_calls:
-                action_id = str(uuid.uuid4())
-                tool_logger = current_loop_logger.bind(action_id=action_id)
-                tool_call_id = tool_call.get("id")
-                function_info = tool_call.get("function", {})
-                tool_name = function_info.get("name")
-                tool_args_str = function_info.get("arguments")
-                tool_logger.info(f"Processing tool call: ID={tool_call_id}, Name={tool_name}")
-                if not tool_call_id or not tool_name or tool_args_str is None:
-                    st.error(f"LLM requested invalid tool call format: {tool_call}")
-                    tool_logger.error(f"Invalid tool call format received from LLM: {tool_call}")
-                    st.session_state.messages.append({"role": "tool", "tool_call_id": tool_call_id if tool_call_id else "unknown_id", "content": f"Error: Invalid tool call format received from LLM: {tool_call}"})
+                 # Decision: Use the llm_action_id for subsequent tool calls in this loop iteration
+                 # This simplifies tracing for a single LLM turn, sacrificing granularity
+                 # between multiple tool calls within the same turn.
+                 # We could generate a unique tool_action_id = str(uuid.uuid4()) here if needed.
+                # tool_action_id = str(uuid.uuid4())
+                # tool_loop_logger = current_loop_logger.bind(action_id=tool_action_id) # Bind for tool logging
+                tool_loop_logger = current_loop_logger # Use the logger already bound with llm_action_id
+                
+                tool_id = tool_call.get("id")
+                function_call = tool_call.get("function")
+                if not tool_id or not function_call or not isinstance(function_call, dict):
+                    tool_loop_logger.error(f"Skipping invalid tool call structure: {tool_call}")
                     continue
+                
+                function_name = function_call.get("name")
+                function_args_str = function_call.get("arguments", "{}")
+                tool_loop_logger.info(f"Executing tool: {function_name} (ID: {tool_id})")
+                
                 try:
-                    tool_args = json.loads(tool_args_str)
-                    tool_logger.debug(f"Parsed arguments for tool '{tool_name}': {tool_args}")
-                except json.JSONDecodeError:
-                    st.error(f"Failed to parse JSON arguments for tool '{tool_name}': {tool_args_str}")
-                    tool_logger.error(f"Failed to parse JSON arguments for tool '{tool_name}': {tool_args_str}", exc_info=True)
-                    st.session_state.messages.append({"role": "tool", "tool_call_id": tool_call_id, "content": f"Error: Failed to parse JSON arguments: {tool_args_str}"})
-                    continue
-                try:
-                    with st.spinner(f"Executing tool: `{tool_name}`..."):
-                         tool_logger.info(f"Executing tool: {tool_name} with args: {tool_args}")
-                         result = execute_mcp_tool(tool_name=tool_name, params=tool_args, user_request_id=user_req_id, action_id=action_id)
-                         tool_logger.info(f"Tool '{tool_name}' executed successfully.")
-                    if isinstance(result, (dict, list)):
-                        result_content = json.dumps(result)
-                    else:
-                        result_content = str(result)
-                    tool_logger.debug(f"Appending tool result for '{tool_name}' (ID: {tool_call_id}) to history.")
-                    st.session_state.messages.append({"role": "tool", "tool_call_id": tool_call_id, "content": result_content})
-                except Exception as e:
-                    st.error(f"Unexpected error executing tool '{tool_name}': {e}")
-                    tool_logger.error(f"Unexpected error executing tool '{tool_name}': {e}", exc_info=True)
-                    st.session_state.messages.append({"role": "tool", "tool_call_id": tool_call_id, "content": f"Error: Failed to execute tool '{tool_name}'. Exception: {e}"})
-            continue 
-            
-        # --- Handle Final Response (No Tool Calls) --- 
-        elif llm_content:
-            final_content = llm_content
-            task_complete_signal = "TASK COMPLETE"
-            is_task_complete = task_complete_signal in final_content
-            if is_task_complete:
-                final_content = final_content.replace(task_complete_signal, "").strip()
-            with st.chat_message("assistant"):
-                st.markdown(final_content)
-                token_count_in = response_data.get("token_count_in", 0)
-                token_count_out = response_data.get("token_count_out", 0)
-                if token_count_in or token_count_out:
-                     st.caption(f"Tokens: In={token_count_in}, Out={token_count_out}")
-            current_loop_logger.info("LLM provided final response. Exiting loop.")
-            break
-        
-        # --- Handle case where LLM returns neither content nor tool calls ---
-        else: 
-            current_loop_logger.warning("LLM response had neither content nor tool calls in this loop iteration. Breaking loop to avoid infinite cycling.")
-            st.warning("Assistant did not provide a response or further actions. Please try rephrasing your request.")
-            break
-            
-    # --- End of Loop --- 
-    
-    # --- Max Iteration Handling --- 
-    if loop_count >= MAX_LOOP_ITERATIONS:
-        warning_msg = f"Reached maximum loop iterations ({MAX_LOOP_ITERATIONS}). Task may be incomplete."
-        st.warning(warning_msg)
-        bound_logger.warning(warning_msg) 
-        st.session_state.messages.append({"role": "system", "content": HISTORY_CLEAR_MARKER})
-        st.session_state.history_cleared_for_next_llm_call = True
-        current_objective = st.session_state.get("current_objective", "").strip()
-        recovery_prompt = (
-            "The previous attempt reached the maximum iterations.\n\n"
-            f"**Original Objective:** {current_objective if current_objective else 'Not specified.'}\n\n"
-            "Please assess the current state of the NiFi flow using available tools (e.g., `list_nifi_objects`) "
-            "and report the **next steps** needed to achieve the objective or confirm if it's already met. "
-            "**Do not execute any further actions now, only report your findings and proposed next steps.**"
-        )
-        st.session_state.messages.append({"role": "user", "content": recovery_prompt})
-        bound_logger.info("Max iterations reached. History marker added. Recovery prompt added.")
-        st.session_state.run_recovery_loop = True 
-        st.rerun()
+                    # Parse arguments
+                    arguments = json.loads(function_args_str)
+                    tool_loop_logger.debug(f"Parsed arguments for {function_name}: {arguments}")
+                    
+                    # Execute the tool using mcp_handler
+                    # Pass user_request_id and the llm_action_id from this loop iteration
+                    tool_result = execute_mcp_tool(
+                        tool_name=function_name, 
+                        params=arguments,
+                        user_request_id=user_req_id, 
+                        action_id=llm_action_id # Use llm_action_id here
+                    )
+                    
+                    # Format result for the LLM
+                    tool_result_content = json.dumps(tool_result) if tool_result is not None else "null"
+                    tool_loop_logger.debug(f"Tool {function_name} execution result: {tool_result_content[:200]}...") # Log snippet
 
-# --- Phase Selection and Chat Input Area --- 
-phase_options = ["All", "Review", "Build", "Modify", "Operate"]
-# Initialize session state for selected_phase if it doesn't exist
-if "selected_phase" not in st.session_state:
-    st.session_state.selected_phase = "All"
+                    # Add tool result message to history for the next LLM iteration
+                    st.session_state.messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tool_id,
+                            "content": tool_result_content, # Send result back as JSON string
+                            # "name": function_name # OpenAI includes name here, Gemini doesn't use it like this
+                        }
+                    )
+                except json.JSONDecodeError as json_err:
+                    error_content = f"Error parsing arguments for {function_name}: {json_err}"
+                    tool_loop_logger.error(error_content)
+                    st.error(error_content)
+                    st.session_state.messages.append({"role": "tool", "tool_call_id": tool_id, "content": error_content})
+                except Exception as tool_err:
+                    error_content = f"Error executing tool {function_name}: {tool_err}"
+                    tool_loop_logger.error(error_content, exc_info=True)
+                    st.error(error_content)
+                    st.session_state.messages.append({"role": "tool", "tool_call_id": tool_id, "content": error_content})
+            # Continue loop to send tool results back to LLM
+            # No break here - loop continues automatically
+    # --- Loop End --- 
 
-col1, col2 = st.columns([1, 4]) # Adjust ratio as needed
-with col1:
-    # Use st.session_state.selected_phase directly with the selectbox
-    st.selectbox(
-        "Phase:",
-        phase_options,
-        key="selected_phase", # Bind directly to session state key
-        label_visibility="collapsed"
-    )
-with col2:
-    prompt = st.chat_input("What would you like to do with NiFi?")
-
-# --- Process User Input --- 
-if prompt:
+# --- User Input Handling --- 
+if prompt := st.chat_input("What can I help you with?"):
     if not provider:
         st.error("Please configure an API key and select a provider.")
         logger.warning("User submitted prompt but no provider was configured/selected.")
@@ -424,19 +490,16 @@ if prompt:
         bound_logger = logger.bind(user_request_id=user_request_id)
         bound_logger.info(f"Received new user prompt (Provider: {provider})")
 
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        # Displaying the prompt happens naturally on rerun after appending
-        # Call the refactored execution loop
-        run_execution_loop(provider, base_system_prompt, user_request_id)
+        # Append user message with ID to history
+        user_message = {"role": "user", "content": prompt, "user_request_id": user_request_id}
+        st.session_state.messages.append(user_message)
+        
+        # Immediately display user message
+        with st.chat_message("user"):
+            st.markdown(prompt)
+            st.caption(f"Request ID: `{user_request_id}`")
 
-# --- Process Recovery Trigger --- 
-if st.session_state.get("run_recovery_loop", False):
-    st.session_state.run_recovery_loop = False # Reset flag immediately
-    logger.info("Recovery loop triggered.")
-    # Need a user_request_id for the recovery attempt
-    recovery_request_id = str(uuid.uuid4())
-    # Ensure provider is available before calling loop
-    if provider:
-        run_execution_loop(provider, base_system_prompt, recovery_request_id)
-    else:
-        st.error("Cannot run recovery: No LLM provider selected.") 
+        # Call the refactored execution loop
+        run_execution_loop(provider=provider, model_name=model_name, base_sys_prompt=base_system_prompt, user_req_id=user_request_id)
+
+# End of file - No changes needed below last removed section 

@@ -74,13 +74,17 @@ GOOGLE_API_KEY = load_api_key("GOOGLE_API_KEY")
 OPENAI_API_KEY = load_api_key("OPENAI_API_KEY")
 
 # Load model configurations with defaults
-OPENAI_MODEL = load_config_value("OPENAI_MODEL", "gpt-4-turbo-preview")  # Default to latest GPT-4
-GEMINI_MODEL = load_config_value("GEMINI_MODEL", "gemini-1.5-pro-latest")  # Default to latest Gemini Pro
+OPENAI_MODELS_STR = load_config_value("OPENAI_MODELS", "gpt-4-turbo-preview")
+GEMINI_MODELS_STR = load_config_value("GEMINI_MODELS", "gemini-1.5-pro-latest")
+
+# Parse the comma-separated strings into lists, removing empty strings
+OPENAI_MODELS = [model.strip() for model in OPENAI_MODELS_STR.split(',') if model.strip()]
+GEMINI_MODELS = [model.strip() for model in GEMINI_MODELS_STR.split(',') if model.strip()]
 
 # Print loaded configuration (excluding sensitive values)
-print("\nLoaded environment/model configuration:") # Added newline for clarity
-print(f"OPENAI_MODEL: {OPENAI_MODEL}")
-print(f"GEMINI_MODEL: {GEMINI_MODEL}")
+print("\nLoaded environment/model configuration:")
+print(f"OPENAI_MODELS: {OPENAI_MODELS}")
+print(f"GEMINI_MODELS: {GEMINI_MODELS}")
 print(f"GOOGLE_API_KEY configured: {'Yes' if GOOGLE_API_KEY else 'No'}")
 print(f"OPENAI_API_KEY configured: {'Yes' if OPENAI_API_KEY else 'No'}")
 # Optionally print logging config status

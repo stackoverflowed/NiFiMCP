@@ -242,17 +242,17 @@ async def list_nifi_objects(
         - 'process_groups': Lists child process groups under the target group (see search_scope).
     process_group_id : str | None, optional
         The UUID of the process group to inspect. If None or omitted, defaults to the root process group. (default is None)
-    search_scope : Literal["current_group", "recursive"], optional
+    search_scope : Literal["current_group"], optional
         Determines the scope of the listing. Defaults to 'current_group'.
         - 'current_group': Lists objects only within the specified `process_group_id`. For 'process_groups', shows only immediate children with counts.
-        - 'recursive': For 'processors', 'connections', or 'ports', lists objects in the specified group and all nested subgroups. For 'process_groups', provides the full nested hierarchy including children of children, with counts at each level. (default is "current_group")
+        - 'recursive': NOT IMPLEMENTED YET. For 'processors', 'connections', or 'ports', lists objects in the specified group and all nested subgroups. For 'process_groups', provides the full nested hierarchy including children of children, with counts at each level. (default is "current_group")
 
     Returns
     -------
     Union[List[Dict], Dict]
         A list or dictionary depending on the object_type and search_scope. See Args descriptions for specifics. Raises ToolError if an API error occurs.
     """
-    local_logger = logger.bind(tool_name="list_nifi_objects", object_type=object_type, search_scope=search_scope)
+    local_logger = logger.bind(tool_name="list_nifi_objects", object_type=object_type, search_scope="current_group")
     await ensure_authenticated(nifi_api_client, local_logger)
 
     target_pg_id = process_group_id
@@ -427,7 +427,9 @@ async def document_nifi_flow(
     starting_processor_id: str | None = None,
     max_depth: int = 10,
     include_properties: bool = True,
-    include_descriptions: bool = True
+    include_descriptions: bool = True,
+    user_request_id: str = "-",
+    action_id: str = "-"
 ) -> Dict[str, Any]:
     """
     Documents a NiFi flow by traversing processors and connections within a specified process group.
@@ -444,20 +446,24 @@ async def document_nifi_flow(
         Whether to include extracted key processor properties, dynamic properties, and expression analysis in the documentation. Defaults to True. (default is True)
     include_descriptions : bool, optional
         Whether to include processor description/comment fields in the documentation. Defaults to True. (default is True)
+    user_request_id : str, optional
+        A unique identifier for the user request. Defaults to "-".
+    action_id : str, optional
+        A unique identifier for the action being performed. Defaults to "-".
 
     Returns
     -------
     Dict[str, Any]
         A dictionary containing the flow documentation, including processors, connections, graph structure summary, identified paths, decision points, and parameter context (if `include_properties` is True).
     """
-    local_logger = logger.bind(tool_name="document_nifi_flow")
-    await ensure_authenticated(nifi_api_client, local_logger)
-
+    local_logger = logger.bind(user_request_id=user_request_id, action_id=action_id)
+    
+    local_logger.debug("Starting document_nifi_flow execution.")
     target_pg_id = process_group_id
-    if target_pg_id is None:
+    if not target_pg_id:
         local_logger.info("No process_group_id provided, fetching root process group ID.")
         try:
-            target_pg_id = await nifi_api_client.get_root_process_group_id()
+            target_pg_id = await nifi_api_client.get_root_process_group_id(user_request_id=user_request_id, action_id=action_id)
         except Exception as e:
             local_logger.error(f"Failed to get root process group ID: {e}", exc_info=True)
             raise ToolError(f"Failed to determine root process group ID: {e}")
@@ -468,13 +474,13 @@ async def document_nifi_flow(
     try:
         nifi_req_procs = {"operation": "list_processors", "process_group_id": target_pg_id}
         local_logger.bind(interface="nifi", direction="request", data=nifi_req_procs).debug("Calling NiFi API")
-        processors = await nifi_api_client.list_processors(target_pg_id)
+        processors = await nifi_api_client.list_processors(target_pg_id, user_request_id=user_request_id, action_id=action_id)
         nifi_resp_procs = {"processor_count": len(processors)}
         local_logger.bind(interface="nifi", direction="response", data=nifi_resp_procs).debug("Received from NiFi API")
         
         nifi_req_conns = {"operation": "list_connections", "process_group_id": target_pg_id}
         local_logger.bind(interface="nifi", direction="request", data=nifi_req_conns).debug("Calling NiFi API")
-        connections = await nifi_api_client.list_connections(target_pg_id)
+        connections = await nifi_api_client.list_connections(target_pg_id, user_request_id=user_request_id, action_id=action_id)
         nifi_resp_conns = {"connection_count": len(connections)}
         local_logger.bind(interface="nifi", direction="response", data=nifi_resp_conns).debug("Received from NiFi API")
 
@@ -564,7 +570,7 @@ async def document_nifi_flow(
         }
         
         if include_properties:
-            parameters = await nifi_api_client.get_parameter_context(target_pg_id)
+            parameters = await nifi_api_client.get_parameter_context(target_pg_id, user_request_id=user_request_id, action_id=action_id)
             if parameters:
                 result["parameters"] = parameters
         

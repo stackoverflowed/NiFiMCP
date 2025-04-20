@@ -5,6 +5,7 @@ import httpx
 from dotenv import load_dotenv
 import uuid # Import uuid for client ID generation
 from typing import Optional, Dict, Any, Union, List # Add Union and List
+from mcp.server.fastmcp.exceptions import ToolError # Import ToolError
 
 # Load environment variables from .env file
 load_dotenv()
@@ -98,66 +99,68 @@ class NiFiClient:
             logger.info("NiFi client connection closed.")
 
     # --- Placeholder for other API methods ---
-    async def get_root_process_group_id(self) -> str:
-        """Fetches the ID of the root process group."""
+    async def get_root_process_group_id(self, user_request_id: str = "-", action_id: str = "-") -> str:
+        """Gets the ID of the root process group."""
+        local_logger = logger.bind(user_request_id=user_request_id, action_id=action_id)
         if not self._token:
+            local_logger.error("Authentication required before getting root process group ID.")
             raise NiFiAuthenticationError("Client is not authenticated. Call authenticate() first.")
 
         client = await self._get_client()
         endpoint = "/flow/process-groups/root"
         try:
-            logger.info(f"Fetching root process group info from {self.base_url}{endpoint}")
+            local_logger.info(f"Fetching root process group ID from {self.base_url}{endpoint}")
             response = await client.get(endpoint)
             response.raise_for_status()
             data = response.json()
-            # According to API docs, the response is ProcessGroupFlowEntity
-            # which contains the id directly or within processGroupFlow.id
-            root_id = data.get("id")
-            if not root_id and "processGroupFlow" in data:
-                 root_id = data["processGroupFlow"].get("id") # Check nested structure too
-
+            # Check both top-level ID and nested ID within processGroupFlow
+            root_id = data.get('id')
+            if not root_id and 'processGroupFlow' in data and isinstance(data['processGroupFlow'], dict):
+                root_id = data['processGroupFlow'].get('id')
+                
             if not root_id:
-                 logger.error(f"Could not find root process group ID in response: {data}")
-                 raise ValueError("Root process group ID not found in API response.")
-
-            logger.info(f"Found root process group ID: {root_id}")
+                 local_logger.error(f"Root process group ID not found in response structure: {data}") # Log structure on error
+                 raise ConnectionError("Could not extract root process group ID from response.")
+            local_logger.info(f"Retrieved root process group ID: {root_id}")
             return root_id
-
         except httpx.HTTPStatusError as e:
-            logger.error(f"Failed to get root process group: {e.response.status_code} - {e.response.text}")
-            raise ConnectionError(f"Failed to get root process group: {e.response.status_code}") from e
+            local_logger.error(f"Failed to get root process group ID: {e.response.status_code} - {e.response.text}")
+            raise ConnectionError(f"Failed to get root process group ID: {e.response.status_code}") from e
         except (httpx.RequestError, ValueError) as e:
-            logger.error(f"Error getting root process group: {e}")
-            raise ConnectionError(f"Error getting root process group: {e}") from e
+            local_logger.error(f"Error getting root process group ID: {e}")
+            raise ConnectionError(f"Error getting root process group ID: {e}") from e
         except Exception as e:
-             logger.error(f"An unexpected error occurred getting root process group ID: {e}", exc_info=True)
-             raise ConnectionError(f"An unexpected error occurred getting root process group ID: {e}") from e
+            local_logger.error(f"An unexpected error occurred getting root process group ID: {e}", exc_info=True)
+            raise ConnectionError(f"An unexpected error occurred getting root process group ID: {e}") from e
 
-    async def list_processors(self, process_group_id: str) -> list[dict]:
+    async def list_processors(self, process_group_id: str, user_request_id: str = "-", action_id: str = "-") -> list[dict]:
         """Lists processors within a specified process group."""
+        local_logger = logger.bind(user_request_id=user_request_id, action_id=action_id)
+        
         if not self._token:
+            local_logger.error("Authentication required before listing processors.")
             raise NiFiAuthenticationError("Client is not authenticated. Call authenticate() first.")
 
         client = await self._get_client()
         endpoint = f"/process-groups/{process_group_id}/processors"
         try:
-            logger.info(f"Fetching processors for group {process_group_id} from {self.base_url}{endpoint}")
+            local_logger.info(f"Fetching processors for group {process_group_id} from {self.base_url}{endpoint}")
             response = await client.get(endpoint)
             response.raise_for_status()
             data = response.json()
             # The response is typically a ProcessorsEntity which has a 'processors' key containing a list
             processors = data.get("processors", [])
-            logger.info(f"Found {len(processors)} processors in group {process_group_id}.")
+            local_logger.info(f"Found {len(processors)} processors in group {process_group_id}.")
             return processors
 
         except httpx.HTTPStatusError as e:
-            logger.error(f"Failed to list processors for group {process_group_id}: {e.response.status_code} - {e.response.text}")
+            local_logger.error(f"Failed to list processors for group {process_group_id}: {e.response.status_code} - {e.response.text}")
             raise ConnectionError(f"Failed to list processors: {e.response.status_code}") from e
         except (httpx.RequestError, ValueError) as e:
-            logger.error(f"Error listing processors for group {process_group_id}: {e}")
+            local_logger.error(f"Error listing processors for group {process_group_id}: {e}")
             raise ConnectionError(f"Error listing processors: {e}") from e
         except Exception as e:
-            logger.error(f"An unexpected error occurred listing processors: {e}", exc_info=True)
+            local_logger.error(f"An unexpected error occurred listing processors: {e}", exc_info=True)
             raise ConnectionError(f"An unexpected error occurred listing processors: {e}") from e
 
     async def create_processor(
@@ -369,31 +372,32 @@ class NiFiClient:
             logger.error(f"An unexpected error occurred getting connection details for {connection_id}: {e}", exc_info=True)
             raise ConnectionError(f"An unexpected error occurred getting connection details: {e}") from e
 
-    async def list_connections(self, process_group_id: str) -> list[dict]:
+    async def list_connections(self, process_group_id: str, user_request_id: str = "-", action_id: str = "-") -> list[dict]:
         """Lists connections within a specified process group."""
+        local_logger = logger.bind(user_request_id=user_request_id, action_id=action_id)
         if not self._token:
+            local_logger.error("Authentication required before listing connections.")
             raise NiFiAuthenticationError("Client is not authenticated. Call authenticate() first.")
 
         client = await self._get_client()
         endpoint = f"/process-groups/{process_group_id}/connections"
         try:
-            logger.info(f"Fetching connections for group {process_group_id} from {self.base_url}{endpoint}")
+            local_logger.info(f"Fetching connections for group {process_group_id} from {self.base_url}{endpoint}")
             response = await client.get(endpoint)
             response.raise_for_status()
             data = response.json()
-            # The response is typically a ConnectionsEntity which has a 'connections' key containing a list
             connections = data.get("connections", [])
-            logger.info(f"Found {len(connections)} connections in group {process_group_id}.")
+            local_logger.info(f"Found {len(connections)} connections in group {process_group_id}.")
             return connections
 
         except httpx.HTTPStatusError as e:
-            logger.error(f"Failed to list connections for group {process_group_id}: {e.response.status_code} - {e.response.text}")
+            local_logger.error(f"Failed to list connections for group {process_group_id}: {e.response.status_code} - {e.response.text}")
             raise ConnectionError(f"Failed to list connections: {e.response.status_code}") from e
         except (httpx.RequestError, ValueError) as e:
-            logger.error(f"Error listing connections for group {process_group_id}: {e}")
+            local_logger.error(f"Error listing connections for group {process_group_id}: {e}")
             raise ConnectionError(f"Error listing connections: {e}") from e
         except Exception as e:
-            logger.error(f"An unexpected error occurred listing connections: {e}", exc_info=True)
+            local_logger.error(f"An unexpected error occurred listing connections: {e}", exc_info=True)
             raise ConnectionError(f"An unexpected error occurred listing connections: {e}") from e
 
     async def delete_connection(self, connection_id: str, version_number: int) -> bool:
@@ -618,56 +622,44 @@ class NiFiClient:
             logger.error(f"An unexpected error occurred changing state for processor {processor_id}: {e}", exc_info=True)
             raise ConnectionError(f"An unexpected error occurred changing processor state: {e}") from e
 
-    async def get_parameter_context(self, process_group_id: str) -> list:
-        """Get parameter contexts assigned to a process group."""
-        if not self._token:
-            raise NiFiAuthenticationError("Client is not authenticated. Call authenticate() first.")
-
-        client = await self._get_client()
-        
-        # First, get the process group entity to find the parameter context
-        endpoint = f"/process-groups/{process_group_id}"
+    async def get_parameter_context(self, process_group_id: str, user_request_id: str = "-", action_id: str = "-") -> list:
+        """Retrieves the parameter context associated with a process group."""
+        local_logger = logger.bind(user_request_id=user_request_id, action_id=action_id)
+        local_logger.info(f"Fetching process group {process_group_id} to get parameter context")
         try:
-            logger.info(f"Fetching process group {process_group_id} to get parameter context")
-            response = await client.get(endpoint)
-            response.raise_for_status()
-            group_data = response.json()
-            
-            # Check if the process group has a parameter context
-            parameter_context_id = group_data.get("component", {}).get("parameterContext", {}).get("id")
-            
-            if not parameter_context_id:
-                logger.info(f"No parameter context found for process group {process_group_id}")
+            # First, get the process group details to find the parameter context ID
+            pg_details = await self.get_process_group_details(process_group_id, user_request_id=user_request_id, action_id=action_id) # Pass IDs down
+            param_context_id = pg_details.get("component", {}).get("parameterContext", {}).get("id")
+
+            if not param_context_id:
+                local_logger.info(f"No parameter context found for process group {process_group_id}")
                 return []
-                
-            # Now get the parameter context details
-            endpoint = f"/parameter-contexts/{parameter_context_id}"
+
+            # Now fetch the parameter context details using its ID
+            client = await self._get_client()
+            endpoint = f"/parameter-contexts/{param_context_id}?includeInheritedParameters=true"
+            local_logger.info(f"Fetching parameter context {param_context_id} from {self.base_url}{endpoint}")
             response = await client.get(endpoint)
             response.raise_for_status()
-            context_data = response.json()
-            
-            # Extract parameters
-            parameters = []
-            for param in context_data.get("component", {}).get("parameters", []):
-                parameters.append({
-                    "name": param.get("parameter", {}).get("name"),
-                    "value": param.get("parameter", {}).get("value"),
-                    "description": param.get("parameter", {}).get("description"),
-                    "sensitive": param.get("parameter", {}).get("sensitive", False)
-                })
-            
-            logger.info(f"Found {len(parameters)} parameters for process group {process_group_id}")
-            return parameters
-            
+            data = response.json()
+            parameters = data.get("component", {}).get("parameters", [])
+            local_logger.info(f"Found {len(parameters)} parameters in context {param_context_id} for group {process_group_id}.")
+            # Extract only parameter name and value if needed, or return full structure
+            # simplified_params = [{p['parameter']['name']: p['parameter'].get('value')} for p in parameters]
+            return parameters # Return full parameter entity list
+
+        except NiFiAuthenticationError as e:
+             local_logger.error(f"Authentication error fetching parameter context for PG {process_group_id}: {e}", exc_info=False)
+             raise ToolError(f"Authentication error accessing parameter context for PG {process_group_id}.") from e
         except httpx.HTTPStatusError as e:
-            logger.error(f"Failed to get parameter context for process group {process_group_id}: {e.response.status_code} - {e.response.text}")
-            raise ConnectionError(f"Failed to get parameter context: {e.response.status_code}") from e
-        except (httpx.RequestError, ValueError) as e:
-            logger.error(f"Error getting parameter context for process group {process_group_id}: {e}")
-            raise ConnectionError(f"Error getting parameter context: {e}") from e
+            local_logger.error(f"Failed to get parameter context for PG {process_group_id}: {e.response.status_code} - {e.response.text}")
+            raise ToolError(f"Failed to get parameter context: {e.response.status_code}") from e
+        except (httpx.RequestError, ValueError, ConnectionError) as e:
+            local_logger.error(f"Error getting parameter context for PG {process_group_id}: {e}")
+            raise ToolError(f"Error getting parameter context: {e}") from e
         except Exception as e:
-            logger.error(f"An unexpected error occurred getting parameter context: {e}", exc_info=True)
-            raise ConnectionError(f"An unexpected error occurred getting parameter context: {e}") from e
+            local_logger.error(f"An unexpected error occurred getting parameter context for PG {process_group_id}: {e}", exc_info=True)
+            raise ToolError(f"An unexpected error occurred getting parameter context: {e}") from e
 
     async def get_input_ports(self, process_group_id: str) -> list[dict]:
         """Lists input ports within a specified process group."""
@@ -747,33 +739,35 @@ class NiFiClient:
             logger.error(f"An unexpected error occurred listing process groups: {e}", exc_info=True)
             raise ConnectionError(f"An unexpected error occurred listing process groups: {e}") from e
 
-    async def get_process_group_details(self, process_group_id: str) -> dict:
+    async def get_process_group_details(self, process_group_id: str, user_request_id: str = "-", action_id: str = "-") -> dict:
         """Fetches the details of a specific process group."""
+        local_logger = logger.bind(user_request_id=user_request_id, action_id=action_id)
         if not self._token:
+            local_logger.error("Authentication required before getting process group details.")
             raise NiFiAuthenticationError("Client is not authenticated. Call authenticate() first.")
 
         client = await self._get_client()
         endpoint = f"/process-groups/{process_group_id}"
         try:
-            logger.info(f"Fetching details for process group {process_group_id} from {self.base_url}{endpoint}")
+            local_logger.info(f"Fetching details for process group {process_group_id} from {self.base_url}{endpoint}")
             response = await client.get(endpoint)
             response.raise_for_status()
             group_details = response.json()
-            logger.info(f"Successfully fetched details for process group {process_group_id}")
+            local_logger.info(f"Successfully fetched details for process group {process_group_id}")
             return group_details
 
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 404:
-                logger.warning(f"Process group with ID {process_group_id} not found.")
+                local_logger.warning(f"Process group with ID {process_group_id} not found.")
                 raise ValueError(f"Process group with ID {process_group_id} not found.") from e
             else:
-                logger.error(f"Failed to get details for process group {process_group_id}: {e.response.status_code} - {e.response.text}")
+                local_logger.error(f"Failed to get details for process group {process_group_id}: {e.response.status_code} - {e.response.text}")
                 raise ConnectionError(f"Failed to get process group details: {e.response.status_code}, {e.response.text}") from e
         except (httpx.RequestError, ValueError) as e:
-            logger.error(f"Error getting details for process group {process_group_id}: {e}")
+            local_logger.error(f"Error getting details for process group {process_group_id}: {e}")
             raise ConnectionError(f"Error getting process group details: {e}") from e
         except Exception as e:
-            logger.error(f"An unexpected error occurred getting process group details for {process_group_id}: {e}", exc_info=True)
+            local_logger.error(f"An unexpected error occurred getting process group details for {process_group_id}: {e}", exc_info=True)
             raise ConnectionError(f"An unexpected error occurred getting process group details: {e}") from e
 
     async def get_process_group_flow(self, process_group_id: str) -> dict:
@@ -1202,6 +1196,9 @@ class NiFiClient:
         except Exception as e:
             logger.error(f"An unexpected error occurred getting processor types: {e}", exc_info=True)
             raise ConnectionError(f"An unexpected error occurred getting processor types: {e}") from e
+
+    def __repr__(self):
+        return f"<{type(self).__name__} base_url={self.base_url} authenticated={self.is_authenticated}>"
 
 # Example usage (for testing this module directly)
 async def main():

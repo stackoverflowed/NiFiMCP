@@ -61,31 +61,29 @@ except Exception as e:
     FunctionDeclaration = None
 
 # --- Client Initialization --- #
-gemini_model = None # Store the initialized model
+# gemini_model = None # Store the initialized model - Removed, will instantiate per request
 openai_client = None
 is_initialized = False # Flag to track whether LLM clients have been initialized 
 
 def configure_llms():
-    """Configures both LLM clients based on available keys."""
-    global gemini_model, openai_client, is_initialized
+    """Configures LLM clients based on available keys and models."""
+    # global gemini_model, openai_client, is_initialized # Removed gemini_model
+    global openai_client, is_initialized # Keep openai_client global for now
     
-    # Configure Gemini
-    if config.GOOGLE_API_KEY and gemini_model is None:
+    # Configure Gemini (only API key setup here)
+    if config.GOOGLE_API_KEY:
         try:
             genai.configure(api_key=config.GOOGLE_API_KEY)
-            # Select the model specified in config
-            gemini_model = genai.GenerativeModel(
-                config.GEMINI_MODEL, 
-                # system_instruction=system_prompt # System prompt applied during generation
-            )
-            logger.info(f"Gemini client configured with model: {config.GEMINI_MODEL}")
+            # Don't instantiate a specific model here
+            # We need the model name which comes per request
+            logger.info(f"Gemini API key configured. Available models: {config.GEMINI_MODELS}")
         except Exception as e:
             # Log internal error, avoid UI warning during import
-            logger.error(f"Failed to configure Gemini: {e}", exc_info=True)
-            gemini_model = None
+            logger.error(f"Failed to configure Gemini API key: {e}", exc_info=True)
+            # We don't nullify anything here, maybe the key is valid but listing models failed?
 
-    # Configure OpenAI - always reinitialize when this function is called
-    # This ensures a fresh client when switching from Gemini to OpenAI
+    # Configure OpenAI client
+    # Always reinitialize when this function is called
     if config.OPENAI_API_KEY:
         try:
             # First set to None to force a clean initialization
@@ -96,7 +94,9 @@ def configure_llms():
             if not api_key:
                 logger.error("OpenAI API key is empty or whitespace")
                 openai_client = None
-                return
+                # Need to handle this failure state better - perhaps return False?
+                is_initialized = False # Mark as not initialized if key is bad
+                return # Don't proceed if key is bad
             
             # Create a new client with explicit parameters
             logger.debug(f"Creating new OpenAI client with API key (length: {len(api_key)})")
@@ -107,17 +107,28 @@ def configure_llms():
             )
             
             # Test the client with a minimal API call
-            logger.debug("Testing OpenAI client with a basic API call...")
-            # Don't use the limit parameter which causes errors
-            _ = openai_client.models.list()
+            logger.debug("Testing OpenAI client with models.list()...")
+            _ = openai_client.models.list() # Use list instead of retrieve which needs a model name
             
-            logger.info(f"OpenAI client configured with model: {config.OPENAI_MODEL}")
+            logger.info(f"OpenAI client configured. Available models: {config.OPENAI_MODELS}")
         except Exception as e:
             # Log internal error, avoid UI warning during import
             logger.error(f"Failed to initialize OpenAI client: {e}", exc_info=True)
             openai_client = None
+            # is_initialized = False # Mark as not initialized if setup fails - Handled below
+
+    # Update initialization status based on whether *at least one* client/key is ready
+    # And if *at least one* model list is non-empty for the configured keys
+    gemini_ready = bool(config.GOOGLE_API_KEY and config.GEMINI_MODELS)
+    openai_ready = bool(openai_client and config.OPENAI_MODELS) # Check client and models
     
-    is_initialized = True
+    is_initialized = gemini_ready or openai_ready
+    
+    if not is_initialized:
+         logger.warning("LLM configuration incomplete: No valid API key and corresponding model list found.")
+    else:
+         logger.info(f"LLM configuration status: Gemini Ready={gemini_ready}, OpenAI Ready={openai_ready}")
+
 
 # Do NOT call configure_llms() during module import as it can cause
 # Streamlit errors with set_page_config(). Instead, we'll call this
@@ -307,7 +318,7 @@ def get_formatted_tool_definitions(
 
 # --- Helper Functions --- #
 
-def count_tokens_openai(text: str, model: str = "gpt-3.5-turbo") -> int:
+def count_tokens_openai(text: str, model: str) -> int: # Require model name
     """Count tokens using OpenAI's tiktoken library"""
     if not tiktoken_available:
         # Fallback to approximation if tiktoken isn't available
@@ -326,11 +337,11 @@ def count_tokens_gemini(text: str) -> int:
     # Roughly 4 characters per token is a common approximation
     return len(text) // 4
 
-def calculate_input_tokens(messages: List[Dict], provider: str) -> int:
+def calculate_input_tokens(messages: List[Dict], provider: str, model_name: str) -> int: # Added model_name
     """Calculate total input tokens based on message history and provider."""
     total_tokens = 0
-    model_name = config.OPENAI_MODEL if provider.lower() == "openai" else config.GEMINI_MODEL
-    
+    # model_name = config.OPENAI_MODEL if provider.lower() == "openai" else config.GEMINI_MODEL # Removed
+
     for message in messages:
         content = message.get("content", "")
         if isinstance(content, str):
@@ -355,20 +366,39 @@ def get_gemini_response(
     messages: List[Dict[str, Any]], 
     system_prompt: str,
     tools: List["genai_types.FunctionDeclaration"] | None, # Gemini requires FunctionDeclaration
-    user_request_id: str | None = None # Added context ID
+    model_name: str, # Added: Specific model to use
+    user_request_id: str | None = None, # Added context ID
+    action_id: str | None = None # Added: Specific action ID for this LLM call
 ) -> Dict[str, Any]:
     """Gets a response from the Gemini model, handling potential tool calls."""
-    bound_logger = logger.bind(user_request_id=user_request_id)
-    
-    if not gemini_model: # Check if model was configured
-        bound_logger.error("Gemini model is not configured. Cannot get response.")
-        st.error("Gemini API key not configured or configuration failed.")
-        return {"error": "Gemini not configured"}
+    # Bind both user_request_id and action_id to the logger
+    bound_logger = logger.bind(user_request_id=user_request_id, action_id=action_id)
 
-    # Tracking map of tool_call_ids to function names for accurate association
-    tool_id_to_name_map = {}
+    tool_id_to_name_map = {} # Initialize the map here
 
-    # Gemini uses a specific format for history, especially tool calls/results
+    if not config.GOOGLE_API_KEY: # Check if API key is configured
+        bound_logger.error("Gemini API key not configured. Cannot get response.")
+        # Use st.error in the calling function (app.py) if needed for UI feedback
+        return {"error": "Gemini API key not configured."}
+        
+    if not model_name or model_name not in config.GEMINI_MODELS:
+        bound_logger.error(f"Invalid or missing Gemini model specified: {model_name}. Available: {config.GEMINI_MODELS}")
+        return {"error": f"Invalid Gemini model specified: {model_name}"}
+
+    # --- Instantiate Gemini Model ---
+    try:
+        bound_logger.debug(f"Instantiating Gemini model: {model_name}")
+        model_instance = genai.GenerativeModel(
+            model_name,
+            # system_instruction=system_prompt # Apply system prompt during generation if supported this way, else prepend
+        )
+        bound_logger.info(f"Using Gemini model: {model_name}")
+    except Exception as e:
+        bound_logger.error(f"Failed to instantiate Gemini model {model_name}: {e}", exc_info=True)
+        return {"error": f"Failed to instantiate Gemini model {model_name}: {str(e)}"}
+    # -----------------------------
+
+    # Prepare messages: Prepend system prompt if necessary and convert format
     gemini_history = []
     system_instruction_applied = False
     
@@ -479,7 +509,7 @@ def get_gemini_response(
     try:
         # Configure the model instance with the system prompt for this call
         model_instance = genai.GenerativeModel(
-             config.GEMINI_MODEL, 
+             model_name, 
              system_instruction=system_prompt
         )
         
@@ -509,7 +539,7 @@ def get_gemini_response(
             return safe_tools
 
         request_payload = {
-            "model": config.GEMINI_MODEL,
+            "model": model_name,
             "history": gemini_history, # Log prepared history
             # Use helper function to safely serialize tools for logging
             "tools": _safe_serialize_tools(tools), 
@@ -524,7 +554,7 @@ def get_gemini_response(
         # -----------------------
         
         # Generate content
-        bound_logger.info(f"Sending request to Gemini model: {config.GEMINI_MODEL}")
+        bound_logger.info(f"Sending request to Gemini model: {model_name}") # Use model_name
         
         # Add more debug tracing before the API call
         bound_logger.debug(f"Gemini history structure: {json.dumps([{'role': item.get('role'), 'parts_count': len(item.get('parts', []))} for item in gemini_history], indent=2)}")
@@ -707,7 +737,7 @@ def get_gemini_response(
             bound_logger.warning("No parts found in the Gemini response")
         
         # Calculate token counts
-        token_count_in = calculate_input_tokens(messages, "Gemini")
+        token_count_in = calculate_input_tokens(messages, "Gemini", model_name)
         token_count_out = count_tokens_gemini(response_content if response_content else "") if response_content else 0
         bound_logger.debug(f"Token counts - In: {token_count_in}, Out: {token_count_out}")
 
@@ -730,15 +760,22 @@ def get_openai_response(
     messages: List[Dict[str, Any]], 
     system_prompt: str, 
     tools: List[Dict[str, Any]] | None, # OpenAI uses dict format
-    user_request_id: str | None = None # Added context ID
+    model_name: str, # Added: Specific model to use
+    user_request_id: str | None = None, # Added context ID
+    action_id: str | None = None # Added: Specific action ID for this LLM call
 ) -> Dict[str, Any]:
     """Gets a response from the OpenAI model, handling potential tool calls."""
-    bound_logger = logger.bind(user_request_id=user_request_id)
+    # Bind both user_request_id and action_id to the logger
+    bound_logger = logger.bind(user_request_id=user_request_id, action_id=action_id)
 
     if not openai_client: # Check if client was configured
         bound_logger.error("OpenAI client is not configured. Cannot get response.")
-        st.error("OpenAI API key not configured or configuration failed.")
-        return {"error": "OpenAI not configured"}
+        # UI error handled by calling function
+        return {"error": "OpenAI not configured or configuration failed."}
+        
+    if not model_name or model_name not in config.OPENAI_MODELS:
+        bound_logger.error(f"Invalid or missing OpenAI model specified: {model_name}. Available: {config.OPENAI_MODELS}")
+        return {"error": f"Invalid OpenAI model specified: {model_name}"}
 
     # Prepend system prompt as the first message if not already present
     openai_messages = messages.copy()
@@ -748,7 +785,7 @@ def get_openai_response(
     bound_logger.debug(f"Prepared OpenAI messages with {len(openai_messages)} entries.")
 
     try:
-        bound_logger.info(f"Sending request to OpenAI model: {config.OPENAI_MODEL}")
+        bound_logger.info(f"Sending request to OpenAI model: {model_name}") # Use model_name
         
         # Double-check that client is properly initialized before making API call
         if openai_client is None:
@@ -758,7 +795,7 @@ def get_openai_response(
         
         # --- Log LLM Request ---
         request_payload = {
-            "model": config.OPENAI_MODEL,
+            "model": model_name, # Use model_name
             "messages": openai_messages,
             "tools": tools,
             "tool_choice": "auto" if tools else None,
@@ -776,7 +813,7 @@ def get_openai_response(
             bound_logger.debug("Verifying OpenAI client is working...")
             # Simply check if we can retrieve the model info without errors
             try:
-                _ = openai_client.models.retrieve(config.OPENAI_MODEL)
+                _ = openai_client.models.retrieve(model_name) # Use model_name
                 bound_logger.debug("OpenAI client verification successful.")
             except Exception as model_error:
                 # Try models.list() as a fallback
@@ -793,7 +830,7 @@ def get_openai_response(
         # Now attempt the actual completions API call
         bound_logger.debug(f"Sending messages to OpenAI: {json.dumps(openai_messages, indent=2)}") # Log the exact payload
         response = openai_client.chat.completions.create(
-            model=config.OPENAI_MODEL,
+            model=model_name, # Use model_name
             messages=openai_messages,
             tools=tools if tools else None,
             tool_choice="auto" if tools else None,
@@ -897,7 +934,7 @@ def get_openai_response(
             ]
         
         # Calculate token counts - use OpenAI's reported usage when available
-        token_count_in = getattr(response.usage, 'prompt_tokens', 0) if hasattr(response, 'usage') else calculate_input_tokens(messages, "OpenAI")
+        token_count_in = getattr(response.usage, 'prompt_tokens', 0) if hasattr(response, 'usage') else calculate_input_tokens(messages, "OpenAI", model_name)
         token_count_out = getattr(response.usage, 'completion_tokens', 0) if hasattr(response, 'usage') else 0
 
         bound_logger.debug(f"Token counts - In: {token_count_in}, Out: {token_count_out}")

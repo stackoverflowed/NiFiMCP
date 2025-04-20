@@ -16,7 +16,7 @@ try:
     # Adjust import path based on project structure if necessary
     # If server.py is run directly from project root, this might need adjustment
     # Assuming server is run from project root or config is in PYTHONPATH
-    from config.logging_setup import setup_logging
+    from config.logging_setup import setup_logging, request_context
     setup_logging()
 except ImportError as e:
     logger.warning(f"Logging setup failed: {e}. Check config/logging_setup.py and Python path. Using basic stderr logger.")
@@ -33,6 +33,9 @@ from nifi_mcp_server.nifi_client import NiFiAuthenticationError # Keep Error imp
 
 # Import core components AFTER logging is setup, but BEFORE tools
 from .core import mcp, nifi_api_client
+
+# Import the context var from logging_setup
+from config.logging_setup import request_context # Adjust import path if needed
 
 from mcp.shared.exceptions import McpError # Base error
 from mcp.server.fastmcp.exceptions import ToolError # Tool-specific errors
@@ -223,17 +226,29 @@ class ToolExecutionPayload(BaseModel):
 
 # Middleware for binding context IDs to logger
 @app.middleware("http")
-async def add_context_to_logger(request, call_next):
+async def add_context_to_logger(request: Request, call_next):
     user_request_id = request.headers.get("X-Request-ID", "-")
     action_id = request.headers.get("X-Action-ID", "-")
     
-    if user_request_id != "-" or action_id != "-":
-        logger.debug(f"Received request with context IDs: user_request_id={user_request_id}, action_id={action_id}")
-    
+    # Store IDs in request.state (as before, might be useful elsewhere)
     request.state.user_request_id = user_request_id
     request.state.action_id = action_id
+
+    # --- Set ContextVar for Loguru Patcher --- 
+    context_data = {"user_request_id": user_request_id, "action_id": action_id}
+    token = request_context.set(context_data) # Set context for this request
+    # -----------------------------------------
+
+    if user_request_id != "-" or action_id != "-":
+        # Use logger directly here, it will be patched
+        logger.debug(f"Received request with context IDs: user_request_id={user_request_id}, action_id={action_id}")
     
-    response = await call_next(request)
+    try:
+        response = await call_next(request)
+    finally:
+        # --- Reset ContextVar ---
+        request_context.reset(token) # Reset context after request is handled
+        # ------------------------
     return response
 
 @app.post("/tools/{tool_name}")
