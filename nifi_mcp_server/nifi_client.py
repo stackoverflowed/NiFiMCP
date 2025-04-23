@@ -1197,6 +1197,36 @@ class NiFiClient:
             logger.error(f"An unexpected error occurred getting processor types: {e}", exc_info=True)
             raise ConnectionError(f"An unexpected error occurred getting processor types: {e}") from e
 
+    async def search_flow(self, query: str) -> Dict:
+        """Performs a global search across the NiFi flow using the provided query string."""
+        if not self._token:
+            raise NiFiAuthenticationError("Client is not authenticated. Call authenticate() first.")
+
+        client = await self._get_client()
+        endpoint = "/flow/search-results"
+        params = {"q": query}
+
+        try:
+            logger.info(f"Performing global flow search with query '{query}' using {self.base_url}{endpoint}")
+            response = await client.get(endpoint, params=params)
+            response.raise_for_status()
+            search_results = response.json()
+            logger.info(f"Successfully performed global flow search for query '{query}'.")
+            # The response structure usually includes a top-level key like 'searchResultsDTO'
+            # Example: { "searchResultsDTO": { "processorResults": [...], ... } }
+            return search_results
+
+        except httpx.HTTPStatusError as e:
+            logger.error(f"Failed to perform flow search for query '{query}': {e.response.status_code} - {e.response.text}")
+            # Don't raise ValueError for 404, search simply might not find anything or endpoint might differ
+            raise ConnectionError(f"Failed to perform flow search: {e.response.status_code}, {e.response.text}") from e
+        except (httpx.RequestError, ValueError) as e: # Include ValueError for potential JSON parsing issues
+            logger.error(f"Error performing flow search for query '{query}': {e}")
+            raise ConnectionError(f"Error performing flow search: {e}") from e
+        except Exception as e:
+            logger.error(f"An unexpected error occurred performing flow search for query '{query}': {e}", exc_info=True)
+            raise ConnectionError(f"An unexpected error occurred performing flow search: {e}") from e
+
     def __repr__(self):
         return f"<{type(self).__name__} base_url={self.base_url} authenticated={self.is_authenticated}>"
 

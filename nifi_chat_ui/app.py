@@ -191,7 +191,7 @@ with st.sidebar:
          st.warning("No MCP tools available or failed to retrieve.")
          
     # --- History Clear --- 
-    if st.sidebar.button("Clear Chat History"):
+    def clear_chat_callback():
         st.session_state.messages = []
         # Clear objective and flags as well
         st.session_state.current_objective = ""
@@ -199,8 +199,14 @@ with st.sidebar:
         # st.session_state.history_cleared_for_next_llm_call = False # Removed
         # Reset phase to default
         st.session_state.selected_phase = "All" # Reset phase on clear
-        logger.info("Chat history and objective cleared by user.") 
-        st.rerun()
+        logger.info("Chat history, objective, and phase cleared by user.")
+        # No st.rerun() needed here, Streamlit handles it after callback
+
+    if st.sidebar.button("Clear Chat History", on_click=clear_chat_callback):
+        # Logic moved to the callback function
+        pass
+        # logger.info("Chat history and objective cleared by user.") # Logging moved to callback
+        # st.rerun() # Not needed when using on_click
 
 # --- Main Chat Interface --- 
 st.title("NiFi Chat UI")

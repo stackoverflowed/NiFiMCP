@@ -22,7 +22,6 @@ from nifi_mcp_server.flow_documenter import (
     analyze_expressions,
     build_graph_structure,
     format_connection,
-    find_source_to_sink_paths,
     find_decision_branches
 )
 
@@ -89,7 +88,9 @@ async def _list_components_recursively(
     object_type: Literal["processors", "connections", "ports"],
     pg_id: str,
     nifi_client: NiFiClient,
-    local_logger
+    local_logger,
+    depth: int = 0,
+    max_depth: int = 3
 ) -> List[Dict]:
     """Recursively lists processors, connections, or ports within a process group hierarchy."""
     all_results = [] 
@@ -130,6 +131,11 @@ async def _list_components_recursively(
              "error": f"Unexpected error retrieving {object_type}: {e}"
         })
 
+    # Check if max depth is reached before fetching child groups
+    if depth >= max_depth:
+        local_logger.debug(f"Max recursion depth ({max_depth}) reached for PG {pg_id}. Stopping recursion.")
+        return all_results
+
     try:
         child_groups = await nifi_client.get_process_groups(pg_id)
         if child_groups:
@@ -140,7 +146,9 @@ async def _list_components_recursively(
                         object_type=object_type,
                         pg_id=child_id,
                         nifi_client=nifi_client,
-                        local_logger=local_logger
+                        local_logger=local_logger,
+                        depth=depth + 1,  # Increment depth
+                        max_depth=max_depth # Pass max_depth down
                     )
                     all_results.extend(recursive_results)
                     
@@ -245,7 +253,7 @@ async def list_nifi_objects(
     search_scope : Literal["current_group"], optional
         Determines the scope of the listing. Defaults to 'current_group'.
         - 'current_group': Lists objects only within the specified `process_group_id`. For 'process_groups', shows only immediate children with counts.
-        - 'recursive': NOT IMPLEMENTED YET. For 'processors', 'connections', or 'ports', lists objects in the specified group and all nested subgroups. For 'process_groups', provides the full nested hierarchy including children of children, with counts at each level. (default is "current_group")
+        - 'recursive': For 'processors', 'connections', or 'ports', lists objects in the specified group and nested subgroups (up to 2 levels deep). For 'process_groups', provides the nested hierarchy including children of children, with counts at each level.
 
     Returns
     -------
@@ -280,8 +288,9 @@ async def list_nifi_objects(
     try:
         if object_type == "processors":
             if search_scope == "recursive":
-                local_logger.info(f"Performing recursive search for {object_type} starting from {target_pg_id}")
-                return await _list_components_recursively(object_type, target_pg_id, nifi_api_client, local_logger)
+                local_logger.info(f"Performing recursive search for {object_type} starting from {target_pg_id} (max depth: 3)")
+                # Pass initial depth and max_depth
+                return await _list_components_recursively(object_type, target_pg_id, nifi_api_client, local_logger, depth=0, max_depth=3)
             else:
                 nifi_req = {"operation": "list_processors", "process_group_id": target_pg_id}
                 local_logger.bind(interface="nifi", direction="request", data=nifi_req).debug("Calling NiFi API")
@@ -292,8 +301,9 @@ async def list_nifi_objects(
 
         elif object_type == "connections":
             if search_scope == "recursive":
-                local_logger.info(f"Performing recursive search for {object_type} starting from {target_pg_id}")
-                return await _list_components_recursively(object_type, target_pg_id, nifi_api_client, local_logger)
+                local_logger.info(f"Performing recursive search for {object_type} starting from {target_pg_id} (max depth: 3)")
+                 # Pass initial depth and max_depth
+                return await _list_components_recursively(object_type, target_pg_id, nifi_api_client, local_logger, depth=0, max_depth=3)
             else:
                 nifi_req = {"operation": "list_connections", "process_group_id": target_pg_id}
                 local_logger.bind(interface="nifi", direction="request", data=nifi_req).debug("Calling NiFi API")
@@ -304,8 +314,9 @@ async def list_nifi_objects(
 
         elif object_type == "ports":
             if search_scope == "recursive":
-                local_logger.info(f"Performing recursive search for {object_type} starting from {target_pg_id}")
-                return await _list_components_recursively(object_type, target_pg_id, nifi_api_client, local_logger)
+                local_logger.info(f"Performing recursive search for {object_type} starting from {target_pg_id} (max depth: 3)")
+                 # Pass initial depth and max_depth
+                return await _list_components_recursively(object_type, target_pg_id, nifi_api_client, local_logger, depth=0, max_depth=3)
             else:
                 nifi_req_in = {"operation": "get_input_ports", "process_group_id": target_pg_id}
                 local_logger.bind(interface="nifi", direction="request", data=nifi_req_in).debug("Calling NiFi API")
@@ -472,6 +483,14 @@ async def document_nifi_flow(
     local_logger.info(f"Starting flow documentation for process group {target_pg_id}.")
     
     try:
+        # Fetch Process Group details to get variables later
+        nifi_req_pg = {"operation": "get_process_group_details", "process_group_id": target_pg_id}
+        local_logger.bind(interface="nifi", direction="request", data=nifi_req_pg).debug("Calling NiFi API")
+        pg_details = await nifi_api_client.get_process_group_details(target_pg_id, user_request_id=user_request_id, action_id=action_id)
+        nifi_resp_pg = {"pg_details_retrieved": bool(pg_details)}
+        local_logger.bind(interface="nifi", direction="response", data=nifi_resp_pg).debug("Received from NiFi API")
+        pg_variables = pg_details.get("component", {}).get("variables", None)
+
         nifi_req_procs = {"operation": "list_processors", "process_group_id": target_pg_id}
         local_logger.bind(interface="nifi", direction="request", data=nifi_req_procs).debug("Calling NiFi API")
         processors = await nifi_api_client.list_processors(target_pg_id, user_request_id=user_request_id, action_id=action_id)
@@ -537,37 +556,63 @@ async def document_nifi_flow(
                 "type": processor["component"]["type"],
                 "state": processor["component"]["state"],
                 "position": processor["position"],
-                "relationships": [r["name"] for r in processor["component"].get("relationships", [])],
+                "relationships": processor["component"].get("relationships", []),
                 "validation_status": processor["component"].get("validationStatus", "UNKNOWN")
             }
             
             if include_properties:
                 property_info = extract_important_properties(processor)
-                proc_data["properties"] = property_info["key_properties"]
-                proc_data["dynamic_properties"] = property_info["dynamic_properties"]
-                proc_data["expressions"] = analyze_expressions(property_info["all_properties"])
-            
+                proc_data["properties"] = property_info["all_properties"]
+                proc_data["expressions"] = property_info["expressions"]
+
             if include_descriptions:
                 proc_data["description"] = processor["component"].get("config", {}).get("comments", "")
             
             enriched_processors.append(proc_data)
         
-        processor_map = {p["id"]: p for p in filtered_processors}
-        graph = build_graph_structure(filtered_processors, filtered_connections)
-        paths = find_source_to_sink_paths(processor_map, graph)
-        decision_points = find_decision_branches(processor_map, graph)
-        formatted_connections = [format_connection(c, processor_map) for c in filtered_connections]
+        # Build graph structure for decision point analysis and direct graph output
+        processor_map_filtered = {p["id"]: p for p in filtered_processors} # Use filtered map
+        graph_analysis_data = build_graph_structure(filtered_processors, filtered_connections)
+        decision_points = find_decision_branches(processor_map_filtered, graph_analysis_data) # Keep decision points
+        formatted_connections = [format_connection(c, processor_map_filtered) for c in filtered_connections] # Use filtered map
+
+        # Prepare nodes for the graph output (using enriched data)
+        graph_nodes = [
+            {
+                "id": p["id"], 
+                "name": p["name"], 
+                "type": p["type"] # Using the simplified type from enriched_processors
+            } 
+            for p in enriched_processors
+        ]
+
+        # Prepare edges for the graph output (using formatted connection data)
+        graph_edges = [
+            {
+                "source": conn["source_id"],
+                "target": conn["destination_id"],
+                "relationship": conn["relationship"]
+            }
+            for conn in formatted_connections
+        ]
         
         result = {
             "processors": enriched_processors,
-            "connections": formatted_connections,
-            "graph_structure": {
-                "outgoing_count": {p_id: len(conns) for p_id, conns in graph["outgoing"].items()},
-                "incoming_count": {p_id: len(conns) for p_id, conns in graph["incoming"].items()}
+            "connections": formatted_connections, # Keep formatted connections for potential detailed view
+            # Removed graph_structure and common_paths
+            # "graph_structure": { ... },
+            # "common_paths": paths,
+            "graph": { # Add the new graph structure
+                "nodes": graph_nodes,
+                "edges": graph_edges
             },
-            "common_paths": paths,
-            "decision_points": decision_points
+            "decision_points": decision_points # Keep decision points
         }
+        
+        # Add Process Group Variables if they exist
+        if pg_variables:
+            result["process_group_variables"] = pg_variables
+            local_logger.debug(f"Added {len(pg_variables)} variables from process group {target_pg_id} to results.")
         
         if include_properties:
             parameters = await nifi_api_client.get_parameter_context(target_pg_id, user_request_id=user_request_id, action_id=action_id)
@@ -583,3 +628,134 @@ async def document_nifi_flow(
     except Exception as e:
         local_logger.error(f"Unexpected error documenting flow: {e}", exc_info=True)
         raise ToolError(f"An unexpected error occurred while documenting the flow: {e}")
+
+
+@mcp.tool()
+@tool_phases(["Review"])
+async def search_nifi_flow(
+    query: str,
+    filter_object_type: Optional[Literal["processor", "connection", "port", "process_group"]] = None,
+    filter_process_group_id: Optional[str] = None
+) -> Dict[str, List[Dict]]:
+    """
+    Searches the entire NiFi flow canvas for components matching a query string.
+
+    This tool performs a global search across all accessible components (processors, connections, ports, process groups, etc.) 
+    based on the provided query string. The search is case-insensitive and matches against names, IDs, comments, 
+    property values, etc.
+
+    Optionally, the results can be filtered client-side by object type and/or the parent process group ID 
+    after the global search is performed.
+
+    Args:
+        query: The search term to look for across the NiFi canvas.
+        filter_object_type: Optional. If provided, only return results of this type ('processor', 'connection', 'port', 'process_group').
+        filter_process_group_id: Optional. If provided, only return results located directly within this process group ID.
+
+    Returns:
+        A dictionary containing lists of matching components, keyed by type ('processors', 'connections', 'ports', 'process_groups'). 
+        Each component is represented by a dictionary with its 'id', 'name', and 'group_id'. For ports, 'type' ('input'/'output') is also included.
+        Raises ToolError if the search fails or an API error occurs.
+    """
+    local_logger = logger.bind(
+        tool_name="search_nifi_flow", 
+        query=query, 
+        filter_type=filter_object_type, 
+        filter_group=filter_process_group_id
+    )
+    await ensure_authenticated(nifi_api_client, local_logger)
+
+    local_logger.info(f"Executing global NiFi flow search for query: '{query}'")
+
+    try:
+        nifi_req = {"operation": "search_flow", "query": query}
+        local_logger.bind(interface="nifi", direction="request", data=nifi_req).debug("Calling NiFi API for search")
+        
+        # TODO: Implement search_flow method in nifi_client.py
+        # search_results_dto = await nifi_api_client.search_flow(query) 
+        search_results_dto = await nifi_api_client.search_flow(query) # Assuming this method exists/will exist
+
+        nifi_resp = {"has_results": bool(search_results_dto)} # Basic check
+        local_logger.bind(interface="nifi", direction="response", data=nifi_resp).debug("Received search results from NiFi API")
+
+        # Process and filter results
+        filtered_results = {
+            "processors": [],
+            "connections": [],
+            "ports": [],
+            "process_groups": []
+        }
+
+        results_data = search_results_dto.get("searchResultsDTO", {}) # Structure based on typical NiFi response
+
+        # --- Process Processors ---
+        if not filter_object_type or filter_object_type == "processor":
+            for proc in results_data.get("processorResults", []):
+                 if not filter_process_group_id or proc.get("groupId") == filter_process_group_id:
+                     filtered_results["processors"].append({
+                         "id": proc.get("id"),
+                         "name": proc.get("name"),
+                         "group_id": proc.get("groupId")
+                     })
+
+        # --- Process Connections ---
+        if not filter_object_type or filter_object_type == "connection":
+            for conn in results_data.get("connectionResults", []):
+                 if not filter_process_group_id or conn.get("groupId") == filter_process_group_id:
+                      # Connection name might be less useful, often shows source/dest relationship names
+                      conn_name = conn.get("name") or f"Connection from {conn.get('sourceName')} to {conn.get('destinationName')}"
+                      filtered_results["connections"].append({
+                          "id": conn.get("id"),
+                          "name": conn_name, 
+                          "group_id": conn.get("groupId")
+                      })
+
+        # --- Process Ports ---
+        if not filter_object_type or filter_object_type == "port":
+            # Input Ports
+            for port in results_data.get("inputPortResults", []):
+                 if not filter_process_group_id or port.get("groupId") == filter_process_group_id:
+                     filtered_results["ports"].append({
+                         "id": port.get("id"),
+                         "name": port.get("name"),
+                         "group_id": port.get("groupId"),
+                         "type": "input" 
+                     })
+            # Output Ports
+            for port in results_data.get("outputPortResults", []):
+                 if not filter_process_group_id or port.get("groupId") == filter_process_group_id:
+                     filtered_results["ports"].append({
+                         "id": port.get("id"),
+                         "name": port.get("name"),
+                         "group_id": port.get("groupId"),
+                         "type": "output"
+                     })
+
+        # --- Process Process Groups ---
+        if not filter_object_type or filter_object_type == "process_group":
+            for pg in results_data.get("processGroupResults", []):
+                 # Filter out the root group if its ID is returned and we are filtering by a specific group
+                 is_root = pg.get("id") == pg.get("parentGroupId") # Simple check, might need refinement based on API
+                 if not filter_process_group_id or (pg.get("groupId") == filter_process_group_id and not is_root):
+                     filtered_results["process_groups"].append({
+                         "id": pg.get("id"),
+                         "name": pg.get("name"),
+                          # Parent group ID might be more relevant than the group ID itself here? 
+                          # NiFi search result 'groupId' for a PG might be its *own* ID. Let's use parentGroupId if available.
+                         "group_id": pg.get("parentGroupId") or pg.get("groupId") 
+                     })
+        
+        # Remove empty lists if no filter was applied, or if filter resulted in no matches for a type
+        final_results = {k: v for k, v in filtered_results.items() if v}
+
+        local_logger.info(f"Search complete. Found {sum(len(v) for v in final_results.values())} matching components after filtering.")
+        return final_results
+
+    except (NiFiAuthenticationError, ConnectionError, ValueError) as e:
+        local_logger.error(f"API error during NiFi search: {e}", exc_info=True)
+        local_logger.bind(interface="nifi", direction="response", data={"error": str(e)}).debug("Received error from NiFi API")
+        raise ToolError(f"Failed to perform NiFi search: {e}")
+    except Exception as e:
+        local_logger.error(f"Unexpected error during NiFi search: {e}", exc_info=True)
+        local_logger.bind(interface="nifi", direction="response", data={"error": str(e)}).debug("Received unexpected error from NiFi API")
+        raise ToolError(f"An unexpected error occurred during NiFi search: {e}")
