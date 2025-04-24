@@ -2,9 +2,36 @@ import streamlit as st
 import json # Import json for formatting tool results
 import uuid # Added for context IDs
 from loguru import logger # Import logger directly
+from st_copy_to_clipboard import st_copy_to_clipboard # Import the new component
 
 # Set page config MUST be the first Streamlit call
 st.set_page_config(page_title="NiFi Chat UI", layout="wide")
+
+# --- Helper Function for Formatting Conversation --- 
+def format_conversation_for_copy(objective, messages):
+    """Formats the objective and chat messages into a single string for copying."""
+    lines = []
+    if objective and objective.strip():
+        lines.append("## Overall Objective:")
+        lines.append(objective.strip())
+        lines.append("\n---")
+
+    lines.append("## Conversation History:")
+    for msg in messages:
+        role = msg.get("role")
+        content = msg.get("content")
+        
+        if role == "user" and content:
+            lines.append(f"\n**User:**\n{content}")
+        elif role == "assistant" and content:
+            lines.append(f"\n**Assistant:**\n{content}")
+        elif role == "assistant" and msg.get("tool_calls"):
+            tool_names = [tc.get('function', {}).get('name', 'unknown') for tc in msg.get("tool_calls", [])]
+            lines.append(f"\n**Assistant:** ⚙️ Calling tool(s): `{', '.join(tool_names)}`...")
+        # Add other roles or filter as needed
+        
+    return "\n".join(lines)
+# ---------------------------------------------
 
 # --- Setup Logging --- 
 try:
@@ -208,6 +235,20 @@ with st.sidebar:
         # logger.info("Chat history and objective cleared by user.") # Logging moved to callback
         # st.rerun() # Not needed when using on_click
 
+    # --- Copy Conversation Button --- 
+    st.markdown("---") # Separator
+    if st.sidebar.button("Prepare Full Conversation For Copy", key="copy_conv_btn"):
+        conversation_text = format_conversation_for_copy(
+            st.session_state.get("current_objective", ""),
+            st.session_state.get("messages", [])
+        )
+        if conversation_text:
+            st_copy_to_clipboard(conversation_text, key="copy_full_conversation_clipboard")
+            st.sidebar.success("Click icon to copy full conversation to clipboard!")
+        else:
+            st.sidebar.warning("Nothing to copy.")
+    # -------------------------------
+
 # --- Main Chat Interface --- 
 st.title("NiFi Chat UI")
 
@@ -240,6 +281,13 @@ for message in st.session_state.messages:
                 st.markdown("_(Tool call with no details)_")
         elif "content" in message:
             st.markdown(message["content"])
+            # Replace st.code with st_copy_to_clipboard
+            # Add a unique key based on message content/role/potentially ID if available
+            # For simplicity now, using content hash might work, but let's try a simple key first
+            # A better key might involve an action_id or index if reliably available
+            # Using content as part of key for now, might need adjustment
+            content_key = hash(message['content']) # Simple hash for uniqueness
+            st_copy_to_clipboard(message["content"], key=f"hist_copy_{content_key}")
         elif message["role"] == "assistant" and "tool_calls" in message and "content" not in message:
             tool_names = [tc.get('function', {}).get('name', 'unknown') for tc in message.get("tool_calls", [])]
             if tool_names:
@@ -399,6 +447,10 @@ def run_execution_loop(provider: str, model_name: str, base_sys_prompt: str, use
                      st.markdown("_(Tool call with no details)_") # Should be rare
             elif llm_content:
                 st.markdown(llm_content)
+                # Replace st.code with st_copy_to_clipboard here as well
+                # Use llm_action_id if available, otherwise generate a unique one for the key
+                copy_key = f"loop_copy_{llm_action_id if 'llm_action_id' in locals() and llm_action_id else uuid.uuid4()}"
+                st_copy_to_clipboard(llm_content, key=copy_key)
             else:
                 st.markdown("_(Assistant provided no content or tool calls)_") # Should be rare
 

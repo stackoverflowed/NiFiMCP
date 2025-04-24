@@ -631,7 +631,7 @@ async def document_nifi_flow(
 
 
 @mcp.tool()
-@tool_phases(["Review"])
+@tool_phases(["Review", "Build", "Modify", "Operate"])
 async def search_nifi_flow(
     query: str,
     filter_object_type: Optional[Literal["processor", "connection", "port", "process_group"]] = None,
