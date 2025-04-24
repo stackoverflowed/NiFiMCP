@@ -16,7 +16,7 @@ try:
     # If server.py is run directly from project root, this might need adjustment
     # Assuming server is run from project root or config is in PYTHONPATH
     from config.logging_setup import setup_logging, request_context
-    setup_logging()
+    setup_logging(context='server')
 except ImportError as e:
     logger.warning(f"Logging setup failed: {e}. Check config/logging_setup.py and Python path. Using basic stderr logger.")
     # Minimal fallback if setup fails

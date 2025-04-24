@@ -38,7 +38,7 @@ try:
     # Use session state to ensure logging is only set up once per session, not on every script re-run
     if "logging_initialized" not in st.session_state:
         from config.logging_setup import setup_logging
-        setup_logging() 
+        setup_logging(context='client')
         st.session_state.logging_initialized = True
         logger.info("Logging initialized for new session")
     else:
