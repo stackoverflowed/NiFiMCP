@@ -50,7 +50,7 @@ except ImportError:
 # Restore imports
 from chat_manager import get_gemini_response, get_openai_response, get_formatted_tool_definitions
 from chat_manager import configure_llms, is_initialized
-from mcp_handler import get_available_tools, execute_mcp_tool
+from mcp_handler import get_available_tools, execute_mcp_tool, get_nifi_servers
 # Import config from the new location
 try:
     from config import settings as config # Updated import
@@ -82,6 +82,20 @@ if "current_objective" not in st.session_state:
 #     st.session_state.run_recovery_loop = False
 # if "history_cleared_for_next_llm_call" not in st.session_state:
 #     st.session_state.history_cleared_for_next_llm_call = False
+
+# --- Fetch NiFi Servers (once per session) ---
+if "nifi_servers" not in st.session_state:
+    st.session_state.nifi_servers = get_nifi_servers()
+    if not st.session_state.nifi_servers:
+        logger.warning("Failed to retrieve NiFi server list from backend, or no servers configured.")
+    else:
+        logger.info(f"Retrieved {len(st.session_state.nifi_servers)} NiFi server configurations.")
+
+if "selected_nifi_server_id" not in st.session_state:
+    # Default to the first server's ID if available, otherwise None
+    st.session_state.selected_nifi_server_id = st.session_state.nifi_servers[0]["id"] if st.session_state.nifi_servers else None
+    logger.info(f"Initial NiFi server selection set to: {st.session_state.selected_nifi_server_id}")
+# ---------------------------------------------
 
 # --- Load System Prompt --- 
 def load_system_prompt():
@@ -163,6 +177,42 @@ with st.sidebar:
              # Handle case where selection somehow becomes None (shouldn't happen with selectbox)
              st.error("No model selected.")
 
+    # --- NiFi Server Selection --- #
+    st.markdown("---") # Add separator
+    nifi_servers = st.session_state.get("nifi_servers", [])
+    if nifi_servers:
+        server_options = {server["id"]: server["name"] for server in nifi_servers}
+        
+        # Function to update the selected server ID in session state
+        def on_server_change():
+            selected_id = st.session_state.nifi_server_selector # Get value from widget's key
+            if st.session_state.selected_nifi_server_id != selected_id:
+                st.session_state.selected_nifi_server_id = selected_id
+                logger.info(f"User selected NiFi Server: ID={selected_id}, Name={server_options.get(selected_id, 'Unknown')}")
+                # Optionally trigger a rerun or other actions if needed upon change
+                # st.rerun() 
+        
+        # Determine the index of the currently selected server for the selectbox default
+        current_selected_id = st.session_state.get("selected_nifi_server_id")
+        server_ids = list(server_options.keys())
+        try:
+            default_server_index = server_ids.index(current_selected_id) if current_selected_id in server_ids else 0
+        except ValueError:
+            default_server_index = 0 # Default to first if current selection is invalid
+
+        st.selectbox(
+            "Target NiFi Server:",
+            options=server_ids, # Use IDs as the actual option values
+            format_func=lambda server_id: server_options.get(server_id, server_id), # Show names in dropdown
+            key="nifi_server_selector", # Use a specific key for the widget itself
+            index=default_server_index,
+            on_change=on_server_change,
+            help="Select the NiFi instance to interact with."
+        )
+    else:
+        st.warning("No NiFi servers configured or reachable on the backend.")
+    # ----------------------------- #
+
     # --- Phase Selection --- 
     st.markdown("---") # Add separator
     phase_options = ["All", "Review", "Build", "Modify", "Operate"]
@@ -182,7 +232,11 @@ with st.sidebar:
     st.subheader("Available MCP Tools")
     # Fetch tools based on the *current* value of the selectbox for sidebar display
     current_sidebar_phase = st.session_state.get("selected_phase", "All") # Read current value via key
-    raw_tools_list = get_available_tools(phase=current_sidebar_phase)
+    current_nifi_server_id_for_sidebar = st.session_state.get("selected_nifi_server_id") # Get selected server ID
+    raw_tools_list = get_available_tools(
+        phase=current_sidebar_phase, 
+        selected_nifi_server_id=current_nifi_server_id_for_sidebar # Pass server ID
+    )
     
     if raw_tools_list:
         for tool_data in raw_tools_list: 
@@ -351,9 +405,23 @@ def run_execution_loop(provider: str, model_name: str, base_sys_prompt: str, use
         # Get the selected phase
         current_phase = st.session_state.get("selected_phase", "All")
         
-        # Fetch the potentially filtered tools based on the selected phase
-        current_loop_logger.debug(f"Fetching tools for phase: {current_phase}")
-        filtered_raw_tools_list = get_available_tools(phase=current_phase, user_request_id=user_req_id)
+        # Get the selected NiFi server ID
+        current_nifi_server_id = st.session_state.get("selected_nifi_server_id")
+        if not current_nifi_server_id:
+            # This should ideally not happen if a server is selected, but handle it defensively
+            st.error("No NiFi server selected. Please select a server from the sidebar.")
+            current_loop_logger.error("Aborting loop: No NiFi server ID found in session state.")
+            break # Stop the loop if no server is selected
+            
+        current_loop_logger = current_loop_logger.bind(nifi_server_id=current_nifi_server_id) # Bind for loop logging
+        
+        # Fetch the potentially filtered tools based on the selected phase AND server
+        current_loop_logger.debug(f"Fetching tools for phase: {current_phase}, Server ID: {current_nifi_server_id}")
+        filtered_raw_tools_list = get_available_tools(
+            phase=current_phase, 
+            user_request_id=user_req_id, 
+            selected_nifi_server_id=current_nifi_server_id # Pass server ID
+        )
         
         # Format the filtered tools for the current provider
         formatted_tools = None
@@ -504,9 +572,11 @@ def run_execution_loop(provider: str, model_name: str, base_sys_prompt: str, use
                     
                     # Execute the tool using mcp_handler
                     # Pass user_request_id and the llm_action_id from this loop iteration
+                    # Pass the selected NiFi server ID
                     tool_result = execute_mcp_tool(
                         tool_name=function_name, 
                         params=arguments,
+                        selected_nifi_server_id=current_nifi_server_id, # Pass selected server ID
                         user_request_id=user_req_id, 
                         action_id=llm_action_id # Use llm_action_id here
                     )

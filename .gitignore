@@ -7,3 +7,4 @@ logs/
 build/
 nifimcp.egg-info/
 nifi_chat_ui/system_prompt copy.md
+config.yaml

@@ -2,13 +2,13 @@ import asyncio
 from typing import List, Dict, Optional, Any, Union, Literal
 from loguru import logger as _logger # Use _logger to avoid potential conflict
 
-# Import mcp and nifi_api_client from the new core module
-from ..core import mcp, nifi_api_client
+# Import mcp from the new core module
+from ..core import mcp # Removed nifi_api_client
 # REMOVED from ..server import mcp, nifi_api_client
 
-# Import NiFi types/exceptions needed by ensure_authenticated
-from nifi_mcp_server.nifi_client import NiFiClient, NiFiAuthenticationError
-from mcp.server.fastmcp.exceptions import ToolError
+# Removed imports for NiFi types/exceptions previously needed by ensure_authenticated
+# from nifi_mcp_server.nifi_client import NiFiClient, NiFiAuthenticationError
+# from mcp.server.fastmcp.exceptions import ToolError
 
 # --- Phase Tagging Decorator --- 
 PHASE_TAGS_ATTR = "_tool_phases"
@@ -26,28 +26,29 @@ def tool_phases(phases: List[str]):
     return decorator
 # -----------------------------
 
+# Removed ensure_authenticated function
 # --- Helper Function for Authentication --- 
-
-async def ensure_authenticated(nifi_api_client: NiFiClient, logger): # Accept client and logger
-    """Helper to ensure the NiFi client is authenticated before tool use."""
-    if nifi_api_client is None:
-        raise ToolError("NiFi Client is not configured properly (check NIFI_API_URL).")
-    if not nifi_api_client.is_authenticated:
-        logger.info("NiFi client not authenticated. Attempting authentication...")
-        try:
-            await nifi_api_client.authenticate()
-            logger.info("Authentication successful via MCP tool request.")
-        except NiFiAuthenticationError as e:
-            logger.error(f"Authentication failed during tool execution: {e}")
-            # Raise ToolError, but indicate user action needed in the message
-            raise ToolError(
-                f"NiFi authentication failed ({e}). Please ensure NIFI_USERNAME and NIFI_PASSWORD "
-                "are correctly set in the server's environment/.env file."
-            ) from e
-        except Exception as e:
-            logger.error(f"Unexpected error during authentication: {e}", exc_info=True)
-            raise ToolError(f"An unexpected error occurred during NiFi authentication: {e}")
-    pass # Add pass to avoid syntax error if body is empty
+# 
+# async def ensure_authenticated(nifi_api_client: NiFiClient, logger): # Accept client and logger
+#     """Helper to ensure the NiFi client is authenticated before tool use."""
+#     if nifi_api_client is None:
+#         raise ToolError("NiFi Client is not configured properly (check NIFI_API_URL).")
+#     if not nifi_api_client.is_authenticated:
+#         logger.info("NiFi client not authenticated. Attempting authentication...")
+#         try:
+#             await nifi_api_client.authenticate()
+#             logger.info("Authentication successful via MCP tool request.")
+#         except NiFiAuthenticationError as e:
+#             logger.error(f"Authentication failed during tool execution: {e}")
+#             # Raise ToolError, but indicate user action needed in the message
+#             raise ToolError(
+#                 f"NiFi authentication failed ({e}). Please ensure NIFI_USERNAME and NIFI_PASSWORD "
+#                 "are correctly set in the server's environment/.env file."
+#             ) from e
+#         except Exception as e:
+#             logger.error(f"Unexpected error during authentication: {e}", exc_info=True)
+#             raise ToolError(f"An unexpected error occurred during NiFi authentication: {e}")
+#     pass # Add pass to avoid syntax error if body is empty
 
 # --- Formatting/Filtering Helpers --- 
 

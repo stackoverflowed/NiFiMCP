@@ -19,21 +19,61 @@ API_BASE_URL = "http://localhost:8000"
 # (Imports like ClientSession, stdio_client, websocket_client, McpError, ToolError removed)
 # (Helpers like get_server_params, run_async_in_thread removed)
 
+# --- New Function: Get NiFi Server List --- #
+def get_nifi_servers() -> List[Dict[str, str]]:
+    """Fetches the list of configured NiFi servers (ID and Name) from the API."""
+    url = f"{API_BASE_URL}/config/nifi-servers"
+    bound_logger = logger # Use base logger for this config call for now
+    bound_logger.info(f"Fetching configured NiFi servers from: {url}")
+    try:
+        response = requests.get(url, timeout=15)
+        response.raise_for_status()
+        servers = response.json()
+        if isinstance(servers, list):
+            # Validate basic structure
+            valid_servers = [
+                s for s in servers 
+                if isinstance(s, dict) and "id" in s and "name" in s
+            ]
+            bound_logger.info(f"Successfully retrieved {len(valid_servers)} NiFi server configurations.")
+            return valid_servers
+        else:
+            bound_logger.error(f"API Error: Unexpected format received for server list (expected list, got {type(servers)}). URL: {url}")
+            return []
+    except requests.exceptions.HTTPError as e:
+        error_detail = "Unknown API error"
+        try:
+            error_detail = e.response.json().get("detail", e.response.text)
+        except json.JSONDecodeError:
+            error_detail = e.response.text
+        bound_logger.error(f"API Error fetching NiFi servers: {e.response.status_code} - {error_detail}. URL: {url}")
+        return []
+    except requests.exceptions.ConnectionError as e:
+        bound_logger.error(f"Connection Error fetching NiFi servers: Could not connect to {API_BASE_URL}. ({e})")
+        return []
+    except requests.exceptions.Timeout:
+        bound_logger.error(f"Timeout connecting to MCP API server to fetch NiFi servers. URL: {url}")
+        return []
+    except Exception as e:
+        bound_logger.exception(f"Unexpected error fetching NiFi servers. URL: {url}") # Includes traceback
+        return []
+
 # --- Tool Execution (Synchronous HTTP) --- #
 def execute_mcp_tool(
     tool_name: str, 
     params: dict,
+    selected_nifi_server_id: str | None, # Added parameter
     user_request_id: str | None = None, # Added context ID
     action_id: str | None = None # Added context ID
 ) -> dict | str:
     """Executes a tool call via the REST API."""
     # Bind context IDs for logging within this function call
-    bound_logger = logger.bind(user_request_id=user_request_id, action_id=action_id)
+    bound_logger = logger.bind(user_request_id=user_request_id, action_id=action_id, nifi_server_id=selected_nifi_server_id)
     
     url = f"{API_BASE_URL}/tools/{tool_name}"
 
     # Log context IDs explicitly for debugging
-    bound_logger.debug(f"Tool execution context: user_request_id={user_request_id}, action_id={action_id}")
+    bound_logger.debug(f"Tool execution context: user_request_id={user_request_id}, action_id={action_id}, nifi_server_id={selected_nifi_server_id}")
 
     # Convert MapComposite to dict before creating payload
     processed_params = {}
@@ -50,7 +90,8 @@ def execute_mcp_tool(
         "arguments": processed_params,
         "context": {
             "user_request_id": user_request_id or "-",
-            "action_id": action_id or "-"
+            "action_id": action_id or "-",
+            "nifi_server_id": selected_nifi_server_id or "-"
         }
     }
 
@@ -60,6 +101,15 @@ def execute_mcp_tool(
         "X-Action-ID": action_id or "-",
         "Content-Type": "application/json"
     }
+    # Add the NiFi Server ID header if provided
+    if selected_nifi_server_id:
+        headers["X-Nifi-Server-Id"] = selected_nifi_server_id
+    else:
+        # Log a warning or error if the ID is missing, as it's now required by the backend
+        bound_logger.error("Missing NiFi Server ID for tool execution request. This is required.")
+        # Optionally raise an error or return an error message immediately
+        # For now, let the API call proceed and likely fail on the backend
+        # return {"status": "error", "message": "Missing required NiFi Server ID selection in the UI."} 
     
     bound_logger.info(f"Executing tool '{tool_name}' via API: {url}")
     bound_logger.debug(f"Payload for tool '{tool_name}': {payload}")
@@ -89,7 +139,7 @@ def execute_mcp_tool(
         ).debug("Received successful response from MCP API")
         # --------------------------------
         
-        return result_data.get("result", result_data) 
+        return result_data
 
     except requests.exceptions.HTTPError as e:
         error_detail = "Unknown API error"
@@ -143,6 +193,7 @@ def execute_mcp_tool(
 # --- Tool Definitions (Synchronous HTTP) --- #
 # @st.cache_data # Consider caching this
 def get_available_tools(
+    selected_nifi_server_id: str | None, # Added parameter
     user_request_id: str | None = None,
     action_id: str | None = None,
     phase: str | None = None # Add phase parameter
@@ -155,7 +206,7 @@ def get_available_tools(
         url = f"{API_BASE_URL}/tools"
     
     # Bind context IDs for logging within this function call
-    bound_logger = logger.bind(user_request_id=user_request_id, action_id=action_id)
+    bound_logger = logger.bind(user_request_id=user_request_id, action_id=action_id, nifi_server_id=selected_nifi_server_id)
     
     # Use logger instead of print
     bound_logger.info(f"Fetching available tools from API: {url}")
@@ -171,6 +222,12 @@ def get_available_tools(
             "X-Action-ID": action_id or "-",
             "Content-Type": "application/json"
         }
+        # Add the NiFi Server ID header if provided
+        if selected_nifi_server_id:
+            headers["X-Nifi-Server-Id"] = selected_nifi_server_id
+        else:
+            # Log a warning if the ID is missing, as /tools endpoint might work without it but /tools/{tool_name} won't
+            bound_logger.warning("NiFi Server ID not provided for get_available_tools request. Backend might default or error.")
         
         # Log headers for debugging
         bound_logger.debug(f"Headers for tools request: {headers}")

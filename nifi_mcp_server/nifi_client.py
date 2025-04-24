@@ -2,13 +2,13 @@ import os
 # import logging # Remove standard logging
 from loguru import logger # Import Loguru logger
 import httpx
-from dotenv import load_dotenv
+# from dotenv import load_dotenv # Removed dotenv
 import uuid # Import uuid for client ID generation
 from typing import Optional, Dict, Any, Union, List # Add Union and List
 from mcp.server.fastmcp.exceptions import ToolError # Import ToolError
 
-# Load environment variables from .env file
-load_dotenv()
+# Load environment variables from .env file - REMOVED
+# load_dotenv()
 
 # Set up logging - REMOVED standard logging setup
 # logging.basicConfig(level=logging.INFO)
@@ -21,16 +21,26 @@ class NiFiAuthenticationError(Exception):
 class NiFiClient:
     """A simple asynchronous client for the NiFi REST API."""
 
-    def __init__(self, base_url=None, username=None, password=None, tls_verify=True):
-        self.base_url = base_url or os.getenv("NIFI_API_URL")
-        self.username = username or os.getenv("NIFI_USERNAME")
-        self.password = password or os.getenv("NIFI_PASSWORD")
-        self.tls_verify = tls_verify if os.getenv("NIFI_TLS_VERIFY") is None else os.getenv("NIFI_TLS_VERIFY").lower() == "true"
+    def __init__(self, base_url: str, username: Optional[str] = None, password: Optional[str] = None, tls_verify: bool = True):
+        """Initializes the NiFiClient.
+
+        Args:
+            base_url: The base URL of the NiFi API (e.g., "https://localhost:8443/nifi-api"). Required.
+            username: The username for NiFi authentication. Required if password is provided.
+            password: The password for NiFi authentication. Required if username is provided.
+            tls_verify: Whether to verify the server's TLS certificate. Defaults to True.
+        """
+        if not base_url:
+            raise ValueError("base_url is required for NiFiClient")
+        self.base_url = base_url
+        self.username = username
+        self.password = password
+        self.tls_verify = tls_verify
         self._client = None
         self._token = None
         # Generate a unique client ID for this instance, used for revisions
         self._client_id = str(uuid.uuid4())
-        logger.info(f"NiFiClient initialized with client ID: {self._client_id}")
+        logger.info(f"NiFiClient initialized for {self.base_url} with client ID: {self._client_id}")
 
     @property
     def is_authenticated(self) -> bool:
@@ -1230,91 +1240,52 @@ class NiFiClient:
     def __repr__(self):
         return f"<{type(self).__name__} base_url={self.base_url} authenticated={self.is_authenticated}>"
 
-# Example usage (for testing this module directly)
+# Example usage (for testing or direct script execution)
 async def main():
-    client = NiFiClient()
-    new_processor_details = None
-    generate_flowfile_id = None
-    log_attribute_id = None
+    # REMOVED direct os.getenv usage here - configuration should be loaded from config.yaml
+    # and passed to the client constructor externally.
+    logger.warning("Running main() requires manual configuration of NiFiClient parameters.")
+    # Example: Replace with actual config loading
+    # from config.settings import get_nifi_server_config
+    # server_conf = get_nifi_server_config("nifi-local") # Use an ID from your config.yaml
+    # if not server_conf:
+    #     logger.error("NiFi server config not found.")
+    #     return
+    # client = NiFiClient(
+    #     base_url=server_conf.get('url'),
+    #     username=server_conf.get('username'),
+    #     password=server_conf.get('password'),
+    #     tls_verify=server_conf.get('tls_verify', True)
+    # )
+    # ... rest of main function ...
+
+    # Dummy client for demonstration if needed, replace with actual configured client
+    client = NiFiClient(base_url="http://localhost:8443/nifi-api") # Minimal example
 
     try:
-        logger.info("--- NiFi Client Test Start ---")
         await client.authenticate()
+        print(f"Authentication successful: {client.is_authenticated}")
         root_id = await client.get_root_process_group_id()
-        logger.info(f"Successfully fetched Root Process Group ID: {root_id}")
+        print(f"Root Process Group ID: {root_id}")
 
-        # --- List existing processors and find relevant ones ---
-        logger.info(f"Listing existing processors in root group ({root_id})...")
+        # Example: List processors in root
         processors = await client.list_processors(root_id)
-        if processors:
-            for proc in processors:
-                proc_entity = proc
-                proc_id = proc_entity.get("id")
-                proc_component = proc_entity.get("component", {})
-                proc_name = proc_component.get("name", "")
-                proc_type = proc_component.get("type", "")
-                logger.info(f"  - Found: ID: {proc_id}, Name: {proc_name}, Type: {proc_type}")
-                # Store IDs of processors we might want to connect
-                if proc_type == "org.apache.nifi.processors.standard.GenerateFlowFile":
-                    generate_flowfile_id = proc_id
-                    logger.info(f"    (Found GenerateFlowFile ID: {generate_flowfile_id})")
-                elif proc_name == "Test LogAttribute (MCP)": # Find the specific one we created
-                    log_attribute_id = proc_id
-                    logger.info(f"    (Found Test LogAttribute ID: {log_attribute_id})")
-        else:
-            logger.info(f"No existing processors found in root group ({root_id}).")
-
-        # --- Create processor if it doesn't exist (idempotency-ish) ---
-        if not log_attribute_id:
-            logger.info("Test LogAttribute processor not found, attempting to create...")
-            new_processor_type = "org.apache.nifi.processors.standard.LogAttribute"
-            new_processor_name = "Test LogAttribute (MCP)"
-            new_processor_position = {"x": 400.0, "y": 0.0}
-            try:
-                new_processor_details = await client.create_processor(
-                    process_group_id=root_id,
-                    processor_type=new_processor_type,
-                    name=new_processor_name,
-                    position=new_processor_position
-                )
-                log_attribute_id = new_processor_details.get('id')
-                logger.info(f"Successfully created processor: {log_attribute_id}")
-            except ConnectionError as create_err:
-                 logger.error(f"Failed to create placeholder LogAttribute processor: {create_err}")
-                 # Decide if we should exit or continue without connection test
-                 raise
-
-        # --- Create Connection ---
-        if generate_flowfile_id and log_attribute_id:
-            logger.info(f"Attempting to connect GenerateFlowFile ({generate_flowfile_id}) to LogAttribute ({log_attribute_id})...")
-            try:
-                connection_details = await client.create_connection(
-                    process_group_id=root_id,
-                    source_id=generate_flowfile_id,
-                    target_id=log_attribute_id,
-                    relationships=["success"] # Connect the 'success' relationship
-                )
-                logger.info(f"Successfully created connection: {connection_details.get('id')}")
-                logger.info(f"Full connection response: {connection_details}")
-            except ConnectionError as conn_err:
-                logger.error(f"Failed to create connection: {conn_err}")
-                # Log error but continue for cleanup
-        else:
-            logger.warning("Could not find both GenerateFlowFile and LogAttribute processors; skipping connection creation.")
+        print(f"Processors in root ({root_id}): {len(processors)}")
+        # for proc in processors:
+        #     print(f"  - {proc.get('component', {}).get('name')} (ID: {proc.get('id')})")
 
     except NiFiAuthenticationError as e:
-        logger.error(f"Authentication Error: {e}")
-    except ConnectionError as e:
-         logger.error(f"Connection or API error: {e}")
+        print(f"Authentication Error: {e}")
     except Exception as e:
-         logger.error(f"An unexpected error occurred in main: {e}", exc_info=True)
+        print(f"An error occurred: {e}")
     finally:
         await client.close()
-        logger.info("--- NiFi Client Test End ---")
+
+# Note: Running this directly requires NIFI_API_URL, NIFI_USERNAME, NIFI_PASSWORD
+# or manually providing the details in the main function.
+# Ensure NIFI_TLS_VERIFY=false is set in .env if using self-signed certs.
+# REMOVED references to .env as config is now centralized in config.yaml
 
 if __name__ == "__main__":
     import asyncio
-    # Note: Running this directly requires NIFI_API_URL, NIFI_USERNAME, NIFI_PASSWORD
-    # to be set in your environment or a .env file.
-    # Ensure NIFI_TLS_VERIFY=false is set in .env if using self-signed certs.
     asyncio.run(main())

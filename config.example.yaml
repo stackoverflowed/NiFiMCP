@@ -1,0 +1,26 @@
+nifi:
+  servers:
+    - id: "nifi-local-example" # Unique internal ID, used by the client/API calls
+      name: "Local NiFi Example" # Display name for UI dropdown
+      url: "https://localhost:8443/nifi-api" # URL to NiFi API
+      username: "" # Optional: Username for NiFi basic auth
+      password: "" # Optional: Password for NiFi basic auth - DO NOT COMMIT REAL PASSWORDS
+      tls_verify: false # Set to true for valid certs, false for self-signed (dev only)
+    # Add more NiFi server configurations here as needed
+    # - id: "nifi-dev-example"
+    #   name: "Development NiFi Example"
+    #   url: "https://dev-nifi.example.com/nifi-api"
+    #   username: "dev_user"
+    #   password: "dev_password_env_var_reference_or_secret" # Example: Placeholder, ideally use env vars or secrets management
+    #   tls_verify: true
+
+llm:
+  google:
+    api_key: "" # Your Google API Key (e.g., AIza...)
+    models: ["gemini-1.5-pro-latest", "gemini-1.0-pro"] # Comma-separated list of allowed models
+  openai:
+    api_key: "" # Your OpenAI API Key (e.g., sk-...)
+    models: ["gpt-4-turbo-preview", "gpt-3.5-turbo"] # Comma-separated list of allowed models
+
+# general:
+#   setting_1: "value" # Example for other potential app settings 
