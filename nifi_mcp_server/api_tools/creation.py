@@ -7,7 +7,7 @@ from loguru import logger
 from ..core import mcp
 # Removed nifi_api_client import
 # Import context variables
-from ..request_context import current_nifi_client, current_request_logger # Added
+from ..request_context import current_nifi_client, current_request_logger, current_user_request_id, current_action_id # Added
 
 from .utils import (
     tool_phases,
@@ -55,9 +55,13 @@ async def create_nifi_processor(
          raise ToolError("Request logger context is not set.")
          
     # Authentication handled by factory
-    context = local_logger._context
-    user_request_id = context.get("user_request_id", "-")
-    action_id = context.get("action_id", "-")
+    # context = local_logger._context # REMOVED
+    # user_request_id = context.get("user_request_id", "-") # REMOVED
+    # action_id = context.get("action_id", "-") # REMOVED
+    # --- Get IDs from context ---
+    user_request_id = current_user_request_id.get() or "-"
+    action_id = current_action_id.get() or "-"
+    # --------------------------
 
     target_pg_id = process_group_id
     if target_pg_id is None:
@@ -155,14 +159,17 @@ async def create_nifi_connection(
     if not local_logger:
          raise ToolError("Request logger context is not set.")
          
-    # Bind main args for logging
+    # Authentication handled by factory
+    # context = local_logger._context # REMOVED
+    # user_request_id = context.get("user_request_id", "-") # REMOVED
+    # action_id = context.get("action_id", "-") # REMOVED
+    # --- Get IDs from context ---
+    user_request_id = current_user_request_id.get() or "-"
+    action_id = current_action_id.get() or "-"
+    # --------------------------
+
     local_logger = local_logger.bind(source_id=source_id, target_id=target_id, relationships=relationships)
          
-    # Authentication handled by factory
-    context = local_logger._context
-    user_request_id = context.get("user_request_id", "-")
-    action_id = context.get("action_id", "-")
-
     if not relationships:
         raise ToolError("The 'relationships' list cannot be empty.")
     if not isinstance(relationships, list) or not all(isinstance(item, str) for item in relationships):
@@ -344,9 +351,13 @@ async def create_nifi_port(
          raise ToolError("Request logger context is not set.")
          
     # Authentication handled by factory
-    context = local_logger._context
-    user_request_id = context.get("user_request_id", "-")
-    action_id = context.get("action_id", "-")
+    # context = local_logger._context # REMOVED
+    # user_request_id = context.get("user_request_id", "-") # REMOVED
+    # action_id = context.get("action_id", "-") # REMOVED
+    # --- Get IDs from context ---
+    user_request_id = current_user_request_id.get() or "-"
+    action_id = current_action_id.get() or "-"
+    # --------------------------
 
     target_pg_id = process_group_id
     if target_pg_id is None:
@@ -430,9 +441,13 @@ async def create_nifi_process_group(
          raise ToolError("Request logger context is not set.")
          
     # Authentication handled by factory
-    context = local_logger._context
-    user_request_id = context.get("user_request_id", "-")
-    action_id = context.get("action_id", "-")
+    # context = local_logger._context # REMOVED
+    # user_request_id = context.get("user_request_id", "-") # REMOVED
+    # action_id = context.get("action_id", "-") # REMOVED
+    # --- Get IDs from context ---
+    user_request_id = current_user_request_id.get() or "-"
+    action_id = current_action_id.get() or "-"
+    # --------------------------
 
     target_parent_pg_id = parent_process_group_id
     if target_parent_pg_id is None:
@@ -496,9 +511,10 @@ async def create_nifi_flow(
 
     Args:
         nifi_objects: A list where each item describes a processor or connection.
-            Processor format: {"type": "processor", "processor_type": "org.apache.nifi...", "name": "MyProc", "position_x": X, "position_y": Y, "local_id": "proc1"}
-            Connection format: {"type": "connection", "source_local_id": "proc1", "target_local_id": "proc2", "relationships": ["success"]}
-            `local_id` is used to link connections before NiFi IDs are known.
+            Preferred Processor Format: {"type": "processor", "class": "org.apache.nifi...", "name": "MyProc", "position": {"x": X, "y": Y}, "properties": {...}}
+            Preferred Connection Format: {"type": "connection", "source": "MyProc", "dest": "OtherProc", "relationships": ["success"]} # Use 'name' from a processor in this list for 'source' and 'dest'
+            Note: Processor 'name' is used for mapping connections and must be unique within this list. The tool attempts to parse common variations, but the preferred format is recommended.
+            Important: Processor 'properties' provided here are currently IGNORED during creation. Use the 'update_nifi_processor_properties' tool afterwards.
         process_group_id: The ID of the existing process group to create the flow in. Ignored if `create_process_group` is provided.
         create_process_group: Optional. If provided, a new process group is created with this configuration {"name": "NewGroup", "position_x": X, "position_y": Y} and the flow is built inside it.
 
@@ -514,9 +530,13 @@ async def create_nifi_flow(
          raise ToolError("Request logger context is not set.")
          
     # Authentication handled by factory
-    context = local_logger._context
-    user_request_id = context.get("user_request_id", "-")
-    action_id = context.get("action_id", "-")
+    # context = local_logger._context # REMOVED
+    # user_request_id = context.get("user_request_id", "-") # REMOVED
+    # action_id = context.get("action_id", "-") # REMOVED
+    # --- Get IDs from context ---
+    user_request_id = current_user_request_id.get() or "-"
+    action_id = current_action_id.get() or "-"
+    # --------------------------
     
     results = []
     id_map = {}  # Maps local_id to actual NiFi ID
@@ -565,83 +585,129 @@ async def create_nifi_flow(
         local_logger = local_logger.bind(target_process_group_id=target_pg_id)
 
         # 2. Create Processors
-        processors_to_create = [obj for obj in nifi_objects if obj.get("type") == "processor"]
-        local_logger.info(f"Found {len(processors_to_create)} processors to create.")
-        for proc_def in processors_to_create:
-            local_id = proc_def.get("local_id")
-            if not local_id:
-                results.append({"status": "error", "message": "Processor definition missing 'local_id'.", "definition": proc_def})
-                continue
-            if local_id in id_map:
-                 results.append({"status": "error", "message": f"Duplicate local_id '{local_id}' found for processor.", "definition": proc_def})
-                 continue
-                 
-            proc_type = proc_def.get("processor_type")
-            proc_name = proc_def.get("name")
-            pos_x = proc_def.get("position_x")
-            pos_y = proc_def.get("position_y")
+        local_logger.info(f"Processing {len(nifi_objects)} objects for processor creation...")
+        for item in nifi_objects:
+            if item.get("type") == "processor": # Check top-level type
+                proc_def = item # Use the item directly
+                proc_name = proc_def.get("name")
+                # Get type from 'class' key, fallback to 'processor_type' or 'type'
+                proc_type = proc_def.get("class") or proc_def.get("processor_type") or proc_def.get("type")
+                # Get position dictionary
+                position_dict = proc_def.get("position", {})
+                pos_x = position_dict.get("x")
+                pos_y = position_dict.get("y")
+                # Get properties (might be nested or top-level depending on LLM mood)
+                properties = proc_def.get("properties", {}) 
 
-            if not all([proc_type, proc_name, pos_x is not None, pos_y is not None]):
-                results.append({"status": "error", "message": "Processor definition missing required fields (processor_type, name, position_x, position_y).", "definition": proc_def})
-                continue
+                if not proc_name:
+                    results.append({"status": "error", "message": "Processor definition missing 'name'.", "definition": proc_def})
+                    continue
+                if proc_name in id_map:
+                    results.append({"status": "error", "message": f"Duplicate processor name '{proc_name}' found. Names must be unique for connection mapping.", "definition": proc_def})
+                    continue
 
-            # Call create_nifi_processor tool logic
-            proc_creation_result = await create_nifi_processor(
-                processor_type=proc_type,
-                name=proc_name,
-                position_x=pos_x,
-                position_y=pos_y,
-                process_group_id=target_pg_id
-            )
-            proc_creation_result["local_id"] = local_id # Add local_id to result
-            results.append(proc_creation_result)
+                if not all([proc_type, pos_x is not None, pos_y is not None]):
+                    results.append({"status": "error", "message": f"Processor '{proc_name}' definition missing required fields (class/processor_type/type, position.x, position.y).", "definition": proc_def})
+                    continue
 
-            if proc_creation_result.get("status") != "error":
-                nifi_id = proc_creation_result.get("entity", {}).get("id")
-                if nifi_id:
-                    id_map[local_id] = nifi_id
-                else:
-                    local_logger.error(f"Could not get NiFi ID for created processor with local_id '{local_id}'")
-                    # Mark error for this processor, subsequent connections might fail
+                local_logger.info(f"Attempting to create processor: Name='{proc_name}', Type='{proc_type}'")
+                # Call create_nifi_processor tool logic
+                proc_creation_result = await create_nifi_processor(
+                    processor_type=proc_type,
+                    name=proc_name,
+                    position_x=pos_x,
+                    position_y=pos_y,
+                    process_group_id=target_pg_id
+                )
+                # We also need to apply the properties if provided
+                created_proc_id = None
+                if proc_creation_result.get("status") != "error":
+                    created_proc_id = proc_creation_result.get("entity", {}).get("id")
+                    if created_proc_id and properties:
+                        local_logger.info(f"Processor '{proc_name}' created ({created_proc_id}), now applying properties...")
+                        # Need modification tool here - requires importing and calling update_nifi_processor_properties
+                        # This adds complexity - might be better to modify create_nifi_processor to accept config
+                        # For now, log a warning that properties were ignored during creation
+                        local_logger.warning(f"Properties provided for processor '{proc_name}' were ignored during initial creation. Use update tool.")
+                        proc_creation_result["warning"] = "Properties provided but not applied during creation. Use update tool."
+                        
+                proc_creation_result["name_used_for_mapping"] = proc_name
+                results.append(proc_creation_result)
+
+                if proc_creation_result.get("status") != "error" and created_proc_id:
+                    id_map[proc_name] = created_proc_id # Map NAME to NiFi ID
+                    local_logger.debug(f"Mapped name '{proc_name}' to ID '{created_proc_id}'")
+                elif proc_creation_result.get("status") != "error" and not created_proc_id:
+                    local_logger.error(f"Could not get NiFi ID for created processor with name '{proc_name}'")
                     proc_creation_result["status"] = "error"
                     proc_creation_result["message"] += " (Could not retrieve NiFi ID after creation)"
-            else:
-                 local_logger.error(f"Failed to create processor with local_id '{local_id}': {proc_creation_result.get('message')}")
-                 
+                else:
+                    local_logger.error(f"Failed to create processor with name '{proc_name}': {proc_creation_result.get('message')}")
+
         # 3. Create Connections
-        connections_to_create = [obj for obj in nifi_objects if obj.get("type") == "connection"]
-        local_logger.info(f"Found {len(connections_to_create)} connections to create.")
-        for conn_def in connections_to_create:
-            source_local_id = conn_def.get("source_local_id")
-            target_local_id = conn_def.get("target_local_id")
-            relationships = conn_def.get("relationships")
+        local_logger.info(f"Processing {len(nifi_objects)} objects for connection creation...")
+        for item in nifi_objects:
+            if item.get("type") == "connection": # Check top-level type
+                conn_def = item # Use the item directly
+                # Extract details using names
+                source_name = conn_def.get("source") # Expecting name
+                target_name = conn_def.get("dest") or conn_def.get("destination") # Allow variations
+                relationships = conn_def.get("relationships")
 
-            if not all([source_local_id, target_local_id, relationships]):
-                results.append({"status": "error", "message": "Connection definition missing required fields (source_local_id, target_local_id, relationships).", "definition": conn_def})
-                continue
+                if not all([source_name, target_name, relationships]):
+                    results.append({"status": "error", "message": "Connection definition missing required fields (source name, dest/destination name, relationships).", "definition": conn_def})
+                    continue
                 
-            source_nifi_id = id_map.get(source_local_id)
-            target_nifi_id = id_map.get(target_local_id)
+                # Use names to lookup NiFi IDs from our map
+                source_nifi_id = id_map.get(source_name)
+                target_nifi_id = id_map.get(target_name)
 
-            if not source_nifi_id:
-                results.append({"status": "error", "message": f"Source processor with local_id '{source_local_id}' not found or failed to create.", "definition": conn_def})
-                continue
-            if not target_nifi_id:
-                results.append({"status": "error", "message": f"Target processor with local_id '{target_local_id}' not found or failed to create.", "definition": conn_def})
-                continue
+                if not source_nifi_id:
+                    results.append({"status": "error", "message": f"Source component with name '{source_name}' not found or failed to create.", "definition": conn_def})
+                    continue
+                if not target_nifi_id:
+                    results.append({"status": "error", "message": f"Target component with name '{target_name}' not found or failed to create.", "definition": conn_def})
+                    continue
 
-            # Call create_nifi_connection tool logic
-            conn_creation_result = await create_nifi_connection(
-                source_id=source_nifi_id,
-                target_id=target_nifi_id,
-                relationships=relationships
-            )
-            conn_creation_result["definition"] = conn_def # Add original definition to result
-            results.append(conn_creation_result)
-            
-            if conn_creation_result.get("status") == "error":
-                 local_logger.error(f"Failed to create connection from '{source_local_id}' to '{target_local_id}': {conn_creation_result.get('message')}")
+                local_logger.info(f"Attempting to create connection: From='{source_name}' ({source_nifi_id}) To='{target_name}' ({target_nifi_id}) Rel='{relationships}'")
+                # Call create_nifi_connection tool logic
+                conn_creation_result = await create_nifi_connection(
+                    source_id=source_nifi_id,
+                    target_id=target_nifi_id,
+                    relationships=relationships
+                )
+                conn_creation_result["definition"] = conn_def
+                results.append(conn_creation_result)
+                
+                if conn_creation_result.get("status") == "error":
+                     local_logger.error(f"Failed to create connection from '{source_name}' to '{target_name}': {conn_creation_result.get('message')}")
                  
+        # 4. Identify and report any unprocessed items
+        processed_indices = set()
+        for i, item in enumerate(nifi_objects):
+            # Check if item was processed as a processor or connection based on our loops
+            if item.get("type") == "processor" or item.get("type") == "connection":
+                 processed_indices.add(i)
+            # Add checks here if we support other types later
+
+        unprocessed_items = []
+        for i, item in enumerate(nifi_objects):
+            if i not in processed_indices:
+                unprocessed_items.append({
+                    "index": i,
+                    "item": item, # Include the problematic item for context
+                    "message": f"Input object at index {i} was ignored. Expected 'type' to be 'processor' or 'connection'."
+                })
+
+        if unprocessed_items:
+            local_logger.warning(f"Found {len(unprocessed_items)} unprocessed items in the input list.")
+            # Add a summary error or individual errors to the main results
+            results.append({
+                "status": "warning",
+                "message": f"{len(unprocessed_items)} input object(s) were ignored due to unrecognized type.",
+                "unprocessed_details": unprocessed_items # Provide details
+            })
+
         local_logger.info("Finished processing all objects for flow creation.")
         return results
 

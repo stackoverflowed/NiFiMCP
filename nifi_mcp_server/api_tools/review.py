@@ -629,9 +629,29 @@ async def document_nifi_flow(
         output_ports = {p['id']: p for p in output_ports_resp if 'id' in p}
         all_components = {**processors, **input_ports, **output_ports}
 
-        # Build the graph structure
+        # Build the graph structure (new return format)
         local_logger.info("Building graph structure from fetched components...")
-        graph, nodes_by_id = build_graph_structure(processors, connections, input_ports, output_ports)
+        graph_data = build_graph_structure(list(processors.values()), list(connections.values())) # Pass lists
+        outgoing_graph = graph_data.get("outgoing", {}) # Use the 'outgoing' part
+        # incoming_graph = graph_data.get("incoming", {}) # Keep if needed
+
+        # Manually create nodes_by_id map for easy lookup
+        nodes_by_id = {}
+        for comp_id, comp_details in all_components.items():
+            comp_type = comp_details.get('component', {}).get('type', 'UNKNOWN')
+            # Map NiFi types to documentation types if needed
+            doc_type = "UNKNOWN"
+            if "PROCESSOR" in comp_type:
+                doc_type = "PROCESSOR"
+            elif "INPUT_PORT" in comp_type:
+                doc_type = "INPUT_PORT"
+            elif "OUTPUT_PORT" in comp_type:
+                doc_type = "OUTPUT_PORT"
+                
+            nodes_by_id[comp_id] = {
+                "name": comp_details.get('component', {}).get('name', 'Unknown'),
+                "type": doc_type # Use mapped type
+            }
 
         # Analyze and document the flow
         local_logger.info("Analyzing flow structure...")
@@ -639,9 +659,15 @@ async def document_nifi_flow(
         
         # If no specific processor start, try to find source nodes (input ports or processors with no incoming connections)
         if not start_node_id:
-            source_nodes = [nid for nid, node in nodes_by_id.items() 
-                            if node['type'] == 'INPUT_PORT' or 
-                               (node['type'] == 'PROCESSOR' and not any(conn['source']['id'] == nid for conn in connections.values()))]
+            # Use incoming_graph if available, otherwise check connections directly
+            incoming_graph = graph_data.get("incoming", {})
+            source_nodes = [nid for nid, node in nodes_by_id.items()
+                            if node['type'] == 'INPUT_PORT' or
+                               (node['type'] == 'PROCESSOR' and nid not in incoming_graph)]
+            # Old check:
+            # source_nodes = [nid for nid, node in nodes_by_id.items() 
+            #                 if node['type'] == 'INPUT_PORT' or 
+            #                    (node['type'] == 'PROCESSOR' and not any(conn['source']['id'] == nid for conn in connections.values()))]
             if source_nodes:
                 start_node_id = source_nodes[0] # Pick the first source node found
                 local_logger.info(f"No starting_processor_id given, starting analysis from source node: {start_node_id}")
@@ -693,23 +719,35 @@ async def document_nifi_flow(
             traversed_path.append(doc_entry)
             
             # Add neighbors to queue
-            if current_node_id in graph:
-                 for neighbor_id, connection_details_list in graph[current_node_id].items():
-                     if neighbor_id not in visited_nodes:
-                         # Add connection details if needed
-                         # Example: Add first connection detail found
-                         if connection_details_list:
-                              first_conn_id = connection_details_list[0]["connection_id"]
-                              first_conn_details = connections.get(first_conn_id)
-                              if first_conn_details:
-                                   # Append connection info to the current node's entry or as a separate entry
-                                   doc_entry["outgoing_connection"] = format_connection(first_conn_details, include_descriptions)
-                                   pass # Append or handle connection documentation
-                                   
-                         queue.append((neighbor_id, depth + 1))
+            # Use outgoing_graph now
+            if current_node_id in outgoing_graph:
+                 # Corrected loop: iterate directly over the list of connection details
+                 connection_details_list = outgoing_graph[current_node_id]
+                 # for neighbor_id, connection_details_list in outgoing_graph[current_node_id].items(): # OLD INCORRECT LOOP
+                 #    # The value is now the list of connection dicts, not neighbor_id -> list
+                 #    # We need to iterate through the connection list directly
+                 for connection_detail in connection_details_list: # Iterate list directly
+                     neighbor_id = connection_detail.get("destination", {}).get("id")
+                     if not neighbor_id:
+                         # Handle potential older format in connection_detail if necessary
+                         neighbor_id = connection_detail.get("destinationId")
+                         
+                         if neighbor_id and neighbor_id not in visited_nodes:
+                             # Add connection details if needed
+                             first_conn_id = connection_detail.get("id") # Get ID from the detail itself
+                             if first_conn_id:
+                                 # Append connection info to the current node's entry or as a separate entry
+                                 # Use the existing format_connection, needs processor map
+                                 # Construct processor_map if needed (can just use all_components for name lookup)
+                                 # Ensure format_connection is compatible or adjust its call
+                                 formatted_conn = format_connection(connection_detail, all_components) # Pass all_components for name lookup
+                                 doc_entry["outgoing_connection"] = formatted_conn
+                                 # pass # Append or handle connection documentation
+                                 
+                             queue.append((neighbor_id, depth + 1))
 
         results["flow_structure"] = traversed_path
-        results["decision_branches"] = find_decision_branches(processors, connections)
+        results["decision_branches"] = find_decision_branches(all_components, graph_data) # Pass all_components and the raw graph_data
         
         # Populate unconnected
         for proc_id in unconnected_processors:

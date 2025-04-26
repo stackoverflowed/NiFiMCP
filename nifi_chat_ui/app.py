@@ -317,7 +317,7 @@ st.text_area(
 st.markdown("---")
 
 # --- Display Chat History --- 
-for message in st.session_state.messages:
+for index, message in enumerate(st.session_state.messages):
     if message.get("role") == "tool":
         continue
     # Removed system message check for HISTORY_CLEAR_MARKER
@@ -340,8 +340,19 @@ for message in st.session_state.messages:
             # For simplicity now, using content hash might work, but let's try a simple key first
             # A better key might involve an action_id or index if reliably available
             # Using content as part of key for now, might need adjustment
-            content_key = hash(message['content']) # Simple hash for uniqueness
-            st_copy_to_clipboard(message["content"], key=f"hist_copy_{content_key}")
+            # content_key = hash(message['content']) # Simple hash for uniqueness
+            # st_copy_to_clipboard(message["content"], key=f"hist_copy_{content_key}")
+            # --- Generate Unique Key ---
+            unique_part = ""
+            if message["role"] == "user":
+                unique_part = message.get("user_request_id", "")
+            elif message["role"] == "assistant":
+                 unique_part = message.get("action_id", "")
+            # Use index and the ID (or just index if ID is missing)
+            copy_key = f"hist_copy_{index}_{unique_part}"
+            # ---------------------------
+
+            st_copy_to_clipboard(message["content"], key=copy_key) # Use the new unique key
         elif message["role"] == "assistant" and "tool_calls" in message and "content" not in message:
             tool_names = [tc.get('function', {}).get('name', 'unknown') for tc in message.get("tool_calls", [])]
             if tool_names:
