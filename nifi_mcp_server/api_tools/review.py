@@ -1,5 +1,6 @@
 import asyncio
 from typing import List, Dict, Optional, Any, Union, Literal
+from datetime import datetime # Added import
 
 # Import necessary components from parent/utils
 from loguru import logger # Keep global logger for potential module-level logging if needed
@@ -12,7 +13,8 @@ from .utils import (
     _format_processor_summary,
     _format_connection_summary,
     _format_port_summary,
-    filter_processor_data # Keep if needed by helpers here
+    filter_processor_data, # Keep if needed by helpers here
+    filter_connection_data # Add missing import
 )
 # Keep NiFiClient type hint and error imports
 from nifi_mcp_server.nifi_client import NiFiClient, NiFiAuthenticationError
@@ -633,25 +635,47 @@ async def document_nifi_flow(
         local_logger.info("Building graph structure from fetched components...")
         graph_data = build_graph_structure(list(processors.values()), list(connections.values())) # Pass lists
         outgoing_graph = graph_data.get("outgoing", {}) # Use the 'outgoing' part
-        # incoming_graph = graph_data.get("incoming", {}) # Keep if needed
+        incoming_graph = graph_data.get("incoming", {}) # Keep if needed
 
         # Manually create nodes_by_id map for easy lookup
         nodes_by_id = {}
         for comp_id, comp_details in all_components.items():
             comp_type = comp_details.get('component', {}).get('type', 'UNKNOWN')
             # Map NiFi types to documentation types if needed
+            comp_type_lower = comp_type.lower() # Convert to lowercase for case-insensitive check
             doc_type = "UNKNOWN"
-            if "PROCESSOR" in comp_type:
+            if "processor" in comp_type_lower:
                 doc_type = "PROCESSOR"
-            elif "INPUT_PORT" in comp_type:
+            elif "input_port" in comp_type_lower:
                 doc_type = "INPUT_PORT"
-            elif "OUTPUT_PORT" in comp_type:
+            elif "output_port" in comp_type_lower:
                 doc_type = "OUTPUT_PORT"
                 
             nodes_by_id[comp_id] = {
                 "name": comp_details.get('component', {}).get('name', 'Unknown'),
                 "type": doc_type # Use mapped type
             }
+        
+        # --- Debugging Graph and Source Node Logic ---
+        local_logger.debug(f"Nodes identified (nodes_by_id keys): {list(nodes_by_id.keys())}")
+        local_logger.debug(f"Incoming graph keys (nodes with inputs): {list(incoming_graph.keys())}")
+
+        # Check Generate Flow File node specifically
+        gen_flow_file_id = '2ca23583-0196-1000-8dfe-fdf4f50b40d8' # Hardcode ID from image/logs
+        if gen_flow_file_id in nodes_by_id:
+             gen_node_info = nodes_by_id[gen_flow_file_id]
+             gen_node_type = gen_node_info['type']
+             is_processor = gen_node_type == 'PROCESSOR'
+             not_in_incoming = gen_flow_file_id not in incoming_graph
+             local_logger.debug(f"Check for {gen_flow_file_id}: Type is '{gen_node_type}'. Is 'PROCESSOR'? {is_processor}. Not in incoming keys? {not_in_incoming}")
+        else:
+             local_logger.warning(f"Generate Flow File ID {gen_flow_file_id} not found in nodes_by_id!")
+
+        _potential_source_nodes = [nid for nid, node in nodes_by_id.items()
+                                   if node['type'] == 'INPUT_PORT' or 
+                                   (node['type'] == 'PROCESSOR' and nid not in incoming_graph)]
+        local_logger.debug(f"Calculated potential source nodes: {_potential_source_nodes}")
+        # --- End Debugging ---
 
         # Analyze and document the flow
         local_logger.info("Analyzing flow structure...")
@@ -659,25 +683,22 @@ async def document_nifi_flow(
         
         # If no specific processor start, try to find source nodes (input ports or processors with no incoming connections)
         if not start_node_id:
-            # Use incoming_graph if available, otherwise check connections directly
-            incoming_graph = graph_data.get("incoming", {})
-            source_nodes = [nid for nid, node in nodes_by_id.items()
-                            if node['type'] == 'INPUT_PORT' or
-                               (node['type'] == 'PROCESSOR' and nid not in incoming_graph)]
-            # Old check:
-            # source_nodes = [nid for nid, node in nodes_by_id.items() 
-            #                 if node['type'] == 'INPUT_PORT' or 
-            #                    (node['type'] == 'PROCESSOR' and not any(conn['source']['id'] == nid for conn in connections.values()))]
-            if source_nodes:
-                start_node_id = source_nodes[0] # Pick the first source node found
-                local_logger.info(f"No starting_processor_id given, starting analysis from source node: {start_node_id}")
+            # Use the PREVIOUSLY calculated source nodes from the debug step
+            if _potential_source_nodes:
+                start_node_id = _potential_source_nodes[0] # Pick the first source node found
+                local_logger.info(f"No starting_processor_id given, starting analysis from calculated source node: {start_node_id}")
             else:
                 # Fallback if no clear source, maybe pick first processor?
                 if processors:
                     start_node_id = list(processors.keys())[0]
-                    local_logger.warning(f"No source node found, starting analysis from arbitrary processor: {start_node_id}")
+                    local_logger.warning(f"No source nodes identified, starting analysis from arbitrary processor: {start_node_id}")
                 else:
                     raise ToolError("Cannot document flow: No starting point specified and no processors found in the group.")
+        else:
+             local_logger.info(f"Using provided starting processor ID: {start_node_id}")
+
+        if not start_node_id: # Final safety check before traversal
+             raise ToolError("Could not determine a valid starting node ID for traversal.")
                     
         traversed_path = []
         visited_nodes = set()
@@ -685,18 +706,25 @@ async def document_nifi_flow(
         unconnected_processors = set(processors.keys())
         unconnected_ports = set(input_ports.keys()) | set(output_ports.keys())
 
+        local_logger.debug(f"Starting traversal. Initial Queue: {queue}") # Log initial queue
+
         while queue:
             current_node_id, depth = queue.pop(0)
 
+            local_logger.debug(f"Processing Node: {current_node_id} at depth {depth}. Current Queue: {queue}") # Log current node and queue
+
             if current_node_id in visited_nodes or depth > max_depth:
+                local_logger.debug(f"Skipping Node {current_node_id}: Visited or max depth reached.") # Log skip reason
                 continue
             visited_nodes.add(current_node_id)
+            local_logger.debug(f"Added Node {current_node_id} to visited set.") # Log visited add
 
             if current_node_id in unconnected_processors: unconnected_processors.remove(current_node_id)
             if current_node_id in unconnected_ports: unconnected_ports.remove(current_node_id)
 
             node_info = nodes_by_id.get(current_node_id)
             if not node_info:
+                local_logger.warning(f"Node details not found for ID: {current_node_id} in nodes_by_id map.") # Changed log level
                 results["errors"].append(f"Node details not found for ID: {current_node_id}")
                 continue
 
@@ -708,44 +736,51 @@ async def document_nifi_flow(
                 "id": current_node_id,
                 "name": node_info["name"],
                 "type": node_info["type"],
+                "outgoing_connections": [] # Initialize list for outgoing connections
             }
             if include_descriptions:
                 doc_entry["description"] = component_details.get("component", {}).get("comments", "") or component_details.get("component", {}).get("name", "")
             if include_properties and node_info["type"] == "PROCESSOR":
-                 doc_entry["properties"] = extract_important_properties(component_props)
-                 doc_entry["expressions"] = analyze_expressions(component_props)
+                 # Use extract_important_properties which now returns all props + expressions
+                 prop_analysis = extract_important_properties(component_details) # Pass full details
+                 doc_entry["properties"] = prop_analysis["all_properties"]
+                 doc_entry["expressions"] = prop_analysis["expressions"]
                  
-            # Add Relationship info here if needed
+            # Relationship info will be added in the loop below
             traversed_path.append(doc_entry)
+            local_logger.debug(f"Appended {current_node_id} ({node_info['name']}) to traversed_path.") # Log path append
             
             # Add neighbors to queue
             # Use outgoing_graph now
             if current_node_id in outgoing_graph:
                  # Corrected loop: iterate directly over the list of connection details
                  connection_details_list = outgoing_graph[current_node_id]
-                 # for neighbor_id, connection_details_list in outgoing_graph[current_node_id].items(): # OLD INCORRECT LOOP
-                 #    # The value is now the list of connection dicts, not neighbor_id -> list
-                 #    # We need to iterate through the connection list directly
+                 local_logger.debug(f"Found {len(connection_details_list)} outgoing connections for {current_node_id}.") # Log connection count
                  for connection_detail in connection_details_list: # Iterate list directly
                      neighbor_id = connection_detail.get("destination", {}).get("id")
                      if not neighbor_id:
-                         # Handle potential older format in connection_detail if necessary
                          neighbor_id = connection_detail.get("destinationId")
                          
-                         if neighbor_id and neighbor_id not in visited_nodes:
-                             # Add connection details if needed
-                             first_conn_id = connection_detail.get("id") # Get ID from the detail itself
-                             if first_conn_id:
-                                 # Append connection info to the current node's entry or as a separate entry
-                                 # Use the existing format_connection, needs processor map
-                                 # Construct processor_map if needed (can just use all_components for name lookup)
-                                 # Ensure format_connection is compatible or adjust its call
-                                 formatted_conn = format_connection(connection_detail, all_components) # Pass all_components for name lookup
-                                 doc_entry["outgoing_connection"] = formatted_conn
-                                 # pass # Append or handle connection documentation
-                                 
+                     if neighbor_id:
+                         local_logger.debug(f"  Checking neighbor: {neighbor_id} via connection {connection_detail.get('id')}") # Log neighbor check
+                         # Format connection info
+                         formatted_conn = format_connection(connection_detail, all_components) # Pass all_components for name lookup
+                         # Append connection info to the CURRENT node's entry in traversed_path
+                         # Since doc_entry was just appended, it's the last item
+                         if traversed_path:
+                              traversed_path[-1]["outgoing_connections"].append(formatted_conn)
+                          
+                         if neighbor_id not in visited_nodes:
                              queue.append((neighbor_id, depth + 1))
+                             local_logger.debug(f"    Added neighbor {neighbor_id} to queue.") # Log queue add
+                         else:
+                              local_logger.debug(f"    Neighbor {neighbor_id} already visited.") # Log neighbor visited
+                     else:
+                         local_logger.warning(f"  Could not find destination ID in connection detail: {connection_detail}") # Log missing ID
+            else:
+                 local_logger.debug(f"Node {current_node_id} has no outgoing connections in graph.") # Log no outgoing
 
+        local_logger.debug(f"Traversal loop finished. Final traversed_path: {traversed_path}") # Log final path
         results["flow_structure"] = traversed_path
         results["decision_branches"] = find_decision_branches(all_components, graph_data) # Pass all_components and the raw graph_data
         
@@ -784,7 +819,7 @@ async def document_nifi_flow(
         return results
 
 @mcp.tool()
-@tool_phases(["Review", "Build", "Modify", "Operate"])
+@tool_phases(["Review", "Operate"])
 async def search_nifi_flow(
     query: str,
     filter_object_type: Optional[Literal["processor", "connection", "port", "process_group"]] = None,
@@ -895,3 +930,623 @@ async def search_nifi_flow(
         local_logger.error(f"Unexpected error searching NiFi flow: {e}", exc_info=True)
         local_logger.bind(interface="nifi", direction="response", data={"error": str(e)}).debug("Received unexpected error from NiFi API")
         raise ToolError(f"An unexpected error occurred: {e}") from e
+
+@mcp.tool()
+@tool_phases(["Review", "Operate"])
+async def get_process_group_status(
+    process_group_id: str | None = None,
+    include_bulletins: bool = True,
+    bulletin_limit: int = 20,
+) -> Dict[str, Any]:
+    """
+    Provides a consolidated status overview of a process group.
+
+    Includes component state summaries, validation issues, connection queue sizes,
+    and optionally, recent bulletins for the group.
+
+    Args:
+        process_group_id: The ID of the target process group. Defaults to root if None.
+        include_bulletins: Whether to fetch and include bulletins specific to this group.
+        bulletin_limit: Max number of bulletins to fetch if include_bulletins is True.
+
+    Returns:
+        A dictionary summarizing the status as defined in the plan.
+    """
+    # Get client, logger, and context IDs
+    nifi_client: Optional[NiFiClient] = current_nifi_client.get()
+    local_logger = current_request_logger.get() or logger
+    user_request_id = current_user_request_id.get() or "-"
+    action_id = current_action_id.get() or "-"
+
+    if not nifi_client:
+        raise ToolError("NiFi client not found in context.")
+
+    local_logger = local_logger.bind(pg_id_param=process_group_id, include_bulletins=include_bulletins)
+    local_logger.info("Getting process group status overview.")
+
+    results = {
+        "process_group_id": None,
+        "process_group_name": "Unknown",
+        "component_summary": {
+            "processors": {"total": 0, "running": 0, "stopped": 0, "invalid": 0, "disabled": 0},
+            "input_ports": {"total": 0, "running": 0, "stopped": 0, "invalid": 0, "disabled": 0},
+            "output_ports": {"total": 0, "running": 0, "stopped": 0, "invalid": 0, "disabled": 0},
+        },
+        "invalid_components": [],
+        "queue_summary": {
+             "total_queued_count": 0,
+             "total_queued_size_bytes": 0,
+             "total_queued_size_human": "0 B",
+             "connections_with_data": []
+        },
+        "bulletins": []
+    }
+
+    try:
+        # --- Step 0: Resolve PG ID and Name ---
+        target_pg_id = process_group_id
+        if not target_pg_id:
+            local_logger.info("process_group_id not provided, resolving root.")
+            target_pg_id = await nifi_client.get_root_process_group_id(user_request_id=user_request_id, action_id=action_id)
+            local_logger.info(f"Resolved root process group ID: {target_pg_id}")
+            results["process_group_name"] = "Root"
+        else:
+            # Use helper to get name, handles errors internally
+            results["process_group_name"] = await _get_process_group_name(target_pg_id)
+        
+        results["process_group_id"] = target_pg_id
+        local_logger = local_logger.bind(process_group_id=target_pg_id) # Bind resolved ID
+
+        # --- Step 1: Get Components (Processors, Connections, Ports) ---
+        local_logger.info("Fetching components (processors, connections, ports)...")
+        # Use asyncio.gather for concurrency
+        tasks = {
+            "processors": nifi_client.list_processors(target_pg_id, user_request_id=user_request_id, action_id=action_id),
+            "connections": nifi_client.list_connections(target_pg_id, user_request_id=user_request_id, action_id=action_id),
+            "input_ports": nifi_client.get_input_ports(target_pg_id),
+            "output_ports": nifi_client.get_output_ports(target_pg_id)
+        }
+        # Log the request details (simplified)
+        nifi_req = {"operation": "list_components", "process_group_id": target_pg_id}
+        local_logger.bind(interface="nifi", direction="request", data=nifi_req).debug("Calling NiFi API (multiple component lists)")
+        
+        component_responses = await asyncio.gather(*tasks.values(), return_exceptions=True)
+        
+        processors_resp, connections_resp, input_ports_resp, output_ports_resp = component_responses
+        
+        # Log the response details (simplified)
+        nifi_resp = {
+            "processor_count": len(processors_resp) if isinstance(processors_resp, list) else -1,
+            "connection_count": len(connections_resp) if isinstance(connections_resp, list) else -1,
+            "input_port_count": len(input_ports_resp) if isinstance(input_ports_resp, list) else -1,
+            "output_port_count": len(output_ports_resp) if isinstance(output_ports_resp, list) else -1,
+        }
+        local_logger.bind(interface="nifi", direction="response", data=nifi_resp).debug("Received from NiFi API (multiple component lists)")
+
+        # Handle potential errors from gather
+        if isinstance(processors_resp, Exception): local_logger.error(f"Error listing processors: {processors_resp}"); processors_resp = []
+        if isinstance(connections_resp, Exception): local_logger.error(f"Error listing connections: {connections_resp}"); connections_resp = []
+        if isinstance(input_ports_resp, Exception): local_logger.error(f"Error listing input ports: {input_ports_resp}"); input_ports_resp = []
+        if isinstance(output_ports_resp, Exception): local_logger.error(f"Error listing output ports: {output_ports_resp}"); output_ports_resp = []
+        
+        # --- Step 2: Process Components for Status and Validation ---
+        local_logger.info("Processing component statuses...")
+        comp_summary = results["component_summary"]
+        invalid_list = results["invalid_components"]
+
+        for proc in processors_resp:
+            comp = proc.get("component", {})
+            state = comp.get("state", "UNKNOWN").lower()
+            comp_summary["processors"]["total"] += 1
+            if state in comp_summary["processors"]: comp_summary["processors"][state] += 1
+            # --- Updated Condition ---
+            validation_status = comp.get("validationStatus", "UNKNOWN") # Get the status
+            if validation_status == "INVALID": # Check specifically for INVALID
+                invalid_list.append({
+                    "id": proc.get("id"),
+                    "name": comp.get("name"),
+                    "type": "processor",
+                    "validation_status": validation_status, # Include the status
+                    "validation_errors": comp.get("validationErrors", [])
+                })
+
+        for port in input_ports_resp:
+            comp = port.get("component", {})
+            state = comp.get("state", "UNKNOWN").lower()
+            comp_summary["input_ports"]["total"] += 1
+            if state in comp_summary["input_ports"]: comp_summary["input_ports"][state] += 1
+            # --- Updated Condition ---
+            validation_status = comp.get("validationStatus", "UNKNOWN") # Get the status
+            if validation_status == "INVALID": # Check specifically for INVALID
+                invalid_list.append({
+                    "id": port.get("id"),
+                    "name": comp.get("name"),
+                    "type": "input_port",
+                    "validation_status": validation_status, # Include the status
+                    "validation_errors": comp.get("validationErrors", [])
+                })
+
+        for port in output_ports_resp:
+            comp = port.get("component", {})
+            state = comp.get("state", "UNKNOWN").lower()
+            comp_summary["output_ports"]["total"] += 1
+            if state in comp_summary["output_ports"]: comp_summary["output_ports"][state] += 1
+            # --- Updated Condition ---
+            validation_status = comp.get("validationStatus", "UNKNOWN") # Get the status
+            if validation_status == "INVALID": # Check specifically for INVALID
+                invalid_list.append({
+                    "id": port.get("id"),
+                    "name": comp.get("name"),
+                    "type": "output_port",
+                    "validation_status": validation_status, # Include the status
+                    "validation_errors": comp.get("validationErrors", [])
+                })
+
+        # --- Step 3: Get Queue Status for Connections ---
+        local_logger.info("Fetching connection queue statuses...")
+        queue_summary = results["queue_summary"]
+        connection_status_tasks = []
+        connection_ids = [conn.get("id") for conn in connections_resp if conn.get("id")]
+        connection_details_map = {conn.get("id"): filter_connection_data(conn) for conn in connections_resp}
+
+        for conn_id in connection_ids:
+            connection_status_tasks.append(nifi_client.get_connection_status(conn_id))
+            
+        nifi_req_q = {"operation": "get_connection_status", "connection_count": len(connection_ids)}
+        local_logger.bind(interface="nifi", direction="request", data=nifi_req_q).debug("Calling NiFi API (connection status)")
+        connection_statuses = await asyncio.gather(*connection_status_tasks, return_exceptions=True)
+        nifi_resp_q = {"results_count": len(connection_statuses)}
+        local_logger.bind(interface="nifi", direction="response", data=nifi_resp_q).debug("Received from NiFi API (connection status)")
+
+        for i, status_result in enumerate(connection_statuses):
+            conn_id = connection_ids[i]
+            conn_details = connection_details_map.get(conn_id, {})
+            if isinstance(status_result, Exception):
+                local_logger.warning(f"Error fetching status for connection {conn_id}: {status_result}")
+                continue
+
+            snapshot = status_result.get("aggregateSnapshot", {})
+            queued_count = int(snapshot.get("flowFilesQueued", 0))
+            queued_bytes = int(snapshot.get("bytesQueued", 0))
+
+            if queued_count > 0:
+                queue_summary["total_queued_count"] += queued_count
+                queue_summary["total_queued_size_bytes"] += queued_bytes
+                queue_summary["connections_with_data"].append({
+                    "id": conn_id,
+                    "name": conn_details.get("name"),
+                    "sourceName": conn_details.get("sourceName"),
+                    "destName": conn_details.get("destinationName"),
+                    "queued_count": queued_count,
+                    "queued_size_bytes": queued_bytes,
+                    "queued_size_human": snapshot.get("queuedSize", "0 B") # Use pre-formatted string
+                })
+        # Format total size
+        total_bytes = queue_summary["total_queued_size_bytes"]
+        if total_bytes < 1024:
+            queue_summary["total_queued_size_human"] = f"{total_bytes} B"
+        elif total_bytes < 1024**2:
+            queue_summary["total_queued_size_human"] = f"{total_bytes/1024:.1f} KB"
+        elif total_bytes < 1024**3:
+             queue_summary["total_queued_size_human"] = f"{total_bytes/(1024**2):.1f} MB"
+        else:
+             queue_summary["total_queued_size_human"] = f"{total_bytes/(1024**3):.1f} GB"
+
+        # --- Step 4: Get Bulletins (if requested) ---
+        if include_bulletins:
+            local_logger.info(f"Fetching bulletins (limit {bulletin_limit})...")
+            try:
+                nifi_req_b = {"operation": "get_bulletin_board", "group_id": target_pg_id, "limit": bulletin_limit}
+                local_logger.bind(interface="nifi", direction="request", data=nifi_req_b).debug("Calling NiFi API")
+                bulletins = await nifi_client.get_bulletin_board(group_id=target_pg_id, limit=bulletin_limit)
+                nifi_resp_b = {"bulletin_count": len(bulletins)}
+                local_logger.bind(interface="nifi", direction="response", data=nifi_resp_b).debug("Received from NiFi API")
+                results["bulletins"] = bulletins
+            except Exception as e:
+                local_logger.error(f"Failed to fetch bulletins: {e}")
+                # Continue without bulletins, maybe add an error marker?
+                results["bulletins"] = [{"error": f"Failed to fetch bulletins: {e}"}]
+        else:
+            local_logger.info("Skipping bulletin fetch as per request.")
+            results["bulletins"] = None # Explicitly set to None if not included
+
+        local_logger.info("Process group status overview fetch complete.")
+        return results
+
+    except NiFiAuthenticationError as e:
+         local_logger.error(f"Authentication error getting status for PG {target_pg_id}: {e}", exc_info=False)
+         raise ToolError(f"Authentication error accessing NiFi: {e}") from e
+    except (ValueError, ConnectionError, ToolError) as e:
+        local_logger.error(f"Error getting status for PG {target_pg_id}: {e}", exc_info=False)
+        raise ToolError(f"Error getting status for PG {target_pg_id}: {e}") from e
+    except Exception as e:
+        local_logger.error(f"Unexpected error getting status for PG {target_pg_id}: {e}", exc_info=True)
+        raise ToolError(f"An unexpected error occurred: {e}") from e
+
+@mcp.tool()
+@tool_phases(["Review", "Operate"])
+async def list_flowfiles(
+    target_id: str,
+    target_type: Literal["connection", "processor"],
+    max_results: int = 100,
+    polling_interval: float = 0.5,
+    polling_timeout: float = 30.0 # Increased default timeout to 30s
+) -> Dict[str, Any]:
+    """
+    Lists FlowFile summaries from a connection queue or processor provenance.
+
+    For connections, lists FlowFiles currently queued.
+    For processors, lists FlowFiles recently processed via provenance events.
+
+    Args:
+        target_id: The ID of the connection or processor.
+        target_type: Whether the target_id refers to a 'connection' or 'processor'.
+        max_results: Maximum number of FlowFile summaries to return.
+        polling_interval: Seconds between polling for async request completion (queue/provenance).
+        polling_timeout: Maximum seconds to wait for async request completion.
+
+    Returns:
+        A dictionary containing the list of FlowFile summaries and metadata.
+    """
+    # Get client and logger
+    nifi_client: Optional[NiFiClient] = current_nifi_client.get()
+    local_logger = current_request_logger.get() or logger
+    if not nifi_client:
+        raise ToolError("NiFi client context is not set.")
+
+    local_logger = local_logger.bind(target_id=target_id, target_type=target_type, max_results=max_results)
+    local_logger.info(f"Listing flowfiles for {target_type} {target_id}")
+
+    results = {
+        "target_id": target_id,
+        "target_type": target_type,
+        "listing_source": "unknown",
+        "flowfile_summaries": [],
+        "error": None
+    }
+
+    try:
+        if target_type == "connection":
+            results["listing_source"] = "queue"
+            local_logger.info("Listing via connection queue...")
+            request_id = None
+            try:
+                # 1. Create request
+                nifi_req_create = {"operation": "create_flowfile_listing_request", "connection_id": target_id}
+                local_logger.bind(interface="nifi", direction="request", data=nifi_req_create).debug("Calling NiFi API")
+                listing_request = await nifi_client.create_flowfile_listing_request(target_id)
+                request_id = listing_request.get("id")
+                nifi_resp_create = {"request_id": request_id}
+                local_logger.bind(interface="nifi", direction="response", data=nifi_resp_create).debug("Received from NiFi API")
+                if not request_id:
+                    raise ToolError("Failed to get request ID from NiFi for queue listing.")
+                local_logger.info(f"Submitted queue listing request: {request_id}")
+
+                # 2. Poll for completion
+                start_time = asyncio.get_event_loop().time()
+                while True:
+                    if (asyncio.get_event_loop().time() - start_time) > polling_timeout:
+                        raise TimeoutError(f"Timed out waiting for queue listing request {request_id} to complete.")
+                    
+                    nifi_req_get = {"operation": "get_flowfile_listing_request", "connection_id": target_id, "request_id": request_id}
+                    local_logger.bind(interface="nifi", direction="request", data=nifi_req_get).debug("Calling NiFi API (polling)")
+                    request_status = await nifi_client.get_flowfile_listing_request(target_id, request_id)
+                    nifi_resp_get = {"finished": request_status.get("finished"), "percentCompleted": request_status.get("percentCompleted")}
+                    local_logger.bind(interface="nifi", direction="response", data=nifi_resp_get).debug("Received from NiFi API (polling)")
+                    
+                    if request_status.get("finished"): 
+                        local_logger.info(f"Queue listing request {request_id} finished.")
+                        # 3. Extract results (already in the final status response)
+                        summaries_raw = request_status.get("flowFileSummaries", [])
+                        # Limit results here if necessary, though API might have internal limit
+                        results["flowfile_summaries"] = [
+                            {
+                                "uuid": ff.get("uuid"),
+                                "filename": ff.get("filename"),
+                                "size": ff.get("size"),
+                                "queued_duration": ff.get("queuedDuration"),
+                                "attributes": ff.get("attributes", {}), # Queue listing includes attributes
+                                "position": ff.get("position")
+                            }
+                            for ff in summaries_raw[:max_results]
+                        ]
+                        break
+                    await asyncio.sleep(polling_interval)
+
+            finally:
+                 # 4. Delete request (always attempt cleanup)
+                 if request_id:
+                    local_logger.info(f"Cleaning up queue listing request {request_id}...")
+                    try:
+                        nifi_req_del = {"operation": "delete_flowfile_listing_request", "connection_id": target_id, "request_id": request_id}
+                        local_logger.bind(interface="nifi", direction="request", data=nifi_req_del).debug("Calling NiFi API")
+                        await nifi_client.delete_flowfile_listing_request(target_id, request_id)
+                        local_logger.bind(interface="nifi", direction="response", data={"deleted": True}).debug("Received from NiFi API")
+                    except Exception as del_e:
+                        local_logger.warning(f"Failed to delete queue listing request {request_id}: {del_e}")
+                        # Don't fail the whole operation if cleanup fails
+
+        elif target_type == "processor":
+            results["listing_source"] = "provenance"
+            local_logger.info("Listing via processor provenance...")
+            query_id = None
+            try:
+                # 1. Submit query
+                provenance_payload = {
+                    "searchTerms": {"componentId": target_id},
+                    # "maxResults": max_results, # Removed - Let client handle default, limit applied after fetch/sort
+                    # "summarize": True, # May be useful later?
+                    # "sortColumn": "eventTime", # Default is usually time - sorting handled client-side now
+                    # "sortOrder": "DESC"     # Default is usually time - sorting handled client-side now
+                }
+                nifi_req_create = {"operation": "submit_provenance_query", "payload": provenance_payload}
+                local_logger.bind(interface="nifi", direction="request", data=nifi_req_create).debug("Calling NiFi API")
+                query_response = await nifi_client.submit_provenance_query(provenance_payload)
+                # --- Corrected ID extraction ---
+                # query_id = query_response.get("query", {}).get("id") # Old incorrect way
+                query_id = query_response.get("id") # Correct: ID is directly in the returned dict
+                # -----------------------------
+                nifi_resp_create = {"query_id": query_id}
+                local_logger.bind(interface="nifi", direction="response", data=nifi_resp_create).debug("Received from NiFi API")
+                if not query_id:
+                    raise ToolError("Failed to get query ID from NiFi for provenance search.")
+                local_logger.info(f"Submitted provenance query: {query_id}")
+
+                # 2. Poll for completion
+                start_time = asyncio.get_event_loop().time()
+                while True:
+                    if (asyncio.get_event_loop().time() - start_time) > polling_timeout:
+                        raise TimeoutError(f"Timed out waiting for provenance query {query_id} to complete.")
+
+                    nifi_req_get = {"operation": "get_provenance_query", "query_id": query_id}
+                    local_logger.bind(interface="nifi", direction="request", data=nifi_req_get).debug("Calling NiFi API (polling)")
+                    query_status = await nifi_client.get_provenance_query(query_id)
+                    nifi_resp_get = {"finished": query_status.get("query", {}).get("finished"), "percentCompleted": query_status.get("query", {}).get("percentCompleted")}
+                    local_logger.bind(interface="nifi", direction="response", data=nifi_resp_get).debug("Received from NiFi API (polling)")
+
+                    # --- Corrected Finished Check ---
+                    # if query_status.get("query", {}).get("finished"): # Old incorrect check
+                    if query_status.get("finished"): # Correct check directly on the status dict
+                    # ------------------------------
+                        local_logger.info(f"Provenance query {query_id} finished.")
+                        # 3. Get results
+                        # get_provenance_results already handles getting from completed query
+                        events = await nifi_client.get_provenance_results(query_id)
+                        
+                        # --- Added Logging for Raw Events --- 
+                        local_logger.debug(f"Retrieved {len(events)} raw provenance events from client.")
+                        # if events:
+                        #      local_logger.trace(f"First raw event details: {events[0]}") # Log first event details
+                        # ------------------------------------
+
+                        # --- Client-side Sorting & Limiting --- 
+                        def parse_event_time(event_time_str: str) -> Optional[datetime]:
+                            """Helper to parse NiFi timestamp string, stripping timezone."""
+                            try:
+                                # Expect format like "04/27/2025 10:55:06.137 EDT"
+                                time_part = event_time_str.rsplit(' ', 1)[0] # Remove timezone part
+                                return datetime.strptime(time_part, "%m/%d/%Y %H:%M:%S.%f")
+                            except (ValueError, IndexError, AttributeError) as e:
+                                local_logger.warning(f"Could not parse eventTime '{event_time_str}': {e}")
+                                return None
+
+                        # Sort events by time descending (most recent first)
+                        sorted_events = sorted(
+                            [e for e in events if parse_event_time(e.get("eventTime", "")) is not None], # Filter out unparseable
+                            key=lambda e: parse_event_time(e["eventTime"]), 
+                            reverse=True
+                        )
+                        
+                        # Apply max_results limit
+                        limited_events = sorted_events[:max_results]
+                        local_logger.debug(f"Applied max_results={max_results}, using {len(limited_events)} events for summary.")
+                        # -------------------------------------
+                        
+                        # Format events into summaries
+                        # Note: Provenance events might show multiple stages for the same FlowFile.
+                        # We will return one entry per event for simplicity, ordered by event time (default). 
+                        results["flowfile_summaries"] = [
+                            {
+                                "uuid": event.get("flowFileUuid"),
+                                "filename": event.get("previousAttributes", {}).get("filename") or event.get("updatedAttributes", {}).get("filename"), # Try both
+                                # "size": event.get("fileSize"), # Use bytes value instead
+                                "size_bytes": event.get("fileSizeBytes"), # Corrected field
+                                "event_id": event.get("eventId"),
+                                "event_type": event.get("eventType"),
+                                "event_time": event.get("eventTime"),
+                                "component_name": event.get("componentName"),
+                                "attributes": event.get("updatedAttributes", {}), # Use updated attributes for the event
+                            }
+                            for event in limited_events # Use the sorted and limited list
+                        ]
+                        break
+                    await asyncio.sleep(polling_interval)
+
+            finally:
+                # 4. Delete query
+                if query_id:
+                    local_logger.info(f"Cleaning up provenance query {query_id}...")
+                    try:
+                        nifi_req_del = {"operation": "delete_provenance_query", "query_id": query_id}
+                        local_logger.bind(interface="nifi", direction="request", data=nifi_req_del).debug("Calling NiFi API")
+                        await nifi_client.delete_provenance_query(query_id)
+                        local_logger.bind(interface="nifi", direction="response", data={"deleted": True}).debug("Received from NiFi API")
+                    except Exception as del_e:
+                        local_logger.warning(f"Failed to delete provenance query {query_id}: {del_e}")
+
+        else:
+            raise ToolError(f"Invalid target_type: {target_type}. Must be 'connection' or 'processor'.")
+
+        local_logger.info(f"Successfully listed {len(results['flowfile_summaries'])} flowfile summaries.")
+        return results
+
+    except (NiFiAuthenticationError, ConnectionError, ToolError, ValueError, TimeoutError) as e:
+        local_logger.error(f"Error listing flowfiles for {target_type} {target_id}: {e}", exc_info=False)
+        results["error"] = str(e)
+        # Return partial results with error message
+        return results
+    except Exception as e:
+        local_logger.error(f"Unexpected error listing flowfiles for {target_type} {target_id}: {e}", exc_info=True)
+        results["error"] = f"An unexpected error occurred: {e}"
+        # Return partial results with error message
+        return results
+
+@mcp.tool()
+@tool_phases(["Review", "Operate"])
+async def get_flowfile_event_details( # Renamed function
+    event_id: int, # Changed parameter from flowfile_uuid
+    max_content_bytes: int = 4096
+    # Removed target_id, target_type, polling params
+) -> Dict[str, Any]:
+    """
+    Retrieves detailed attributes and content for a specific FlowFile provenance event.
+
+    Fetches the event details using the event ID and attempts to retrieve both the 
+    input and output content associated with that event, subject to availability and limits.
+
+    Args:
+        event_id: The specific numeric ID of the provenance event.
+        max_content_bytes: Max bytes of content to return for EACH direction (input/output).
+                           -1 for unlimited (use with caution).
+
+    Returns:
+        A dictionary containing the event and content details.
+    """
+    # Get client and logger
+    nifi_client: Optional[NiFiClient] = current_nifi_client.get()
+    local_logger = current_request_logger.get() or logger
+    if not nifi_client:
+        raise ToolError("NiFi client context is not set.")
+
+    local_logger = local_logger.bind(
+        event_id=event_id, 
+        max_content_bytes=max_content_bytes
+    )
+    local_logger.info("Getting FlowFile event details.")
+
+    # Initialize results structure
+    results = {
+        "status": "error",
+        "message": "",
+        "event_id": event_id,
+        "event_details": None,
+        "attributes": None,
+        "input_content_available": False,
+        "input_content_truncated": False,
+        "input_content_bytes": 0,
+        "input_content": None, # Store content as string (decoded or base64)
+        "output_content_available": False,
+        "output_content_truncated": False,
+        "output_content_bytes": 0,
+        "output_content": None # Store content as string (decoded or base64)
+    }
+    
+    # Helper function to process content stream
+    async def _process_content(direction: Literal["input", "output"]) -> None:
+        nonlocal results # Allow modifying the outer results dict
+        content_resp = None
+        try:
+            nifi_req_content = {"operation": "get_provenance_event_content", "event_id": event_id, "direction": direction}
+            local_logger.bind(interface="nifi", direction="request", data=nifi_req_content).debug(f"Calling NiFi API for {direction} content")
+            content_resp = await nifi_client.get_provenance_event_content(event_id, direction)
+            local_logger.bind(interface="nifi", direction="response", data={
+                "status_code": content_resp.status_code, 
+                "headers": dict(content_resp.headers)
+                }).debug(f"Received from NiFi API for {direction} content")
+            
+            results[f"{direction}_content_available"] = True
+            content_bytes_list = []
+            bytes_read = 0
+            async for chunk in content_resp.aiter_bytes():
+                if max_content_bytes != -1 and (bytes_read + len(chunk)) > max_content_bytes:
+                    chunk = chunk[:max_content_bytes - bytes_read]
+                    content_bytes_list.append(chunk)
+                    bytes_read += len(chunk)
+                    results[f"{direction}_content_truncated"] = True
+                    local_logger.warning(f"{direction.capitalize()} content truncated to {max_content_bytes} bytes.")
+                    break
+                content_bytes_list.append(chunk)
+                bytes_read += len(chunk)
+            
+            results[f"{direction}_content_bytes"] = bytes_read
+            full_content_bytes = b"".join(content_bytes_list)
+            
+            # Attempt to decode as UTF-8, fallback to base64
+            try:
+                results[f"{direction}_content"] = full_content_bytes.decode('utf-8')
+                local_logger.info(f"Successfully fetched and decoded {bytes_read} bytes of {direction} content.")
+            except UnicodeDecodeError:
+                import base64
+                results[f"{direction}_content"] = base64.b64encode(full_content_bytes).decode('ascii')
+                local_logger.warning(f"Fetched {bytes_read} bytes of {direction} content, but failed to decode as UTF-8. Returning as base64.")
+        
+        except ValueError as content_err:
+             # Specific error from get_provenance_event_content (e.g., 404)
+             local_logger.warning(f"Could not retrieve {direction} content for event {event_id}: {content_err}")
+             results[f"{direction}_content_available"] = False
+        except Exception as content_exc:
+             local_logger.error(f"Unexpected error retrieving {direction} content for event {event_id}: {content_exc}", exc_info=True)
+             results[f"{direction}_content_available"] = False
+             results["message"] += f" Unexpected error retrieving {direction} content." # Append error info
+        finally:
+             if content_resp:
+                 await content_resp.aclose()
+                 local_logger.debug(f"Closed {direction} content response stream.")
+
+    try:
+        # --- Step 1: Get Event Details --- 
+        local_logger.info(f"Fetching details for provenance event {event_id}...")
+        nifi_req_event = {"operation": "get_provenance_event", "event_id": event_id}
+        local_logger.bind(interface="nifi", direction="request", data=nifi_req_event).debug("Calling NiFi API")
+        event_details = await nifi_client.get_provenance_event(event_id)
+        local_logger.bind(interface="nifi", direction="response", data=event_details).debug("Received from NiFi API")
+
+        if not event_details:
+             raise ValueError(f"No details returned for event {event_id}.")
+
+        results["event_details"] = event_details # Store raw event details
+        # Attributes can be complex, decide how much to expose
+        # Using the flattened list structure like the UI might be good
+        results["attributes"] = event_details.get("attributes", []) 
+        local_logger.info(f"Found event {event_id} (Type: {event_details.get('eventType')}). Details retrieved.")
+
+        # --- Step 2: Get Input Content --- 
+        if event_details.get("inputContentAvailable"): # Check if claim exists
+            local_logger.info(f"Input content reported as available for event {event_id}. Attempting fetch...")
+            await _process_content("input")
+        else:
+             local_logger.info(f"Input content not available for event {event_id}.")
+             results["input_content_available"] = False
+
+        # --- Step 3: Get Output Content --- 
+        if event_details.get("outputContentAvailable"): # Check if claim exists
+            local_logger.info(f"Output content reported as available for event {event_id}. Attempting fetch...")
+            await _process_content("output")
+        else:
+             local_logger.info(f"Output content not available for event {event_id}.")
+             results["output_content_available"] = False
+
+        # --- Final Status --- 
+        if results["attributes"] is not None:
+            results["status"] = "success"
+            if results["input_content_available"] or results["output_content_available"]:
+                results["message"] = f"Successfully retrieved event details and available content for event {event_id}."
+            else:
+                 results["message"] = f"Successfully retrieved event details for event {event_id}. No content was available."
+        else:
+            # Should have errored earlier if event details failed, but good fallback
+            results["message"] = f"Failed to retrieve details for event {event_id}."
+        
+        return results
+
+    except (NiFiAuthenticationError, ConnectionError, ToolError, ValueError, TimeoutError) as e:
+        local_logger.error(f"Error getting flowfile event details for event {event_id}: {e}", exc_info=False)
+        results["status"] = "error"
+        results["message"] = str(e)
+        return results
+    except Exception as e:
+        local_logger.error(f"Unexpected error getting flowfile event details for event {event_id}: {e}", exc_info=True)
+        results["status"] = "error"
+        results["message"] = f"An unexpected error occurred: {e}"
+        return results
+    # Removed finally block with query cleanup as query is no longer submitted here

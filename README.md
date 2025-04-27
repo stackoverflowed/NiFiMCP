@@ -62,3 +62,36 @@ To set up the development environment and install all dependencies, follow these
    python -m streamlit run nifi_chat_ui/app.py
    ```
 
+## Running Automated Tests
+
+A test script is included to verify the core functionality of the NiFi MCP tools via the REST API.
+
+1.  **Ensure the MCP Server is Running:**
+    Follow step 6 in the Setup Instructions to start the server:
+    ```bash
+    uvicorn nifi_mcp_server.server:app --reload --port 8000 
+    ```
+
+2.  **Set the Target NiFi Instance ID:**
+    The test script needs to know which configured NiFi server instance to target. Set the `NIFI_TEST_SERVER_ID` environment variable to the `id` of the desired server from your `config.yaml`.
+    - On macOS/Linux:
+      ```bash
+      export NIFI_TEST_SERVER_ID="your_nifi_server_id_here"
+      ```
+    - On Windows (Command Prompt):
+      ```bash
+      set NIFI_TEST_SERVER_ID="your_nifi_server_id_here"
+      ```
+    - On Windows (PowerShell):
+      ```bash
+      $env:NIFI_TEST_SERVER_ID="your_nifi_server_id_here"
+      ```
+    *Replace `"your_nifi_server_id_here"` with the actual ID.*
+
+3.  **Run the Test Script:**
+    Execute the script from the project root directory:
+    ```bash
+    python -m tests.test_nifi_tools
+    ```
+    The script will output logs indicating the progress and success or failure of each step. It will create and then clean up a process group named `mcp-auto-test-pg-...` on the target NiFi instance.
+

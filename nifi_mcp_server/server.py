@@ -9,6 +9,7 @@ import os
 import sys
 from loguru import logger 
 from docstring_parser import parse 
+from contextlib import asynccontextmanager # Added import
 
 # --- Setup Logging --- 
 try:
@@ -76,9 +77,32 @@ from config.settings import get_nifi_servers # Added
 
 
 # === FastAPI Application Setup === #
+
+# --- Lifespan Context Manager --- #
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup logic
+    logger.info("FastAPI server starting up...")
+    if not get_nifi_servers():
+        logger.warning("*******************************************************")
+        logger.warning("*** No NiFi servers configured in config.yaml!      ***")
+        logger.warning("*** The /tools/{tool_name} endpoint will not work! ***")
+        logger.warning("*******************************************************")
+    else:
+        logger.info(f"Found {len(get_nifi_servers())} NiFi server configurations.")
+    
+    yield # Application runs here
+    
+    # Shutdown logic (moved from shutdown_event and cleanup)
+    logger.info("FastAPI server shutting down...")
+    # Call cleanup logic directly here if needed in the future
+    # await cleanup() 
+    logger.info("Cleanup finished.")
+
 app = FastAPI(
     title="NiFi MCP REST Bridge", 
-    description="Exposes NiFi MCP tools via a REST API."
+    description="Exposes NiFi MCP tools via a REST API.",
+    lifespan=lifespan # Use the lifespan manager
 )
 
 # --- CORS Middleware --- #
@@ -90,23 +114,23 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- FastAPI Event Handlers --- #
-@app.on_event("startup")
-async def startup_event():
-    logger.info("FastAPI server starting up...")
-    # Check if any NiFi servers are configured
-    if not get_nifi_servers():
-        logger.warning("*******************************************************")
-        logger.warning("*** No NiFi servers configured in config.yaml!      ***")
-        logger.warning("*** The /tools/{tool_name} endpoint will not work! ***")
-        logger.warning("*******************************************************")
-    else:
-        logger.info(f"Found {len(get_nifi_servers())} NiFi server configurations.")
+# --- FastAPI Event Handlers (REMOVED) --- #
+# @app.on_event("startup")
+# async def startup_event():
+#     logger.info("FastAPI server starting up...")
+#     # Check if any NiFi servers are configured
+#     if not get_nifi_servers():
+#         logger.warning("*******************************************************")
+#         logger.warning("*** No NiFi servers configured in config.yaml!      ***")
+#         logger.warning("*** The /tools/{tool_name} endpoint will not work! ***")
+#         logger.warning("*******************************************************")
+#     else:
+#         logger.info(f"Found {len(get_nifi_servers())} NiFi server configurations.")
 
-@app.on_event("shutdown")
-async def shutdown_event():
-    logger.info("FastAPI server shutting down...")
-    await cleanup()
+# @app.on_event("shutdown")
+# async def shutdown_event():
+#     logger.info("FastAPI server shutting down...")
+#     await cleanup()
 
 # --- REST API Endpoints --- #
 
@@ -426,13 +450,13 @@ async def execute_tool(
             await nifi_client.close() # Ensure connection is closed after request
         # -------------------------- #
 
-# --- Cleanup Function --- #
-async def cleanup():
-    logger.info("Running cleanup...")
-    # No global client to close anymore
-    # if nifi_api_client:
-    #     await nifi_api_client.close()
-    logger.info("Cleanup finished.")
+# --- Cleanup Function (REMOVED - Logic moved to lifespan) --- #
+# async def cleanup():
+#     logger.info("Running cleanup...")
+#     # No global client to close anymore
+#     # if nifi_api_client:
+#     #     await nifi_api_client.close()
+#     logger.info("Cleanup finished.")
 
 # Run with uvicorn if this module is run directly
 if __name__ == "__main__":

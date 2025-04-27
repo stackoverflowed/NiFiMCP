@@ -31,7 +31,7 @@ async def create_nifi_processor(
     position_x: int,
     position_y: int,
     process_group_id: str | None = None,
-    # config: Optional[Dict[str, Any]] = None
+    config: Optional[Dict[str, Any]] = None
 ) -> Dict:
     """
     Creates a new processor within a specified NiFi process group.
@@ -42,6 +42,7 @@ async def create_nifi_processor(
         position_x: The desired X coordinate.
         position_y: The desired Y coordinate.
         process_group_id: The UUID of the target process group. Defaults to root.
+        config: The configuration for the processor.
 
     Returns:
         A dictionary representing the result, including status and the created entity.
@@ -88,7 +89,7 @@ async def create_nifi_processor(
             "processor_type": processor_type,
             "name": name,
             "position": position,
-            "config": None
+            "config": config
         }
         local_logger.bind(interface="nifi", direction="request", data=nifi_request_data).debug("Calling NiFi API")
         processor_entity = await nifi_client.create_processor(
@@ -96,7 +97,7 @@ async def create_nifi_processor(
             processor_type=processor_type,
             name=name,
             position=position,
-            config=None
+            config=config
         )
         nifi_response_data = filter_created_processor_data(processor_entity)
         local_logger.bind(interface="nifi", direction="response", data=nifi_response_data).debug("Received from NiFi API")
@@ -514,7 +515,6 @@ async def create_nifi_flow(
             Preferred Processor Format: {"type": "processor", "class": "org.apache.nifi...", "name": "MyProc", "position": {"x": X, "y": Y}, "properties": {...}}
             Preferred Connection Format: {"type": "connection", "source": "MyProc", "dest": "OtherProc", "relationships": ["success"]} # Use 'name' from a processor in this list for 'source' and 'dest'
             Note: Processor 'name' is used for mapping connections and must be unique within this list. The tool attempts to parse common variations, but the preferred format is recommended.
-            Important: Processor 'properties' provided here are currently IGNORED during creation. Use the 'update_nifi_processor_properties' tool afterwards.
         process_group_id: The ID of the existing process group to create the flow in. Ignored if `create_process_group` is provided.
         create_process_group: Optional. If provided, a new process group is created with this configuration {"name": "NewGroup", "position_x": X, "position_y": Y} and the flow is built inside it.
 
@@ -617,20 +617,13 @@ async def create_nifi_flow(
                     name=proc_name,
                     position_x=pos_x,
                     position_y=pos_y,
-                    process_group_id=target_pg_id
+                    process_group_id=target_pg_id,
+                    config=properties
                 )
                 # We also need to apply the properties if provided
                 created_proc_id = None
                 if proc_creation_result.get("status") != "error":
                     created_proc_id = proc_creation_result.get("entity", {}).get("id")
-                    if created_proc_id and properties:
-                        local_logger.info(f"Processor '{proc_name}' created ({created_proc_id}), now applying properties...")
-                        # Need modification tool here - requires importing and calling update_nifi_processor_properties
-                        # This adds complexity - might be better to modify create_nifi_processor to accept config
-                        # For now, log a warning that properties were ignored during creation
-                        local_logger.warning(f"Properties provided for processor '{proc_name}' were ignored during initial creation. Use update tool.")
-                        proc_creation_result["warning"] = "Properties provided but not applied during creation. Use update tool."
-                        
                 proc_creation_result["name_used_for_mapping"] = proc_name
                 results.append(proc_creation_result)
 
