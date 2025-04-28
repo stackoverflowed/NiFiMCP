@@ -36,6 +36,13 @@ async def create_nifi_processor(
     """
     Creates a new processor within a specified NiFi process group.
 
+    Example:
+    ```python
+    nifi_objects = [
+        {"type": "processor", "class": "org.apache.nifi.processors.standard.LogAttribute", "name": "LogAttribute", "position": {"x": 100, "y": 100}, "properties": {"Attribute": "mcp-test-log"}}
+    ]
+    ```
+
     Args:
         processor_type: The fully qualified Java class name of the processor type.
         name: The desired name for the new processor instance.
@@ -509,6 +516,15 @@ async def create_nifi_flow(
     """
     Creates a NiFi flow based on a list of processors and connections.
     Can optionally create a new process group to contain the flow.
+
+    Example:
+    ```python
+    nifi_objects = [
+        {"type": "processor", "class": "org.apache.nifi.processors.standard.LogAttribute", "name": "LogAttribute", "position": {"x": 100, "y": 100}, "properties": {"Attribute": "mcp-test-log"}},
+        {"type": "processor", "class": "org.apache.nifi.processors.standard.GenerateFlowFile", "name": "GenerateFlowFile", "position": {"x": 200, "y": 200}},
+        {"type": "connection", "source": "LogAttribute", "dest": "GenerateFlowFile", "relationships": ["success"]}
+    ]
+    ```
 
     Args:
         nifi_objects: A list where each item describes a processor or connection.

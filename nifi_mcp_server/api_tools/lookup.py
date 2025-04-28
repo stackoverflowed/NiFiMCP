@@ -72,19 +72,31 @@ async def lookup_nifi_processor_type(
         filter_artifact_lower = bundle_artifact_filter.lower() if bundle_artifact_filter else None
 
         for proc_type in all_types:
-            # Use title if available, otherwise guess from type
-            display_name = proc_type.get("title", proc_type.get("type", "").split('.')[-1]) 
-            
-            if display_name.lower() == search_name_lower:
+            # Extract relevant fields, ensuring they are strings and lowercased
+            title = proc_type.get("title", "").lower()
+            type_str = proc_type.get("type", "").lower()
+            description = proc_type.get("description", "").lower()
+            tags = [tag.lower() for tag in proc_type.get("tags", [])] # Lowercase all tags
+
+            # Check if the search term is present in any relevant field
+            name_match_found = (
+                search_name_lower in title or
+                search_name_lower in type_str or
+                search_name_lower in description or
+                any(search_name_lower in tag for tag in tags)
+            )
+
+            if name_match_found:
+                # Apply bundle artifact filter if specified
                 if filter_artifact_lower:
                     bundle = proc_type.get("bundle", {})
-                    artifact = bundle.get("artifact", "")
-                    if artifact.lower() == filter_artifact_lower:
+                    artifact = bundle.get("artifact", "").lower()
+                    if artifact == filter_artifact_lower: # Check lowercase artifact
                         matches.append(_format_processor_type_summary(proc_type))
                 else:
                     matches.append(_format_processor_type_summary(proc_type))
 
-        local_logger.info(f"Found {len(matches)} match(es)")
+        local_logger.info(f"Found {len(matches)} match(es) for '{processor_name}'")
         
         if len(matches) == 1:
             return matches[0]

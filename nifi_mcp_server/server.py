@@ -10,6 +10,7 @@ import sys
 from loguru import logger 
 from docstring_parser import parse 
 from contextlib import asynccontextmanager # Added import
+from textwrap import dedent # <-- IMPORT ADDED
 
 # --- Setup Logging --- 
 try:
@@ -208,7 +209,46 @@ async def get_tools(
                     base_description = raw_docstring.split('\n\n')[0] # Original fallback
                     bound_logger.trace(f"Falling back to basic description for tool '{tool_name}' (parsing empty?)")
 
-                tool_description = f"{base_description}{returns_description}"
+                # --- BEGIN ADDITION: Extract Example section ---
+                example_section = ""
+                example_markers = ["Example:\n", "Examples:\n"] # Check for both singular and plural
+                normalized_docstring = "\n" + raw_docstring # Ensure leading newline for marker check at start
+
+                marker_found = None
+                marker_start_index = -1
+                for marker in example_markers:
+                    found_index = normalized_docstring.find(marker)
+                    if found_index != -1:
+                        marker_found = marker
+                        marker_start_index = found_index
+                        break
+                
+                if marker_found:
+                    # Start content search *after* the marker
+                    content_start_index = marker_start_index + len(marker_found)
+                    potential_example_content = normalized_docstring[content_start_index:]
+
+                    # Find the end of the example block by looking for the next common section marker
+                    next_section_markers = ["Args:\n", "Returns:\n", "Raises:\n", "Attributes:\n", "Yields:\n"] # Add others if needed
+                    end_index = len(potential_example_content) # Default to end of string
+
+                    for next_marker in next_section_markers:
+                         found_index = potential_example_content.find(next_marker)
+                         if found_index != -1:
+                            end_index = min(end_index, found_index)
+
+                    # Dedent the extracted block before stripping
+                    raw_example_content = potential_example_content[:end_index]
+                    dedented_content = dedent(raw_example_content)
+                    example_content = dedented_content.strip() # Strip after dedenting
+                    
+                    if example_content:
+                         # Re-add the marker itself (stripped) and format with bold markdown around it
+                         example_section = f"\n\n**{marker_found.strip()}**\n{example_content}\n\n"
+                         bound_logger.trace(f"Extracted Example section for tool '{tool_name}'")
+                # --- END ADDITION ---
+
+                tool_description = f"{base_description}{example_section}{returns_description}"
 
                 param_descriptions = {p.arg_name: p.description for p in parsed_docstring.params}
                 raw_params_schema = getattr(tool_info, 'parameters', {})
