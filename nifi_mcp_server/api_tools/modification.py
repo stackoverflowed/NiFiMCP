@@ -29,6 +29,18 @@ async def update_nifi_processor_properties(
     """
     Updates a processor's configuration properties by *replacing* the existing property dictionary.
 
+    Example:
+    ```python
+    {
+        "processor_id": "123e4567-e89b-12d3-a456-426614174000",
+        "processor_config_properties": {
+            "Property1": "Value1",
+            "Property2": "Value2",
+            ...
+        }
+    }
+    ```
+
     Args:
         processor_id: The UUID of the processor to update.
         processor_config_properties: A complete dictionary representing the desired final state of all properties. Cannot be empty.

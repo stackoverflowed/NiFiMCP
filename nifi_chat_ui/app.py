@@ -48,7 +48,7 @@ except ImportError:
 # ---------------------
 
 # Restore imports
-from chat_manager import get_gemini_response, get_openai_response, get_formatted_tool_definitions
+from chat_manager import get_gemini_response, get_openai_response, get_formatted_tool_definitions, calculate_input_tokens
 from chat_manager import configure_llms, is_initialized
 from mcp_handler import get_available_tools, execute_mcp_tool, get_nifi_servers
 # Import config from the new location
@@ -77,11 +77,11 @@ if "messages" not in st.session_state:
 if "current_objective" not in st.session_state:
     st.session_state.current_objective = ""
     
-# Initialize recovery flags
-# if "run_recovery_loop" not in st.session_state:
-#     st.session_state.run_recovery_loop = False
-# if "history_cleared_for_next_llm_call" not in st.session_state:
-#     st.session_state.history_cleared_for_next_llm_call = False
+# Initialize auto-pruning settings
+if "auto_prune_history" not in st.session_state:
+    st.session_state.auto_prune_history = False # Default to off
+if "max_tokens_limit" not in st.session_state:
+    st.session_state.max_tokens_limit = 16000 # Default token limit
 
 # --- Fetch NiFi Servers (once per session) ---
 if "nifi_servers" not in st.session_state:
@@ -271,6 +271,21 @@ with st.sidebar:
     else:
          st.warning("No MCP tools available or failed to retrieve.")
          
+    # --- Auto Prune Settings --- 
+    st.markdown("---") # Separator
+    st.checkbox(
+        "Auto-prune History", 
+        key="auto_prune_history", # Binds to session state
+        help="If checked, automatically remove older messages from the context sent to the LLM to stay below the token limit. The full history remains visible in the chat UI."
+    )
+    st.selectbox(
+        "Max Tokens Limit (approx)", 
+        options=[4000, 8000, 16000, 32000, 64000],
+        key="max_tokens_limit", # Binds to session state
+        help="The maximum approximate number of tokens to include in the request to the LLM when auto-pruning is enabled."
+    )
+    # --------------------------
+
     # --- History Clear --- 
     def clear_chat_callback():
         st.session_state.messages = []
@@ -389,91 +404,127 @@ def run_execution_loop(provider: str, model_name: str, base_sys_prompt: str, use
         current_loop_logger.info(f"Starting execution loop iteration {loop_count}")
 
         # --- Prepare context for LLM call (History and System Prompt) ---
-        messages_for_llm = None
-        system_prompt_for_llm = None
-        
-        # Removed history clearing logic based on flag
-        # if st.session_state.get("history_cleared_for_next_llm_call", False):
-        #     current_loop_logger.info("History clear flag set. Preparing recovery context.")
-        #     messages_for_llm = [st.session_state.messages[-1]] if st.session_state.messages else []
-        #     system_prompt_for_llm = base_sys_prompt
-        #     st.session_state.history_cleared_for_next_llm_call = False
-        # else:
-        
-        # Always use current logic for preparing messages
-        current_loop_logger.debug("Using full history and potentially dynamic system prompt.")
-        messages_for_llm = st.session_state.messages
+        # 1. Determine the System Prompt
         current_objective = st.session_state.get("current_objective", "")
         if current_objective and current_objective.strip():
-            system_prompt_for_llm = f"{base_sys_prompt}\\n\\n## Current Objective\\n{current_objective.strip()}"
-            current_loop_logger.debug("Objective found, appending to system prompt.")
+            effective_system_prompt = f"{base_sys_prompt}\n\n## Current Objective\n{current_objective.strip()}"
+            current_loop_logger.debug("Objective found, appending to base system prompt.")
         else:
-            system_prompt_for_llm = base_sys_prompt
+            effective_system_prompt = base_sys_prompt
             current_loop_logger.debug("No objective set, using base system prompt.")
-        # -----------------------------------------------------------------
-
-        # --- Prepare Tools --- 
-        # Get the selected phase
+            
+        # --- Prepare Tools (BEFORE potential pruning) --- 
+        # Get the selected phase and NiFi server ID
         current_phase = st.session_state.get("selected_phase", "All")
-        
-        # Get the selected NiFi server ID
         current_nifi_server_id = st.session_state.get("selected_nifi_server_id")
         if not current_nifi_server_id:
-            # This should ideally not happen if a server is selected, but handle it defensively
             st.error("No NiFi server selected. Please select a server from the sidebar.")
             current_loop_logger.error("Aborting loop: No NiFi server ID found in session state.")
             break # Stop the loop if no server is selected
             
-        current_loop_logger = current_loop_logger.bind(nifi_server_id=current_nifi_server_id) # Bind for loop logging
-        
-        # Fetch the potentially filtered tools based on the selected phase AND server
+        current_loop_logger = current_loop_logger.bind(nifi_server_id=current_nifi_server_id)
         current_loop_logger.debug(f"Fetching tools for phase: {current_phase}, Server ID: {current_nifi_server_id}")
+        
         filtered_raw_tools_list = get_available_tools(
             phase=current_phase, 
             user_request_id=user_req_id, 
-            selected_nifi_server_id=current_nifi_server_id # Pass server ID
+            selected_nifi_server_id=current_nifi_server_id
         )
         
-        # Format the filtered tools for the current provider
         formatted_tools = None
         current_loop_logger.debug(f"Formatting tools for provider: {provider}")
         if filtered_raw_tools_list:
              try:
-                  # Pass the *filtered* list to the formatter
-                  formatted_tools = get_formatted_tool_definitions(provider=provider, raw_tools=filtered_raw_tools_list, user_request_id=user_req_id) 
+                  formatted_tools = get_formatted_tool_definitions(
+                      provider=provider, 
+                      raw_tools=filtered_raw_tools_list, 
+                      user_request_id=user_req_id
+                  ) 
                   if formatted_tools:
                        current_loop_logger.debug(f"Tools successfully formatted for {provider} ({len(formatted_tools)} tools).")
                   else:
-                       current_loop_logger.warning(f"get_formatted_tool_definitions returned None/empty for {provider} with filtered list.")
+                       current_loop_logger.warning(f"get_formatted_tool_definitions returned None/empty for {provider}.")
              except Exception as fmt_e:
                   st.error(f"Error formatting tools for {provider} in loop: {fmt_e}")
                   current_loop_logger.error(f"Error formatting tools for {provider}: {fmt_e}", exc_info=True)
-                  formatted_tools = None # Ensure it's None if formatting fails
-        # ----------------------
+                  formatted_tools = None 
+        # --------------------------------------------------
+            
+        # 2. Initialize LLM context messages (AFTER tool prep, BEFORE pruning)
+        llm_context_messages = [{"role": "system", "content": effective_system_prompt}]
+        llm_context_messages.extend(st.session_state.messages)
+        current_loop_logger.debug(f"Initial llm_context_messages length (incl system prompt): {len(llm_context_messages)}")
+
+        # --- Apply Auto-Pruning (if enabled) --- 
+        if st.session_state.get("auto_prune_history", False):
+            current_loop_logger.info("Auto-pruning enabled. Checking token count...")
+            max_tokens = st.session_state.get("max_tokens_limit", 8000)
+            
+            pruning_iterations = 0
+            while pruning_iterations < 200:
+                pruning_iterations += 1
+                try:
+                    # PASS formatted_tools to the token calculation here
+                    current_tokens = calculate_input_tokens(
+                        llm_context_messages, 
+                        provider, 
+                        model_name, 
+                        tools=formatted_tools # Pass the prepared tools
+                    )
+                    current_loop_logger.debug(f"Current token count (incl. tools): {current_tokens}, Limit: {max_tokens}")
+                except Exception as token_calc_err:
+                    current_loop_logger.error(f"Error calculating tokens during pruning: {token_calc_err}", exc_info=True)
+                    st.warning("Error calculating tokens, cannot prune history accurately.")
+                    break
+
+                if current_tokens > max_tokens and len(llm_context_messages) > 2:
+                    removed_message = llm_context_messages.pop(1)
+                    # Recalculate tokens after removal for logging difference (optional but helpful)
+                    # Note: Recalculating just for logging adds a bit of overhead
+                    try:
+                        new_token_count = calculate_input_tokens(llm_context_messages, provider, model_name, tools=formatted_tools)
+                        tokens_removed = current_tokens - new_token_count
+                    except:
+                        tokens_removed = "N/A"
+                    current_loop_logger.info(f"Pruning message at index 1 (Role: {removed_message.get('role')}, Approx Tokens Removed: {tokens_removed}) to fit token limit.")
+                else:
+                    if current_tokens <= max_tokens:
+                        current_loop_logger.debug("Token count is within limit. No more pruning needed.")
+                    elif len(llm_context_messages) <= 2:
+                        current_loop_logger.warning(f"Cannot prune further. Only system prompt and last user message remain, but token count ({current_tokens}) still exceeds limit ({max_tokens}).")
+                    break
+            else:
+                 current_loop_logger.warning(f"Pruning loop safety break hit after {pruning_iterations} iterations.")
+
+            current_loop_logger.debug(f"Final llm_context_messages length after pruning: {len(llm_context_messages)}")
+        else:
+            current_loop_logger.debug("Auto-pruning disabled.")
+        # ------------------------------------------
+        
+        # --- LLM Action ID --- # Moved Action ID generation closer to the LLM call
+        llm_action_id = str(uuid.uuid4())
+        current_loop_logger = current_loop_logger.bind(action_id=llm_action_id)
 
         # --- Call LLM --- 
-        # Generate a unique Action ID for this specific LLM call
-        llm_action_id = str(uuid.uuid4())
-        current_loop_logger = current_loop_logger.bind(action_id=llm_action_id) # Bind action_id for loop logging
-
+        # Note: formatted_tools was prepared BEFORE the pruning loop
         response_data = None
-        with st.spinner(f"Thinking... (Step {loop_count})"):
+        with st.spinner(f"Thinking... (Step {loop_count}) / Tokens: ~{current_tokens if 'current_tokens' in locals() else 'N/A'}"):
             try:
                 current_loop_logger.info(f"Calling LLM ({provider} - {model_name})...")
                 if provider == "Gemini":
-                    response_data = get_gemini_response(messages=messages_for_llm, 
-                                                        system_prompt=system_prompt_for_llm, 
+                    response_data = get_gemini_response(messages=llm_context_messages, 
+                                                        system_prompt=effective_system_prompt,
                                                         tools=formatted_tools, 
                                                         model_name=model_name, 
                                                         user_request_id=user_req_id, 
-                                                        action_id=llm_action_id) # Pass action_id
+                                                        action_id=llm_action_id)
                 elif provider == "OpenAI":
-                    response_data = get_openai_response(messages=messages_for_llm, 
-                                                        system_prompt=system_prompt_for_llm, 
+                    response_data = get_openai_response(messages=llm_context_messages, 
+                                                        system_prompt=effective_system_prompt, 
                                                         tools=formatted_tools, 
                                                         model_name=model_name, 
                                                         user_request_id=user_req_id,
-                                                        action_id=llm_action_id) # Pass action_id
+                                                        action_id=llm_action_id)
                 else:
                     st.error("Invalid provider selected.")
                     current_loop_logger.error(f"Invalid provider selected: {provider}")

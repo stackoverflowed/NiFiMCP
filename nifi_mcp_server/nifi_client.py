@@ -632,6 +632,83 @@ class NiFiClient:
             logger.error(f"An unexpected error occurred changing state for processor {processor_id}: {e}", exc_info=True)
             raise ConnectionError(f"An unexpected error occurred changing processor state: {e}") from e
 
+    async def get_process_group_status_snapshot(self, process_group_id: str) -> dict:
+        """Fetches the status snapshot for a specific process group, including component states and queue sizes.
+
+        Args:
+            process_group_id: The ID of the target process group.
+
+        Returns:
+            A dictionary containing the process group status snapshot, typically under the 'processGroupStatus' key.
+        """
+        if not self._token:
+            raise NiFiAuthenticationError("Client is not authenticated. Call authenticate() first.")
+
+        client = await self._get_client()
+        endpoint = f"/flow/process-groups/{process_group_id}/status"
+        try:
+            logger.info(f"Fetching status snapshot for process group {process_group_id} from {self.base_url}{endpoint}")
+            response = await client.get(endpoint)
+            response.raise_for_status()
+            status_data = response.json()
+            # The core data is usually within processGroupStatus
+            logger.info(f"Successfully fetched status snapshot for process group {process_group_id}")
+            return status_data.get("processGroupStatus", {}) # Return the main status part
+
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                logger.warning(f"Process group {process_group_id} not found when fetching status snapshot.")
+                raise ValueError(f"Process group with ID {process_group_id} not found.") from e
+            else:
+                logger.error(f"Failed to get status snapshot for process group {process_group_id}: {e.response.status_code} - {e.response.text}")
+                raise ConnectionError(f"Failed to get process group status snapshot: {e.response.status_code}, {e.response.text}") from e
+        except (httpx.RequestError, ValueError) as e:
+            logger.error(f"Error getting status snapshot for process group {process_group_id}: {e}")
+            raise ConnectionError(f"Error getting process group status snapshot: {e}") from e
+        except Exception as e:
+            logger.error(f"An unexpected error occurred getting status snapshot for {process_group_id}: {e}", exc_info=True)
+            raise ConnectionError(f"An unexpected error occurred getting process group status snapshot: {e}") from e
+
+    async def get_bulletin_board(self, group_id: Optional[str] = None, source_id: Optional[str] = None, limit: int = 100) -> List[Dict]:
+        """Fetches bulletins from the NiFi bulletin board, optionally filtered.
+
+        Args:
+            group_id: The ID of the process group to filter bulletins by.
+            source_id: The ID of the source component to filter bulletins by.
+            limit: The maximum number of bulletins to return.
+
+        Returns:
+            A list of bulletin dictionaries.
+        """
+        if not self._token:
+            raise NiFiAuthenticationError("Client is not authenticated. Call authenticate() first.")
+
+        client = await self._get_client()
+        endpoint = "/flow/bulletin-board"
+        params = {"limit": limit}
+        if group_id:
+            params["groupId"] = group_id
+        if source_id:
+            params["sourceId"] = source_id
+
+        try:
+            logger.info(f"Fetching bulletins from {self.base_url}{endpoint} with params: {params}")
+            response = await client.get(endpoint, params=params)
+            response.raise_for_status()
+            bulletins = response.json().get("bulletins", [])
+            logger.info(f"Successfully fetched {len(bulletins)} bulletins.")
+            return bulletins
+
+        except httpx.HTTPStatusError as e:
+            logger.error(f"Failed to get bulletins: {e.response.status_code} - {e.response.text}")
+            raise ConnectionError(f"Failed to get bulletins: {e.response.status_code}, {e.response.text}") from e
+        except (httpx.RequestError, ValueError) as e:
+            logger.error(f"Error getting bulletins: {e}")
+            raise ConnectionError(f"Error getting bulletins: {e}") from e
+        except Exception as e:
+            logger.error(f"An unexpected error occurred getting bulletins: {e}", exc_info=True)
+            raise ConnectionError(f"An unexpected error occurred getting bulletins: {e}") from e
+
     async def get_parameter_context(self, process_group_id: str, user_request_id: str = "-", action_id: str = "-") -> list:
         """Retrieves the parameter context associated with a process group."""
         local_logger = logger.bind(user_request_id=user_request_id, action_id=action_id)
@@ -1284,35 +1361,42 @@ class NiFiClient:
             logger.error(f"An unexpected error occurred updating state for process group {pg_id}: {e}", exc_info=True)
             raise ConnectionError(f"An unexpected error occurred updating process group state: {e}") from e
 
-    async def get_connection_status(self, connection_id: str) -> dict:
-        """Fetches the status (queue size/count) for a specific connection."""
+    async def get_process_group_status_snapshot(self, process_group_id: str) -> dict:
+        """Fetches the status snapshot for a specific process group, including component states and queue sizes.
+
+        Args:
+            process_group_id: The ID of the target process group.
+
+        Returns:
+            A dictionary containing the process group status snapshot, typically under the 'processGroupStatus' key.
+        """
         if not self._token:
             raise NiFiAuthenticationError("Client is not authenticated. Call authenticate() first.")
 
         client = await self._get_client()
-        endpoint = f"/connections/{connection_id}/status"
+        endpoint = f"/flow/process-groups/{process_group_id}/status"
         try:
-            logger.debug(f"Fetching status for connection {connection_id} from {self.base_url}{endpoint}")
+            logger.info(f"Fetching status snapshot for process group {process_group_id} from {self.base_url}{endpoint}")
             response = await client.get(endpoint)
             response.raise_for_status()
             status_data = response.json()
-            # The relevant data is usually within connectionStatus.aggregateSnapshot
-            logger.debug(f"Successfully fetched status for connection {connection_id}")
-            return status_data.get("connectionStatus", {}) # Return the connectionStatus part
+            # The core data is usually within processGroupStatus
+            logger.info(f"Successfully fetched status snapshot for process group {process_group_id}")
+            return status_data.get("processGroupStatus", {}) # Return the main status part
 
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 404:
-                logger.warning(f"Connection {connection_id} not found when fetching status.")
-                raise ValueError(f"Connection with ID {connection_id} not found.") from e
+                logger.warning(f"Process group {process_group_id} not found when fetching status snapshot.")
+                raise ValueError(f"Process group with ID {process_group_id} not found.") from e
             else:
-                logger.error(f"Failed to get status for connection {connection_id}: {e.response.status_code} - {e.response.text}")
-                raise ConnectionError(f"Failed to get connection status: {e.response.status_code}, {e.response.text}") from e
+                logger.error(f"Failed to get status snapshot for process group {process_group_id}: {e.response.status_code} - {e.response.text}")
+                raise ConnectionError(f"Failed to get process group status snapshot: {e.response.status_code}, {e.response.text}") from e
         except (httpx.RequestError, ValueError) as e:
-            logger.error(f"Error getting status for connection {connection_id}: {e}")
-            raise ConnectionError(f"Error getting connection status: {e}") from e
+            logger.error(f"Error getting status snapshot for process group {process_group_id}: {e}")
+            raise ConnectionError(f"Error getting process group status snapshot: {e}") from e
         except Exception as e:
-            logger.error(f"An unexpected error occurred getting connection status for {connection_id}: {e}", exc_info=True)
-            raise ConnectionError(f"An unexpected error occurred getting connection status: {e}") from e
+            logger.error(f"An unexpected error occurred getting status snapshot for {process_group_id}: {e}", exc_info=True)
+            raise ConnectionError(f"An unexpected error occurred getting process group status snapshot: {e}") from e
 
     async def get_bulletin_board(self, group_id: Optional[str] = None, source_id: Optional[str] = None, limit: int = 100) -> List[Dict]:
         """Fetches bulletins from the NiFi bulletin board, optionally filtered.

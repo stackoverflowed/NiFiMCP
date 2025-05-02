@@ -1082,46 +1082,80 @@ async def get_process_group_status(
                     "validation_errors": comp.get("validationErrors", [])
                 })
 
-        # --- Step 3: Get Queue Status for Connections ---
-        local_logger.info("Fetching connection queue statuses...")
+        # --- Step 3: Get Queue Status for Connections --- 
+        local_logger.info("Fetching connection queue statuses via process group snapshot...")
         queue_summary = results["queue_summary"]
-        connection_status_tasks = []
-        connection_ids = [conn.get("id") for conn in connections_resp if conn.get("id")]
-        connection_details_map = {conn.get("id"): filter_connection_data(conn) for conn in connections_resp}
+        # Clear previous connection-specific details needed for old method
+        # connection_status_tasks = []
+        # connection_ids = [conn.get("id") for conn in connections_resp if conn.get("id")]
+        # connection_details_map = {conn.get("id"): filter_connection_data(conn) for conn in connections_resp}
+        
+        # Fetch the single status snapshot for the entire group
+        nifi_req_q = {"operation": "get_process_group_status_snapshot", "process_group_id": target_pg_id}
+        local_logger.bind(interface="nifi", direction="request", data=nifi_req_q).debug("Calling NiFi API")
+        group_status_snapshot = {}
+        try:
+            group_status_snapshot = await nifi_client.get_process_group_status_snapshot(target_pg_id)
+            nifi_resp_q = {"has_snapshot": bool(group_status_snapshot)}
+            local_logger.bind(interface="nifi", direction="response", data=nifi_resp_q).debug("Received from NiFi API")
+        except (ConnectionError, ValueError, NiFiAuthenticationError) as status_err:
+             local_logger.error(f"Failed to get process group status snapshot for queue summary: {status_err}")
+             # Log error but continue, queue summary will be empty/zero
+             nifi_resp_q = {"error": str(status_err)}
+             local_logger.bind(interface="nifi", direction="response", data=nifi_resp_q).debug("Received error from NiFi API")
+             # Explicitly set snapshot to empty dict to avoid errors below
+             group_status_snapshot = {}
+        except Exception as status_exc:
+             local_logger.error(f"Unexpected error getting process group status snapshot: {status_exc}", exc_info=True)
+             nifi_resp_q = {"error": str(status_exc)}
+             local_logger.bind(interface="nifi", direction="response", data=nifi_resp_q).debug("Received unexpected error from NiFi API")
+             # Explicitly set snapshot to empty dict to avoid errors below
+             group_status_snapshot = {}
 
-        for conn_id in connection_ids:
-            connection_status_tasks.append(nifi_client.get_connection_status(conn_id))
-            
-        nifi_req_q = {"operation": "get_connection_status", "connection_count": len(connection_ids)}
-        local_logger.bind(interface="nifi", direction="request", data=nifi_req_q).debug("Calling NiFi API (connection status)")
-        connection_statuses = await asyncio.gather(*connection_status_tasks, return_exceptions=True)
-        nifi_resp_q = {"results_count": len(connection_statuses)}
-        local_logger.bind(interface="nifi", direction="response", data=nifi_resp_q).debug("Received from NiFi API (connection status)")
+        # Process the snapshots from the single response
+        connection_snapshots = group_status_snapshot.get("aggregateSnapshot", {}).get("connectionStatusSnapshots", [])
+        local_logger.debug(f"Processing {len(connection_snapshots)} connection snapshots from group status.")
 
-        for i, status_result in enumerate(connection_statuses):
-            conn_id = connection_ids[i]
-            conn_details = connection_details_map.get(conn_id, {})
-            if isinstance(status_result, Exception):
-                local_logger.warning(f"Error fetching status for connection {conn_id}: {status_result}")
+        # We need connection details (like name) to enrich the summary.
+        # Reuse connections_resp obtained in Step 1
+        connections_map = {conn.get("id"): conn for conn in connections_resp if conn.get("id")}
+
+        for snapshot_entity in connection_snapshots:
+            # Extract the actual snapshot data
+            snapshot_data = snapshot_entity.get("connectionStatusSnapshot")
+            if not snapshot_data:
+                local_logger.warning(f"Skipping connection snapshot due to missing data: {snapshot_entity}")
                 continue
-
-            snapshot = status_result.get("aggregateSnapshot", {})
-            queued_count = int(snapshot.get("flowFilesQueued", 0))
-            queued_bytes = int(snapshot.get("bytesQueued", 0))
+                
+            conn_id = snapshot_data.get("id")
+            if not conn_id:
+                 local_logger.warning(f"Skipping connection snapshot due to missing ID: {snapshot_data}")
+                 continue
+                 
+            queued_count = int(snapshot_data.get("flowFilesQueued", 0))
+            queued_bytes = int(snapshot_data.get("bytesQueued", 0))
+            
+            # Get connection details from the map populated earlier
+            conn_info = connections_map.get(conn_id, {})
+            conn_component = conn_info.get("component", {})
+            conn_name = conn_component.get("name", "")
+            source_name = conn_component.get("source", {}).get("name", "Unknown Source")
+            dest_name = conn_component.get("destination", {}).get("name", "Unknown Destination")
 
             if queued_count > 0:
                 queue_summary["total_queued_count"] += queued_count
                 queue_summary["total_queued_size_bytes"] += queued_bytes
                 queue_summary["connections_with_data"].append({
                     "id": conn_id,
-                    "name": conn_details.get("name"),
-                    "sourceName": conn_details.get("sourceName"),
-                    "destName": conn_details.get("destinationName"),
+                    "name": conn_name,
+                    "sourceName": source_name,
+                    "destName": dest_name,
                     "queued_count": queued_count,
                     "queued_size_bytes": queued_bytes,
-                    "queued_size_human": snapshot.get("queuedSize", "0 B") # Use pre-formatted string
+                    "queued_size_human": snapshot_data.get("queuedSize", "0 B") # Use pre-formatted string
                 })
-        # Format total size
+                
+        # Format total size (logic remains the same)
         total_bytes = queue_summary["total_queued_size_bytes"]
         if total_bytes < 1024:
             queue_summary["total_queued_size_human"] = f"{total_bytes} B"

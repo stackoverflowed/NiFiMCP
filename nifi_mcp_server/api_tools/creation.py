@@ -31,28 +31,26 @@ async def create_nifi_processor(
     position_x: int,
     position_y: int,
     process_group_id: str | None = None,
-    config: Optional[Dict[str, Any]] = None
+    properties: Optional[Dict[str, Any]] = None
 ) -> Dict:
     """
     Creates a new processor within a specified NiFi process group.
 
-    Example:
-    ```python
-    nifi_objects = [
-        {"type": "processor", "class": "org.apache.nifi.processors.standard.LogAttribute", "name": "LogAttribute", "position": {"x": 100, "y": 100}, "properties": {"Attribute": "mcp-test-log"}}
-    ]
+    Example Call:
+    ```tool_code
+    print(default_api.create_nifi_processor(processor_type='org.apache.nifi.processors.standard.LogAttribute', name='Log Test Attribute', position_x=200, position_y=300, properties={'Log Level': 'info', 'Attributes to Log': 'uuid, filename'}))
     ```
 
     Args:
-        processor_type: The fully qualified Java class name of the processor type.
+        processor_type: The fully qualified Java class name of the processor type (e.g., 'org.apache.nifi.processors.standard.ReplaceText').
         name: The desired name for the new processor instance.
-        position_x: The desired X coordinate.
-        position_y: The desired Y coordinate.
-        process_group_id: The UUID of the target process group. Defaults to root.
-        config: The configuration for the processor.
+        position_x: The desired X coordinate for the processor's position on the canvas.
+        position_y: The desired Y coordinate for the processor's position on the canvas.
+        process_group_id: The UUID of the target process group. If None, the root process group of the NiFi instance will be used.
+        properties: A dictionary containing the processor's configuration properties. Provide the properties directly as key-value pairs. Do NOT include the 'properties' key itself within this dictionary, as it will be added automatically by the underlying client. Example: {'Replacement Strategy': 'Always Replace', 'Replacement Value': 'Hello'}.
 
     Returns:
-        A dictionary representing the result, including status and the created entity.
+        A dictionary reporting the success, warning, or error status of the operation, potentially including the created processor entity details.
     """
     # Get client and logger from context
     nifi_client: Optional[NiFiClient] = current_nifi_client.get()
@@ -96,7 +94,7 @@ async def create_nifi_processor(
             "processor_type": processor_type,
             "name": name,
             "position": position,
-            "config": config
+            "config": properties
         }
         local_logger.bind(interface="nifi", direction="request", data=nifi_request_data).debug("Calling NiFi API")
         processor_entity = await nifi_client.create_processor(
@@ -104,7 +102,7 @@ async def create_nifi_processor(
             processor_type=processor_type,
             name=name,
             position=position,
-            config=config
+            config=properties
         )
         nifi_response_data = filter_created_processor_data(processor_entity)
         local_logger.bind(interface="nifi", direction="response", data=nifi_response_data).debug("Received from NiFi API")
@@ -634,7 +632,7 @@ async def create_nifi_flow(
                     position_x=pos_x,
                     position_y=pos_y,
                     process_group_id=target_pg_id,
-                    config=properties
+                    properties=properties
                 )
                 # We also need to apply the properties if provided
                 created_proc_id = None

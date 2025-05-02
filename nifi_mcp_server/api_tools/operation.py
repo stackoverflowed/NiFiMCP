@@ -1,5 +1,7 @@
 import asyncio
 from typing import List, Dict, Optional, Any, Union, Literal
+import httpx
+import json
 
 # Import necessary components from parent/utils
 from loguru import logger
@@ -421,3 +423,171 @@ async def run_processor_once(processor_id: str) -> Dict:
         local_logger.error(f"Unexpected error during run-once for processor {processor_id}: {e}", exc_info=True)
         local_logger.bind(interface="nifi", direction="response", data={"error": str(e)}).debug("Received error from NiFi API")
         return {"status": "error", "message": f"An unexpected error occurred: {e}", "processor_id": processor_id, "final_state": initial_state}
+
+
+@mcp.tool()
+@tool_phases(["Operate", "Verify"])
+async def invoke_nifi_http_endpoint(
+    url: str,
+    method: Literal["GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS", "PATCH"] = "POST",
+    payload: Optional[Union[str, Dict[str, Any]]] = None,
+    headers: Optional[Dict[str, str]] = None,
+    timeout_seconds: int = 10
+) -> Dict:
+    """
+    Sends an HTTP request to a specified URL, typically to test a NiFi flow endpoint (e.g., ListenHTTP).
+    Waits for a response or times out.
+
+    WARNING: Ensure the URL points to a trusted endpoint, ideally one hosted by your NiFi instance or related infrastructure.
+
+    Examples:
+    Call (POST JSON):
+    ```tool_code
+    print(default_api.invoke_nifi_http_endpoint(url='http://localhost:9999/myflow', method='POST', payload={'key': 'value'}, headers={'Content-Type': 'application/json'}))
+    ```
+
+    Call (GET):
+    ```tool_code
+    print(default_api.invoke_nifi_http_endpoint(url='http://localhost:9998/status', method='GET'))
+    ```
+
+    Args:
+        url: The full URL of the target endpoint.
+        method: The HTTP method to use (e.g., GET, POST). Defaults to POST.
+        payload: The request body. If a dictionary, it will be sent as JSON with 'Content-Type: application/json' unless overridden in headers. If a string, it's sent as is.
+        headers: A dictionary of custom request headers.
+        timeout_seconds: Maximum time in seconds to wait for a response. Defaults to 10.
+
+    Returns:
+        A dictionary describing the outcome:
+        {
+          "status": "success" | "timeout" | "connection_error" | "http_error" | "internal_error",
+          "message": "Descriptive message of the outcome.",
+          "response_status_code": Optional[int],  # e.g., 200, 404, 500
+          "response_headers": Optional[Dict[str, str]],
+          "response_body": Optional[str], # Response body as text (potentially truncated)
+          "request_details": { # Details of the request sent
+            "url": str,
+            "method": str,
+            "headers": Dict[str, str],
+            "payload_type": str # e.g., 'json', 'string', 'none'
+          }
+        }
+    """
+    local_logger = current_request_logger.get() or logger
+    local_logger = local_logger.bind(target_url=url, http_method=method)
+    local_logger.info(f"Attempting to invoke HTTP endpoint.")
+
+    request_headers = headers or {}
+    content_to_send = None
+    payload_type = "none"
+
+    try:
+        if isinstance(payload, dict):
+            if 'content-type' not in (h.lower() for h in request_headers):
+                request_headers['Content-Type'] = 'application/json'
+            try:
+                content_to_send = json.dumps(payload).encode('utf-8')
+                payload_type = "json"
+            except (TypeError, OverflowError) as json_err:
+                 local_logger.error(f"Failed to serialize JSON payload: {json_err}", exc_info=True)
+                 return {
+                     "status": "internal_error",
+                     "message": f"Failed to serialize dictionary payload to JSON: {json_err}",
+                     "response_status_code": None,
+                     "response_headers": None,
+                     "response_body": None,
+                     "request_details": {"url": url, "method": method, "headers": request_headers, "payload_type": "dict (serialization failed)"}
+                 }
+        elif isinstance(payload, str):
+            content_to_send = payload.encode('utf-8') # Assume UTF-8 for strings
+            payload_type = "string"
+
+        # Log the headers being sent *before* the request
+        final_request_headers = request_headers
+        local_logger.debug(f"Sending request: Method={method}, URL={url}, Headers={final_request_headers}, Payload Type={payload_type}")
+
+        request_details_for_response = {
+            "url": url,
+            "method": method,
+            "headers": final_request_headers,
+            "payload_type": payload_type
+        }
+
+        async with httpx.AsyncClient(timeout=timeout_seconds) as client:
+            response = await client.request(
+                method=method,
+                url=url,
+                headers=final_request_headers,
+                content=content_to_send
+            )
+
+            # Attempt to decode body, handle potential errors
+            response_body_text = None
+            try:
+                response_body_text = response.text
+                # Optional: Truncate large responses
+                # max_len = 1024
+                # if len(response_body_text) > max_len:
+                #     response_body_text = response_body_text[:max_len] + "... (truncated)"
+            except Exception as decode_err:
+                local_logger.warning(f"Could not decode response body: {decode_err}")
+                response_body_text = "<Could not decode response body>"
+
+            response_headers_dict = dict(response.headers)
+            local_logger.info(f"Received response: Status={response.status_code}")
+            local_logger.debug(f"Response Headers: {response_headers_dict}")
+            local_logger.debug(f"Response Body: {response_body_text}") # Be mindful of logging sensitive data
+
+            # Check if status code indicates an HTTP error (4xx or 5xx)
+            if 400 <= response.status_code < 600:
+                return {
+                    "status": "http_error",
+                    "message": f"Endpoint returned HTTP error status code: {response.status_code}",
+                    "response_status_code": response.status_code,
+                    "response_headers": response_headers_dict,
+                    "response_body": response_body_text,
+                    "request_details": request_details_for_response
+                }
+            else:
+                 return {
+                    "status": "success",
+                    "message": f"Successfully received response from endpoint.",
+                    "response_status_code": response.status_code,
+                    "response_headers": response_headers_dict,
+                    "response_body": response_body_text,
+                    "request_details": request_details_for_response
+                 }
+
+    except httpx.TimeoutException:
+        local_logger.warning(f"Request timed out after {timeout_seconds} seconds.")
+        return {
+            "status": "timeout",
+            "message": f"Request timed out after {timeout_seconds} seconds.",
+            "response_status_code": None,
+            "response_headers": None,
+            "response_body": None,
+            "request_details": request_details_for_response # Use headers prepared before request
+        }
+    except httpx.RequestError as e:
+        # Covers connection errors, DNS errors, invalid URL errors (caught by httpx), etc.
+        local_logger.error(f"HTTP request error: {e}", exc_info=False)
+        return {
+            "status": "connection_error",
+            "message": f"Failed to connect or send request: {e}",
+            "response_status_code": None,
+            "response_headers": None,
+            "response_body": None,
+            "request_details": request_details_for_response
+        }
+    except Exception as e:
+        # Catch-all for unexpected errors during preparation or execution
+        local_logger.error(f"Unexpected internal error during HTTP invocation: {e}", exc_info=True)
+        return {
+            "status": "internal_error",
+            "message": f"An unexpected internal error occurred: {e}",
+            "response_status_code": None,
+            "response_headers": None,
+            "response_body": None,
+            "request_details": {"url": url, "method": method, "headers": request_headers, "payload_type": payload_type}
+        }

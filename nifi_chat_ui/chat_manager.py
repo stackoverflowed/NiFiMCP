@@ -319,16 +319,39 @@ def get_formatted_tool_definitions(
 # --- Helper Functions --- #
 
 def count_tokens_openai(text: str, model: str) -> int: # Require model name
-    """Count tokens using OpenAI's tiktoken library"""
+    """Count tokens using OpenAI's tiktoken library, with fallback for specific models."""
     if not tiktoken_available:
         # Fallback to approximation if tiktoken isn't available
         return len(text.split())
     
+    encoding = None
     try:
+        # First, try the standard model mapping
         encoding = tiktoken.encoding_for_model(model)
-        return len(encoding.encode(text))
+        # logger.debug(f"Using standard tiktoken encoding for model: {model}") # Optional logging
+    except KeyError:
+        # If standard mapping fails, try the common encoding for GPT-4 and new models
+        try:
+            encoding = tiktoken.get_encoding("cl100k_base")
+        except Exception as e:
+            logger.error(f"Failed to get 'cl100k_base' encoding: {e}. Using approximation.")
+            # Fall back to approximation if cl100k_base also fails
+            return len(text.split())
     except Exception as e:
-        logger.warning(f"Error counting tokens with tiktoken for model {model}: {e}. Using approximation.") # Use logger
+        # Catch any other unexpected errors during encoding_for_model
+        logger.warning(f"Unexpected error getting tiktoken encoding for model {model}: {e}. Using approximation.")
+        return len(text.split())
+
+    # If we successfully got an encoding (either standard or fallback)
+    if encoding:
+        try:
+            return len(encoding.encode(text))
+        except Exception as e:
+            logger.warning(f"Error encoding text with tiktoken for model {model} (encoding: {encoding.name}): {e}. Using approximation.")
+            return len(text.split())
+    else:
+        # Should not be reached if logic above is correct, but as a final fallback
+        logger.error(f"Failed to obtain any tiktoken encoding for model {model}. Using approximation.")
         return len(text.split())
 
 def count_tokens_gemini(text: str) -> int:
@@ -337,11 +360,16 @@ def count_tokens_gemini(text: str) -> int:
     # Roughly 4 characters per token is a common approximation
     return len(text) // 4
 
-def calculate_input_tokens(messages: List[Dict], provider: str, model_name: str) -> int: # Added model_name
-    """Calculate total input tokens based on message history and provider."""
+def calculate_input_tokens(
+    messages: List[Dict],
+    provider: str,
+    model_name: str,
+    tools: List[Dict[str, Any]] | List["genai_types.FunctionDeclaration"] | None = None # Added tools param
+) -> int:
+    """Calculate total input tokens based on message history, provider, and tools."""
     total_tokens = 0
-    # model_name = config.OPENAI_MODEL if provider.lower() == "openai" else config.GEMINI_MODEL # Removed
 
+    # Calculate tokens for messages
     for message in messages:
         content = message.get("content", "")
         if isinstance(content, str):
@@ -349,7 +377,6 @@ def calculate_input_tokens(messages: List[Dict], provider: str, model_name: str)
                 total_tokens += count_tokens_openai(content, model_name)
             else:
                 total_tokens += count_tokens_gemini(content)
-        # Add rough estimate for tool calls/results if needed
         elif message.get("role") == "tool":
             # Simple approximation for tool results
             total_tokens += len(str(content)) // 4 
@@ -357,7 +384,47 @@ def calculate_input_tokens(messages: List[Dict], provider: str, model_name: str)
             # Simple approximation for tool requests
             total_tokens += len(json.dumps(message["tool_calls"])) // 4
             
-    # logger.debug(f"Calculated input tokens: {total_tokens} for {provider}") # Optional: Log token count
+    # Calculate tokens for tool definitions
+    if tools:
+        tools_str = ""
+        try:
+            if provider.lower() == "openai":
+                # OpenAI tools are already JSON-serializable dicts
+                tools_str = json.dumps(tools)
+            elif provider.lower() == "gemini":
+                # Gemini tools are FunctionDeclaration objects, need safe serialization
+                # Convert each declaration to a dict representation for token counting
+                tool_dicts = []
+                for declaration in tools:
+                    # Basic dict representation - might not be perfectly accurate
+                    # but better than nothing. Adjust as needed for accuracy vs complexity.
+                    param_dict = {} # Placeholder for parameters if needed
+                    # Example: Accessing parameters requires knowledge of FunctionDeclaration structure
+                    # For now, just using name and description for estimation
+                    tool_dicts.append({
+                        "name": getattr(declaration, 'name', ''),
+                        "description": getattr(declaration, 'description', ''),
+                        # Add parameters serialization here if more accuracy is needed
+                    })
+                tools_str = json.dumps(tool_dicts)
+            else:
+                 logger.warning(f"Token calculation for tools not implemented for provider: {provider}")
+
+            # Count tokens for the serialized tool string
+            if tools_str:
+                tool_tokens = 0
+                if provider.lower() == "openai":
+                    tool_tokens = count_tokens_openai(tools_str, model_name)
+                else: # Assume Gemini or other
+                    tool_tokens = count_tokens_gemini(tools_str)
+                
+                # logger.debug(f"Calculated tool definition tokens: {tool_tokens}") # Optional logging
+                total_tokens += tool_tokens
+                
+        except Exception as e:
+            logger.warning(f"Error estimating token count for tool definitions: {e}")
+
+    # logger.debug(f"Calculated total input tokens: {total_tokens} for {provider}")
     return total_tokens
 
 # --- Core LLM Interaction Functions --- #
@@ -737,7 +804,7 @@ def get_gemini_response(
             bound_logger.warning("No parts found in the Gemini response")
         
         # Calculate token counts
-        token_count_in = calculate_input_tokens(messages, "Gemini", model_name)
+        token_count_in = calculate_input_tokens(messages, "Gemini", model_name, tools)
         token_count_out = count_tokens_gemini(response_content if response_content else "") if response_content else 0
         bound_logger.debug(f"Token counts - In: {token_count_in}, Out: {token_count_out}")
 
@@ -934,7 +1001,7 @@ def get_openai_response(
             ]
         
         # Calculate token counts - use OpenAI's reported usage when available
-        token_count_in = getattr(response.usage, 'prompt_tokens', 0) if hasattr(response, 'usage') else calculate_input_tokens(messages, "OpenAI", model_name)
+        token_count_in = getattr(response.usage, 'prompt_tokens', 0) if hasattr(response, 'usage') else calculate_input_tokens(messages, "OpenAI", model_name, tools)
         token_count_out = getattr(response.usage, 'completion_tokens', 0) if hasattr(response, 'usage') else 0
 
         bound_logger.debug(f"Token counts - In: {token_count_in}, Out: {token_count_out}")
