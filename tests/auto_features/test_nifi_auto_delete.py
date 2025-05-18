@@ -1,0 +1,1 @@
+# Tests for NiFi auto-delete features 

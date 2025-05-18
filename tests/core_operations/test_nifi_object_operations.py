@@ -1,0 +1,1 @@
+# Tests for generic NiFi object operations (get, operate, delete) 
