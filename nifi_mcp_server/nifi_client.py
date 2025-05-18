@@ -290,6 +290,7 @@ class NiFiClient:
         try:
             logger.info(f"Fetching details for processor {processor_id} from {self.base_url}{endpoint}")
             response = await client.get(endpoint)
+            logger.debug(f"NiFiClient.get_processor_details: GET {endpoint} - Response Status: {response.status_code}, Response Body Raw: {response.text}") # Added log
             response.raise_for_status()
             processor_details = response.json()
             logger.info(f"Successfully fetched details for processor {processor_id}")
@@ -529,11 +530,41 @@ class NiFiClient:
         if update_type == "properties":
             if not isinstance(update_data, dict):
                 raise TypeError("update_data must be a dictionary when update_type is 'properties'.")
-            # Ensure config key exists
+            
+            # Ensure config and properties sub-dict exist
             if "config" not in update_component:
                  update_component["config"] = {}
-            update_component["config"]["properties"] = update_data
-            log_message_part = f"properties: {update_data}"
+            if "properties" not in update_component["config"]:
+                 update_component["config"]["properties"] = {} # Initialize/clear existing
+
+            KNOWN_DIRECT_CONFIG_KEYS = {
+                "schedulingStrategy", "schedulingPeriod", "executionNode", "comments",
+                "penaltyDuration", "yieldDuration", "bulletinLevel", "runDurationMillis",
+                "lossTolerant"
+            }
+            
+            temp_properties_to_set = {}
+            direct_config_to_set = {}
+
+            for key, value in update_data.items():
+                # Normalize key for matching (e.g. "Scheduling Strategy" vs "schedulingStrategy")
+                # However, NiFi API is case-sensitive for these direct keys.
+                # The keys in update_data likely come from user input or previous GETs.
+                # For now, assume keys in update_data match NiFi's expected case for direct keys.
+                if key in KNOWN_DIRECT_CONFIG_KEYS:
+                    direct_config_to_set[key] = value
+                else:
+                    # Assume it's a true property meant for the 'properties' sub-dictionary
+                    temp_properties_to_set[key] = value
+            
+            # Assign true properties
+            update_component["config"]["properties"] = temp_properties_to_set
+            
+            # Assign direct config items
+            for key, value in direct_config_to_set.items():
+                update_component["config"][key] = value
+                
+            log_message_part = f"properties: {temp_properties_to_set}, direct_configs: {direct_config_to_set}"
 
         elif update_type == "auto-terminatedrelationships":
             # Expect a list of strings (relationship names)
@@ -558,6 +589,7 @@ class NiFiClient:
         client = await self._get_client()
         endpoint = f"/processors/{processor_id}"
         try:
+            logger.debug(f"NiFiClient.update_processor_config: Sending PUT request to {endpoint} with payload: {update_payload}") # Added log
             logger.info(f"Updating processor {processor_id} (Version: {current_revision.get('version')}). Updating {log_message_part}")
             response = await client.put(endpoint, json=update_payload)
             response.raise_for_status()
@@ -568,9 +600,11 @@ class NiFiClient:
         except httpx.HTTPStatusError as e:
             # Handle 409 Conflict (likely stale revision)
             if e.response.status_code == 409:
+                logger.error(f"NiFiClient.update_processor_config: Conflict. Endpoint: {e.request.url}, Method: {e.request.method}, Sent Payload: {update_payload}, Response Status: {e.response.status_code}, Response Body: {e.response.text}") # Added log
                 logger.error(f"Conflict updating processor {processor_id}. Revision ({current_revision.get('version')}) likely stale. Response: {e.response.text}")
                 raise ValueError(f"Conflict updating processor {processor_id}. Revision mismatch.") from e
             else:
+                logger.error(f"NiFiClient.update_processor_config: HTTP Error. Endpoint: {e.request.url}, Method: {e.request.method}, Sent Payload: {update_payload}, Response Status: {e.response.status_code}, Response Body: {e.response.text}") # Added log
                 logger.error(f"Failed to update processor {processor_id}: {e.response.status_code} - {e.response.text}")
                 raise ConnectionError(f"Failed to update processor: {e.response.status_code}, {e.response.text}") from e
         except (httpx.RequestError, ValueError) as e:

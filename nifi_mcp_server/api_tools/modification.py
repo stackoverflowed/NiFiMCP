@@ -4,10 +4,11 @@ from typing import List, Dict, Optional, Any, Union, Literal
 # Import necessary components from parent/utils
 from loguru import logger
 # Import mcp ONLY
-from ..core import mcp
+from ..core import mcp, handle_nifi_errors, _get_component_details_direct, _stop_pg_direct
 # Removed nifi_api_client import
 # Import context variables
 from ..request_context import current_nifi_client, current_request_logger # Added
+from config import settings as mcp_settings # Corrected import
 
 from .utils import (
     tool_phases,
@@ -462,43 +463,45 @@ async def update_nifi_connection(
 
 @mcp.tool()
 @tool_phases(["Modify"])
+@handle_nifi_errors
 async def delete_nifi_object(
     object_type: Literal["processor", "connection", "port", "process_group"],
-    object_id: str
+    object_id: str,
+    **kwargs # To potentially catch headers if passed by MCP
 ) -> Dict:
     """
     Deletes a specific NiFi object (processor, connection, port, or process group).
-    Requires the object to be stopped and have no active connections/queued data (for processors/ports/PGs).
+    Attempts Auto-Stop for running processors if enabled.
 
     Args:
         object_type: The type of the object to delete ('processor', 'connection', 'port', 'process_group').
         object_id: The UUID of the object to delete.
+        **kwargs: May contain 'request_headers' for feature flag overrides.
 
     Returns:
         A dictionary indicating success or failure.
     """
-    # Get client and logger from context
     nifi_client: Optional[NiFiClient] = current_nifi_client.get()
     local_logger = current_request_logger.get() or logger
     if not nifi_client:
         raise ToolError("NiFi client context is not set. This tool requires the X-Nifi-Server-Id header.")
     if not local_logger:
          raise ToolError("Request logger context is not set.")
-         
-    # Authentication handled by factory
     
     local_logger = local_logger.bind(object_id=object_id, object_type=object_type)
     local_logger.info(f"Executing delete_nifi_object for {object_type} ID: {object_id}")
 
-    # 1. Get current details to find revision and potentially state/type for ports
-    get_details_op = f"get_{object_type}_details"
-    if object_type == "port": get_details_op = "get_port_details" # Generic message
-        
-    nifi_get_req = {"operation": get_details_op, "id": object_id}
-    local_logger.bind(interface="nifi", direction="request", data=nifi_get_req).debug("Calling NiFi API (for details)")
-    
-    current_entity = None
     try:
+        # 1. Get current details to find revision and potentially state/type for ports
+        get_details_op = f"get_{object_type}_details"
+        if object_type == "port": get_details_op = "get_port_details" # Generic message
+            
+        nifi_get_req = {"operation": get_details_op, "id": object_id}
+        local_logger.bind(interface="nifi", direction="request", data=nifi_get_req).debug("Calling NiFi API (for details)")
+        
+        current_entity = None
+        original_object_type = object_type # Store original type for port type refinement
+
         if object_type == "processor":
             current_entity = await nifi_client.get_processor_details(object_id)
         elif object_type == "connection":
@@ -518,7 +521,7 @@ async def delete_nifi_object(
                 except ValueError as e_out:
                     raise ToolError(f"Port with ID '{object_id}' not found (checked input/output). Cannot delete.") from e_out
         else:
-            raise ToolError(f"Invalid object_type '{object_type}' for deletion.")
+            raise ToolError(f"Invalid object_type '{original_object_type}' for deletion.")
             
         local_logger.bind(interface="nifi", direction="response", data=current_entity).debug("Received from NiFi API (full details)")
 
@@ -527,22 +530,65 @@ async def delete_nifi_object(
             raise ToolError(f"Could not retrieve current revision version for {object_type} {object_id}. Cannot delete.")
         current_version = current_revision_dict["version"]
 
-        # Check state if applicable (Processors, Ports, Process Groups might need to be stopped)
         component = current_entity.get("component", {})
         state = component.get("state")
         name = component.get("name", object_id)
 
-        if object_type != "connection" and state == "RUNNING":
-             error_msg = f"{object_type.capitalize()} '{name}' ({object_id}) is currently RUNNING. It must be stopped before deletion."
+        # --- AUTO-STOP PRE-EMPTIVE LOGIC --- 
+        if original_object_type == "processor" and state == "RUNNING": # Use original_object_type here
+            local_logger.info(f"Processor '{name}' is RUNNING. Checking Auto-Stop feature.")
+            
+            request_headers = kwargs.get("request_headers") 
+            if not request_headers and hasattr(local_logger, '_context') and hasattr(local_logger._context, 'get'):
+                 request_headers = local_logger._context.get('headers')
+            
+            is_auto_stop_feature_enabled = mcp_settings.get_feature_auto_stop_enabled(headers=request_headers)
+            local_logger.info(f"Auto-Stop enabled via config/header: {is_auto_stop_feature_enabled}")
+
+            if is_auto_stop_feature_enabled:
+                local_logger.info(f"[Auto-Stop] Attempting for processor: {object_id}")
+                parent_pg_id = component.get("parentGroupId")
+
+                if parent_pg_id:
+                    local_logger.info(f"[Auto-Stop] Identified parent PG ID: {parent_pg_id} for processor {object_id}")
+                    try:
+                        local_logger.info(f"[Auto-Stop] Attempting to stop parent PG: {parent_pg_id}")
+                        stop_success = await _stop_pg_direct(nifi_client, parent_pg_id, local_logger)
+                        if stop_success:
+                            local_logger.info(f"[Auto-Stop] Parent PG {parent_pg_id} stopped. Re-evaluating processor {object_id} state.")
+                            await asyncio.sleep(mcp_settings.get_auto_feature_retry_delay_seconds()) 
+                            local_logger.info(f"[Auto-Stop] Re-fetching processor details for {object_id} after PG stop.")
+                            current_entity = await nifi_client.get_processor_details(object_id) 
+                            component = current_entity.get("component", {})
+                            state = component.get("state") 
+                            current_revision_dict = current_entity.get("revision")
+                            if not current_revision_dict or "version" not in current_revision_dict:
+                                local_logger.error(f"[Auto-Stop] Could not retrieve post-stop revision for {object_id}. Deletion may fail due to version mismatch.")
+                                # Let it proceed, deletion attempt will likely fail with version conflict, or state is still bad
+                            else:
+                                current_version = current_revision_dict["version"]
+                            local_logger.info(f"[Auto-Stop] Processor {object_id} state after PG stop: {state}, new version: {current_version}")
+                        else:
+                            local_logger.warning(f"[Auto-Stop] Failed to stop parent PG {parent_pg_id}. Processor deletion will likely fail if still running.")
+                    except Exception as e_stop:
+                        local_logger.error(f"[Auto-Stop] Exception during stop process for PG {parent_pg_id}: {e_stop}", exc_info=True)
+                else:
+                    local_logger.warning(f"[Auto-Stop] Could not determine parent PG for processor {object_id}. Cannot Auto-Stop.")
+        # --- END AUTO-STOP LOGIC ---
+
+        # Final check on state before attempting deletion (state might have been updated by Auto-Stop logic)
+        if object_type != "connection" and state == "RUNNING": # object_type here should be the potentially refined one (input_port/output_port)
+             error_msg = f"{object_type.capitalize()} '{name}' ({object_id}) is still RUNNING. It must be stopped before deletion. Auto-Stop may have failed or not fully stopped the component."
              local_logger.warning(error_msg)
-             return {"status": "error", "message": error_msg}
+             return {"status": "error", "message": error_msg} 
 
         # 2. Attempt deletion using the obtained version
-        delete_op = f"delete_{object_type}"
+        delete_op = f"delete_{object_type}" # Use potentially refined object_type for ports
         nifi_delete_req = {"operation": delete_op, "id": object_id, "version": current_version}
         local_logger.bind(interface="nifi", direction="request", data=nifi_delete_req).debug("Calling NiFi API (delete)")
         
         deleted = False
+        # Use refined object_type for client calls
         if object_type == "processor":
             deleted = await nifi_client.delete_processor(object_id, current_version)
         elif object_type == "connection":
@@ -561,19 +607,28 @@ async def delete_nifi_object(
             local_logger.info(f"Successfully deleted {object_type} '{name}' ({object_id}).")
             return {"status": "success", "message": f"{object_type.capitalize()} '{name}' deleted successfully."}
         else:
-            # This might indicate a 404 or other issue handled within the client method
-            local_logger.warning(f"Deletion call for {object_type} '{name}' ({object_id}) returned False.")
-            return {"status": "error", "message": f"Deletion failed for {object_type} '{name}'. It might have already been deleted, or another issue occurred."}
+            local_logger.warning(f"Deletion call for {object_type} '{name}' ({object_id}) returned False. This might be due to a 404 (already deleted) or other client-side handled issue.")
+            # The NiFiClient delete methods should raise ValueError for actual API errors like 409 Conflict.
+            # If we reach here with `deleted = False`, it implies the client method itself returned False (e.g. 404 not found)
+            return {"status": "error", "message": f"Deletion failed for {object_type} '{name}'. It might have already been deleted or the client handled an issue returning False instead of an exception."}
 
     except ValueError as e:
-        local_logger.warning(f"Error deleting {object_type} {object_id}: {e}")
+        local_logger.warning(f"Error deleting {object_type} {object_id} (ValueError caught in main try-except): {e}")
         local_logger.bind(interface="nifi", direction="response", data={"error": str(e)}).debug("Received error from NiFi API (delete)")
-        if "not found" in str(e).lower():
+        
+        error_message = str(e)
+        error_message_lower = error_message.lower()
+
+        # No re-raise here for the decorator for now, as Auto-Stop is preemptive.
+        # The decorator can be re-enabled later if needed for other types of errors.
+
+        if "not found" in error_message_lower:
              return {"status": "error", "message": f"{object_type.capitalize()} {object_id} not found."}
-        elif "conflict" in str(e).lower() or "revision mismatch" in str(e).lower():
-             return {"status": "error", "message": f"Conflict deleting {object_type} {object_id}. Ensure correct version and state (e.g., stopped, empty): {e}"}
+        elif "conflict" in error_message_lower or "revision mismatch" in error_message_lower or "is currently RUNNING" in error_message_lower:
+             return {"status": "error", "message": f"Conflict or state issue deleting {object_type} '{name}' ({object_id}): {e}"}
         else:
-            return {"status": "error", "message": f"Error deleting {object_type} {object_id}: {e}"}
+            return {"status": "error", "message": f"Error deleting {object_type} '{name}' ({object_id}): {e}"}
+            
     except (NiFiAuthenticationError, ConnectionError, ToolError) as e:
         local_logger.error(f"API/Tool error deleting {object_type} {object_id}: {e}", exc_info=False)
         local_logger.bind(interface="nifi", direction="response", data={"error": str(e)}).debug("Received error from NiFi API (delete)")
