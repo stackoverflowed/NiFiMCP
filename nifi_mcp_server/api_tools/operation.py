@@ -6,7 +6,7 @@ import json
 # Import necessary components from parent/utils
 from loguru import logger
 # Import mcp ONLY
-from ..core import mcp
+from ..core import mcp, _handle_drop_request
 # Removed nifi_api_client import
 # Import context variables
 from ..request_context import current_nifi_client, current_request_logger # Added
@@ -15,7 +15,9 @@ from .utils import (
     tool_phases,
     # ensure_authenticated, # Removed
     filter_created_processor_data, # Keep for processor/port paths
-    filter_process_group_data # Add for process group path
+    filter_process_group_data, # Add for process group path
+    filter_connection_data,
+    filter_drop_request_data
 )
 from nifi_mcp_server.nifi_client import NiFiClient, NiFiAuthenticationError
 from mcp.server.fastmcp.exceptions import ToolError
@@ -591,3 +593,82 @@ async def invoke_nifi_http_endpoint(
             "response_body": None,
             "request_details": {"url": url, "method": method, "headers": request_headers, "payload_type": payload_type}
         }
+
+
+def format_drop_request_summary(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Formats a drop request result into a standardized summary format.
+    
+    Args:
+        result: The raw drop request result from NiFi
+        
+    Returns:
+        Dict containing formatted summary with consistent fields
+    """
+    # Extract basic fields
+    success = result.get("success", False)
+    message = result.get("message", "")
+    results = result.get("results", [])
+    
+    # Calculate summary metrics
+    total_connections = len(results)
+    successful_drops = len([r for r in results if r.get("success", False)])
+    failed_drops = total_connections - successful_drops
+    
+    # Parse dropped count from format like "1 / 0 bytes"
+    def parse_dropped_count(count_str: str) -> int:
+        try:
+            # Split on '/' and take first number
+            return int(count_str.split('/')[0].strip())
+        except (ValueError, AttributeError, IndexError):
+            return 0
+            
+    total_dropped = sum(parse_dropped_count(str(r.get("dropped_count", "0"))) 
+                       for r in results if r.get("success", False))
+    
+    return {
+        "success": success,
+        "message": message,
+        "total_connections": total_connections,
+        "successful_drops": successful_drops,
+        "failed_drops": failed_drops,
+        "total_dropped": total_dropped,
+        "results": results
+    }
+
+@mcp.tool()
+@tool_phases(["Operate"])
+async def purge_flowfiles(
+    target_id: str,
+    target_type: Literal["connection", "process_group"],
+    timeout_seconds: Optional[int] = 30
+) -> Dict[str, Any]:
+    """Purges all FlowFiles from a connection or all connections in a process group.
+    
+    This tool will wait for the purge operation to complete or until the timeout is reached.
+    For process groups, it will attempt to purge all connections and report any failures.
+    
+    Args:
+        target_id: The ID of the connection or process group to purge
+        target_type: Either "connection" for a single connection or "process_group" for all connections in a PG
+        timeout_seconds: Maximum time in seconds to wait for each purge operation (default: 30)
+        
+    Returns:
+        Dict containing:
+            - success: Whether all purge operations succeeded
+            - message: Summary message
+            - summary: Detailed summary of operations
+            - results: List of individual purge results
+    """
+    nifi_client = current_nifi_client.get()
+    local_logger = current_request_logger.get()
+    
+    if target_type == "connection":
+        # Single connection purge
+        result = await _handle_drop_request(nifi_client, target_id, timeout_seconds, local_logger)
+        formatted_result = format_drop_request_summary(result)
+        return formatted_result
+    
+    else:  # process_group
+        # Use the client's process group purge method
+        results = await nifi_client.purge_process_group_flowfiles(target_id, timeout_seconds)
+        return format_drop_request_summary(results)

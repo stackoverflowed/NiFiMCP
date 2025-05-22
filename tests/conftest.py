@@ -148,9 +148,33 @@ async def test_pg(
 
     yield pg_details # Provide the PG details to the test
 
-    # Teardown: Delete the process group
+    # Teardown: First purge any queued flowfiles, then delete the process group
     global_logger.info(f"Fixture: Cleaning up test process group: {pg_id}")
     try:
+        # First purge any queued flowfiles
+        purge_args = {
+            "target_id": pg_id,
+            "target_type": "process_group",
+            "timeout_seconds": 30
+        }
+        try:
+            purge_result_list = await util_call_tool(
+                client=async_client,
+                base_url=base_url,
+                tool_name="purge_flowfiles",
+                arguments=purge_args,
+                headers=mcp_headers,
+                custom_logger=global_logger
+            )
+            if purge_result_list and purge_result_list[0].get("status") == "success":
+                global_logger.info(f"Fixture: Successfully purged flowfiles from Process Group {pg_id}")
+            else:
+                global_logger.warning(f"Fixture: Some flowfiles may remain in Process Group {pg_id}")
+        except Exception as e_purge:
+            # Continue even if purge fails - we'll still try to delete the Process Group
+            global_logger.warning(f"Fixture: Error purging flowfiles (continuing with cleanup): {e_purge}")
+
+        # Then delete the process group
         delete_pg_args = {"object_type": "process_group", "object_id": pg_id, "kwargs": {}}
         delete_pg_result_list = await util_call_tool(
             client=async_client, 
@@ -167,10 +191,8 @@ async def test_pg(
             global_logger.info(f"Fixture: Successfully deleted Test Process Group {pg_id}")
         else:
             global_logger.error(f"Fixture: Failed to delete Test Process Group {pg_id}: {delete_pg_result.get('message')}")
-            # Optionally, raise an error here if cleanup failure should fail tests, 
-            # but often for teardown, logging is preferred to not obscure the original test failure.
     except Exception as e_del_pg:
-        global_logger.error(f"Fixture: Error during Test Process Group {pg_id} deletion: {e_del_pg}", exc_info=False)
+        global_logger.error(f"Fixture: Error during Test Process Group {pg_id} cleanup: {e_del_pg}", exc_info=False)
 
 @pytest.fixture(scope="function")
 async def test_pg_with_processors(

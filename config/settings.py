@@ -93,6 +93,8 @@ def get_nifi_server_config(server_id: str) -> dict | None:
 def get_feature_auto_stop_enabled(headers: dict | None = None) -> bool:
     """Returns whether the Auto-Stop feature is enabled, checking header override first."""
     if headers:
+        # Convert header keys to lowercase for case-insensitive comparison
+        headers = {k.lower(): v for k, v in headers.items()}
         header_value = headers.get("x-mcp-auto-stop-enabled") # Headers are case-insensitive
         if header_value is not None:
             return str(header_value).lower() == "true"
@@ -101,6 +103,8 @@ def get_feature_auto_stop_enabled(headers: dict | None = None) -> bool:
 def get_feature_auto_delete_enabled(headers: dict | None = None) -> bool:
     """Returns whether the Auto-Delete feature is enabled, checking header override first."""
     if headers:
+        # Convert header keys to lowercase for case-insensitive comparison
+        headers = {k.lower(): v for k, v in headers.items()}
         header_value = headers.get("x-mcp-auto-delete-enabled")
         if header_value is not None:
             return str(header_value).lower() == "true"
@@ -109,6 +113,8 @@ def get_feature_auto_delete_enabled(headers: dict | None = None) -> bool:
 def get_feature_auto_purge_enabled(headers: dict | None = None) -> bool:
     """Returns whether the Auto-Purge feature is enabled, checking header override first."""
     if headers:
+        # Convert header keys to lowercase for case-insensitive comparison
+        headers = {k.lower(): v for k, v in headers.items()}
         header_value = headers.get("x-mcp-auto-purge-enabled")
         if header_value is not None:
             return str(header_value).lower() == "true"

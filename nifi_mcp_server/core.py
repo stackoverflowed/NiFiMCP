@@ -77,7 +77,7 @@ except Exception as e:
 # Imports for error_handler (ensure these are at the top of the file if not already)
 import asyncio
 import functools
-from typing import Callable, Any, Coroutine # Add Coroutine if not there
+from typing import Callable, Any, Coroutine, Dict # Add Coroutine if not there
 # from loguru import logger # Already imported
 # from .nifi_client import NiFiClient, NiFiAuthenticationError # Already imported from this file's perspective
 
@@ -88,50 +88,26 @@ from mcp.server.fastmcp.exceptions import ToolError # IMPORT ToolError
 
 
 async def _get_component_details_direct(nifi_client, object_id: str, object_type: str, local_logger) -> dict | None:
-    local_logger.debug(f"_get_component_details_direct: Fetching details for {object_type} {object_id}")
+    """Helper to directly fetch details for a NiFi component."""
     try:
         if object_type == "processor":
-            return await nifi_client.get_processor_details(object_id)
+            details = await nifi_client.get_processor_details(object_id)
+        elif object_type == "input_port":
+            details = await nifi_client.get_input_port_details(object_id)
+        elif object_type == "output_port":
+            details = await nifi_client.get_output_port_details(object_id)
         elif object_type == "process_group":
-            return await nifi_client.get_process_group_details(object_id)
-        # Add other types as needed (e.g., connection, port for different remediation logic)
+            details = await nifi_client.get_process_group_details(object_id)
         else:
-            local_logger.warning(f"_get_component_details_direct: Unsupported object_type '{object_type}' for direct detail fetching.")
+            local_logger.error(f"_get_component_details_direct: Unsupported object type: {object_type}")
             return None
-    except ValueError as e: # Client raises ValueError on 404 Not Found
-        local_logger.warning(f"_get_component_details_direct: {object_type} {object_id} not found or error: {e}")
+        return details
+    except ValueError as e:
+        local_logger.warning(f"_get_component_details_direct: ValueError fetching details for {object_type} {object_id}: {e}")
         return None
     except Exception as e:
         local_logger.error(f"_get_component_details_direct: Unexpected error fetching details for {object_type} {object_id}: {e}", exc_info=True)
         return None
-
-async def _stop_pg_direct(nifi_client, pg_id: str, local_logger) -> bool:
-    """Helper to directly stop a Process Group using the client."""
-    local_logger.info(f"_stop_pg_direct: Attempting to stop PG {pg_id}")
-    try:
-        pg_details = await nifi_client.get_process_group_details(pg_id) # Needed for revision if set_process_group_state required it
-        if not pg_details or "revision" not in pg_details: # Basic check
-            local_logger.error(f"_stop_pg_direct: Could not get critical details for PG {pg_id} for stopping (e.g. revision).")
-            # Fallback or stricter error handling might be needed if revision is always necessary for set_process_group_state
-            # For now, let's proceed assuming client.set_process_group_state handles this well.
-        
-        stopped_entity = await nifi_client.set_process_group_state(pg_id, "STOPPED")
-        if stopped_entity: 
-             local_logger.info(f"_stop_pg_direct: Stop command issued successfully for PG {pg_id}.")
-             await asyncio.sleep(mcp_settings.get_auto_stop_delay_seconds())
-             return True
-        local_logger.error(f"_stop_pg_direct: Failed to issue stop command for PG {pg_id} (client returned falsy).")
-        return False
-
-    except ValueError as e: 
-        local_logger.warning(f"_stop_pg_direct: ValueError stopping PG {pg_id}: {e}. Might be already stopped or not found.")
-        if "stopped" in str(e).lower(): 
-             await asyncio.sleep(mcp_settings.get_auto_stop_delay_seconds()) 
-             return True
-        return False
-    except Exception as e:
-        local_logger.error(f"_stop_pg_direct: Exception stopping PG {pg_id}: {e}", exc_info=True)
-        return False
 
 def handle_nifi_errors(original_func: Callable[..., Coroutine[Any, Any, Any]]):
     """
@@ -168,7 +144,6 @@ def handle_nifi_errors(original_func: Callable[..., Coroutine[Any, Any, Any]]):
             # For simplicity, let's assume if they are string, they are the intended ones for now.
             if not object_type_for_remediation: object_type_for_remediation = inferred_object_type
             if not object_id_for_remediation: object_id_for_remediation = inferred_object_id
-
 
         while attempt < max_attempts:
             attempt += 1
@@ -226,14 +201,13 @@ def handle_nifi_errors(original_func: Callable[..., Coroutine[Any, Any, Any]]):
                     if target_pg_to_stop_id:
                         local_logger.info(f"[Auto-Stop] Attempting to stop PG: {target_pg_to_stop_id}")
                         try:
-                            stop_success = await _stop_pg_direct(nifi_client, target_pg_to_stop_id, local_logger)
-                            if stop_success:
-                                local_logger.info(f"[Auto-Stop] Parent PG {target_pg_to_stop_id} stop initiated/confirmed. Retrying original operation for '{object_id_for_remediation}' ({original_func.__name__}).")
-                                await asyncio.sleep(mcp_settings.get_auto_feature_retry_delay_seconds()) # Ensure this setting exists and is loaded
-                                # The loop will cause a retry by `continue` or falling through to next iteration if this was the last remediation step
-                                continue # Go to next attempt in the while loop
-                            else:
-                                local_logger.warning(f"[Auto-Stop] Failed to stop parent PG {target_pg_to_stop_id}. Original error will be raised.")
+                            # Use update_process_group_state instead of _stop_pg_direct
+                            await nifi_client.update_process_group_state(target_pg_to_stop_id, "STOPPED")
+                            local_logger.info(f"[Auto-Stop] Parent PG {target_pg_to_stop_id} stop initiated. Waiting for delay before retry...")
+                            await asyncio.sleep(mcp_settings.get_auto_stop_delay_seconds())
+                            local_logger.info(f"[Auto-Stop] Retrying original operation for '{object_id_for_remediation}' ({original_func.__name__}).")
+                            await asyncio.sleep(mcp_settings.get_auto_feature_retry_delay_seconds())
+                            continue # Go to next attempt in the while loop
                         except Exception as e_stop_retry:
                             local_logger.error(f"[Auto-Stop] Exception during parent PG stop attempt for {target_pg_to_stop_id}: {e_stop_retry}", exc_info=True)
                             # Fall through to raise original error
@@ -252,3 +226,51 @@ def handle_nifi_errors(original_func: Callable[..., Coroutine[Any, Any, Any]]):
         return None # Fallback, though an error should have been raised.
 
     return wrapper 
+
+import asyncio
+import time
+from typing import Dict, Any, Optional
+from loguru import logger
+
+from .nifi_client import NiFiClient
+from .api_tools.utils import filter_drop_request_data
+
+async def _handle_drop_request(nifi_client: NiFiClient, connection_id: str, timeout_seconds: int, local_logger) -> Dict[str, Any]:
+    """Helper function to handle the lifecycle of a drop request.
+    
+    Args:
+        nifi_client: The authenticated NiFi client
+        connection_id: The ID of the connection to drop FlowFiles from
+        timeout_seconds: Maximum time to wait for the drop request to complete
+        local_logger: Logger instance with request context
+        
+    Returns:
+        Dict containing the drop request results
+    """
+    try:
+        # Use the new NiFiClient method to handle the drop request
+        result = await nifi_client.handle_drop_request(connection_id, timeout_seconds)
+        
+        # Format the response to match the expected structure
+        return {
+            "success": result["success"],
+            "message": "Successfully purged connection" if result["success"] else result.get("error", "Failed to purge connection"),
+            "results": [{
+                "connection_id": connection_id,
+                "success": result["success"],
+                "dropped_count": result.get("dropped_count") if result["success"] else None,
+                "error": result.get("error") if not result["success"] else None
+            }]
+        }
+
+    except Exception as e:
+        local_logger.error(f"Error during drop request for connection {connection_id}: {e}")
+        return {
+            "success": False,
+            "message": f"Failed to purge connection: {e}",
+            "results": [{
+                "connection_id": connection_id,
+                "success": False,
+                "error": str(e)
+            }]
+        } 

@@ -88,26 +88,72 @@ async def test_auto_stop_delete_running_processor(
         headers=headers_auto_stop_true,
         custom_logger=global_logger
     )
-    # For now, expect error since feature isn't implemented
-    assert delete_result_list[0].get("status") == "error", \
-        "Expected error with Auto-Stop enabled (not implemented yet)"
-    global_logger.info("Test: Got expected error with Auto-Stop enabled")
+    # Feature is now implemented, expect success
+    assert delete_result_list[0].get("status") == "success", \
+        "Expected success with Auto-Stop enabled - feature should stop and then delete the processor"
+    global_logger.info("Test: Successfully deleted running processor with Auto-Stop enabled")
 
-    # Verify processor still exists and is running
-    verify_result_list = await call_tool(
+    # Verify processor no longer exists
+    try:
+        verify_result_list = await call_tool(
+            client=async_client,
+            base_url=base_url,
+            tool_name="get_nifi_object_details",
+            arguments=verify_args,
+            headers=mcp_headers,
+            custom_logger=global_logger
+        )
+        assert False, f"Processor {generate_proc_id} still exists after deletion with Auto-Stop"
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 400 or e.response.status_code == 404:
+            # This is expected - the processor should not exist
+            global_logger.info(f"Test: Confirmed processor {generate_proc_id} no longer exists (got expected error).")
+        else:
+            raise  # Re-raise if it's not a 404 error
+
+    # Also try deleting a stopped processor - for completeness
+    # First create a processor
+    create_args = {
+        "process_group_id": test_pg_with_processors.get("pg_id"),
+        "processor_type": "org.apache.nifi.processors.standard.GenerateFlowFile",
+        "name": "mcp-test-auto-stop-extra",
+        "position_x": 400.0,
+        "position_y": 100.0
+    }
+    create_result_list = await call_tool(
         client=async_client,
         base_url=base_url,
-        tool_name="get_nifi_object_details",
-        arguments=verify_args,
+        tool_name="create_nifi_processor",
+        arguments=create_args,
         headers=mcp_headers,
         custom_logger=global_logger
     )
-    assert verify_result_list[0].get("component", {}).get("state") == "RUNNING", \
-        "Processor should still be running after failed deletion attempt"
-    global_logger.info(f"Test: Confirmed processor {generate_proc_id} is still running after failed deletion")
+    assert create_result_list[0].get("status") in ["success", "warning"], "Failed to create processor for additional test"
+    extra_proc_id = create_result_list[0].get("entity", {}).get("id")
+    assert extra_proc_id, "Failed to get ID for created processor"
+    global_logger.info(f"Test: Created processor {extra_proc_id} for additional test")
 
-    # Attempt delete with Auto-Stop disabled
+    # Auto-terminate relationships for the new processor
+    update_rels_args = {
+        "processor_id": extra_proc_id,
+        "auto_terminated_relationships": ["success"]
+    }
+    await call_tool(
+        client=async_client,
+        base_url=base_url,
+        tool_name="update_nifi_processor_relationships",
+        arguments=update_rels_args,
+        headers=mcp_headers,
+        custom_logger=global_logger
+    )
+
+    # Attempt delete with Auto-Stop disabled (should still work since processor is already stopped)
     headers_auto_stop_false = {**mcp_headers, "X-Mcp-Auto-Stop-Enabled": "false"}
+    delete_args = {
+        "object_type": "processor",
+        "object_id": extra_proc_id,
+        "kwargs": {}
+    }
     delete_result_list = await call_tool(
         client=async_client,
         base_url=base_url,
@@ -116,9 +162,9 @@ async def test_auto_stop_delete_running_processor(
         headers=headers_auto_stop_false,
         custom_logger=global_logger
     )
-    assert delete_result_list[0].get("status") == "error", \
-        "Expected error when deleting running processor with Auto-Stop disabled"
-    global_logger.info("Test: Got expected error with Auto-Stop disabled")
+    assert delete_result_list[0].get("status") == "success", \
+        "Failed to delete stopped processor with Auto-Stop disabled"
+    global_logger.info("Test: Successfully deleted stopped processor with Auto-Stop disabled")
 
 @pytest.mark.anyio
 async def test_auto_delete_processor_with_connections(
@@ -128,7 +174,7 @@ async def test_auto_delete_processor_with_connections(
     mcp_headers: Dict[str, str],
     global_logger: Any
 ):
-    """Test that deleting a processor with connections and auto-delete enabled works correctly."""
+    """Test that deleting a processor with incoming connections and auto-delete enabled works correctly."""
     # Get processor IDs from the fixture
     generate_proc_id = test_pg_with_processors.get("generate_proc_id")
     log_proc_id = test_pg_with_processors.get("log_proc_id")
@@ -153,11 +199,63 @@ async def test_auto_delete_processor_with_connections(
     assert connection_id, "Connection ID not found in response"
     global_logger.info(f"Test: Created connection {connection_id} between processors")
 
-    # Attempt delete with Auto-Delete enabled
+    # First try to delete the LogAttribute processor (which has an incoming connection) with Auto-Delete disabled
+    headers_auto_delete_false = {**mcp_headers, "X-Mcp-Auto-Delete-Enabled": "false"}
+    delete_args = {
+        "object_type": "processor",
+        "object_id": log_proc_id,  # Try to delete LogAttribute processor
+        "kwargs": {}
+    }
+    delete_result_list = await call_tool(
+        client=async_client,
+        base_url=base_url,
+        tool_name="delete_nifi_object",
+        arguments=delete_args,
+        headers=headers_auto_delete_false,
+        custom_logger=global_logger
+    )
+    # Should fail because processor has an incoming connection and auto-delete is disabled
+    assert delete_result_list[0].get("status") == "error", \
+        "Expected error when deleting processor with connections and Auto-Delete disabled"
+    global_logger.info("Test: Got expected error with Auto-Delete disabled")
+
+    # Verify processor and connection still exist
+    verify_proc_args = {
+        "object_type": "processor",
+        "object_id": log_proc_id
+    }
+    verify_proc_list = await call_tool(
+        client=async_client,
+        base_url=base_url,
+        tool_name="get_nifi_object_details",
+        arguments=verify_proc_args,
+        headers=mcp_headers,
+        custom_logger=global_logger
+    )
+    assert verify_proc_list[0].get("component"), \
+        "LogAttribute processor should still exist after failed deletion attempt"
+
+    verify_conn_args = {
+        "object_type": "connection",
+        "object_id": connection_id
+    }
+    verify_conn_list = await call_tool(
+        client=async_client,
+        base_url=base_url,
+        tool_name="get_nifi_object_details",
+        arguments=verify_conn_args,
+        headers=mcp_headers,
+        custom_logger=global_logger
+    )
+    assert verify_conn_list[0].get("component"), \
+        "Connection should still exist after failed processor deletion attempt"
+    global_logger.info("Test: Verified processor and connection still exist after failed deletion")
+
+    # Now try to delete the LogAttribute processor with Auto-Delete enabled
     headers_auto_delete_true = {**mcp_headers, "X-Mcp-Auto-Delete-Enabled": "true"}
     delete_args = {
         "object_type": "processor",
-        "object_id": generate_proc_id,
+        "object_id": log_proc_id,  # Try to delete LogAttribute processor
         "kwargs": {}
     }
     delete_result_list = await call_tool(
@@ -168,16 +266,12 @@ async def test_auto_delete_processor_with_connections(
         headers=headers_auto_delete_true,
         custom_logger=global_logger
     )
-    # The feature is now implemented, so expect success
+    # Should succeed because auto-delete will remove the connection first
     assert delete_result_list[0].get("status") == "success", \
         "Failed to delete processor with Auto-Delete enabled"
     global_logger.info("Test: Successfully deleted processor with Auto-Delete enabled")
 
     # Verify processor is gone
-    verify_proc_args = {
-        "object_type": "processor",
-        "object_id": generate_proc_id
-    }
     try:
         verify_proc_list = await call_tool(
             client=async_client,
@@ -187,19 +281,15 @@ async def test_auto_delete_processor_with_connections(
             headers=mcp_headers,
             custom_logger=global_logger
         )
-        assert False, f"Processor {generate_proc_id} still exists after deletion"
+        assert False, f"LogAttribute processor {log_proc_id} still exists after deletion"
     except httpx.HTTPStatusError as e:
-        if e.response.status_code == 400:
+        if e.response.status_code in [400, 404]:
             # This is expected - the processor should not exist
-            global_logger.info(f"Test: Confirmed processor {generate_proc_id} no longer exists (got expected 400 error).")
+            global_logger.info(f"Test: Confirmed processor {log_proc_id} no longer exists (got expected {e.response.status_code} error).")
         else:
-            raise  # Re-raise if it's not a 400 error
+            raise  # Re-raise if it's not a 400/404 error
 
     # Verify connection is gone
-    verify_conn_args = {
-        "object_type": "connection",
-        "object_id": connection_id
-    }
     try:
         verify_conn_list = await call_tool(
             client=async_client,
@@ -211,27 +301,8 @@ async def test_auto_delete_processor_with_connections(
         )
         assert False, f"Connection {connection_id} still exists after processor deletion"
     except httpx.HTTPStatusError as e:
-        if e.response.status_code == 400:
+        if e.response.status_code in [400, 404]:
             # This is expected - the connection should not exist
-            global_logger.info(f"Test: Confirmed connection {connection_id} no longer exists (got expected 400 error).")
+            global_logger.info(f"Test: Confirmed connection {connection_id} no longer exists (got expected {e.response.status_code} error).")
         else:
-            raise  # Re-raise if it's not a 400 error
-
-    # Attempt delete with Auto-Delete disabled
-    headers_auto_delete_false = {**mcp_headers, "X-Mcp-Auto-Delete-Enabled": "false"}
-    delete_args = {
-        "object_type": "processor",
-        "object_id": log_proc_id,  # Try to delete the other processor
-        "kwargs": {}
-    }
-    delete_result_list = await call_tool(
-        client=async_client,
-        base_url=base_url,
-        tool_name="delete_nifi_object",
-        arguments=delete_args,
-        headers=headers_auto_delete_false,
-        custom_logger=global_logger
-    )
-    assert delete_result_list[0].get("status") == "success", \
-        "Failed to delete processor with Auto-Delete disabled"
-    global_logger.info("Test: Successfully deleted processor with Auto-Delete disabled") 
+            raise  # Re-raise if it's not a 400/404 error 

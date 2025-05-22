@@ -1,22 +1,30 @@
 import os
-# import logging # Remove standard logging
-from loguru import logger # Import Loguru logger
+import logging
+from loguru import logger
 import httpx
-# from dotenv import load_dotenv # Removed dotenv
-import uuid # Import uuid for client ID generation
-from typing import Optional, Dict, Any, Union, List, Literal # Add Union and List
-from mcp.server.fastmcp.exceptions import ToolError # Import ToolError
+import uuid
+from typing import Optional, Dict, Any, Union, List, Literal, Tuple
+from mcp.server.fastmcp.exceptions import ToolError
+import asyncio
+import time
+import base64
+import json
 
-# Load environment variables from .env file - REMOVED
-# load_dotenv()
-
-# Set up logging - REMOVED standard logging setup
-# logging.basicConfig(level=logging.INFO)
-# logger = logging.getLogger(__name__)
-
+# Define exceptions locally instead of importing them
 class NiFiAuthenticationError(Exception):
     """Raised when there is an error authenticating with NiFi."""
     pass
+
+class NiFiOperationError(Exception):
+    """Raised when there is an error performing an operation in NiFi."""
+    pass
+
+# Define needed models locally
+class AuthParams:
+    """Authentication parameters for NiFi."""
+    def __init__(self, username: Optional[str] = None, password: Optional[str] = None):
+        self.username = username
+        self.password = password
 
 class NiFiClient:
     """A simple asynchronous client for the NiFi REST API."""
@@ -383,65 +391,88 @@ class NiFiClient:
             logger.error(f"An unexpected error occurred getting connection details for {connection_id}: {e}", exc_info=True)
             raise ConnectionError(f"An unexpected error occurred getting connection details: {e}") from e
 
-    async def list_connections(self, process_group_id: str, user_request_id: str = "-", action_id: str = "-") -> list[dict]:
-        """Lists connections within a specified process group."""
-        local_logger = logger.bind(user_request_id=user_request_id, action_id=action_id)
+    async def list_connections(self, process_group_id: Optional[str] = None, user_request_id: str = "-", action_id: str = "-") -> list[dict]:
+        """Lists all connections in a process group or in the entire flow if no process_group_id is provided."""
         if not self._token:
-            local_logger.error("Authentication required before listing connections.")
             raise NiFiAuthenticationError("Client is not authenticated. Call authenticate() first.")
 
         client = await self._get_client()
-        endpoint = f"/process-groups/{process_group_id}/connections"
+        
+        if process_group_id:
+            # List connections in a specific process group
+            endpoint = f"/process-groups/{process_group_id}/connections"
+            log_message = f"Fetching connections in process group {process_group_id}"
+        else:
+            # List all connections in the flow
+            endpoint = "/connections"
+            log_message = "Fetching all connections in the flow"
+            
+        logger.info(f"{log_message} from {self.base_url}{endpoint}")
+        
         try:
-            local_logger.info(f"Fetching connections for group {process_group_id} from {self.base_url}{endpoint}")
-            response = await client.get(endpoint)
+            response = await client.get(
+                endpoint,
+                headers={"User-Request-ID": user_request_id, "Action-ID": action_id}
+            )
             response.raise_for_status()
             data = response.json()
+            
+            # Extract the connections from the response
             connections = data.get("connections", [])
-            local_logger.info(f"Found {len(connections)} connections in group {process_group_id}.")
+            logger.info(f"Successfully fetched {len(connections)} connections")
             return connections
-
+            
         except httpx.HTTPStatusError as e:
-            local_logger.error(f"Failed to list connections for group {process_group_id}: {e.response.status_code} - {e.response.text}")
-            raise ConnectionError(f"Failed to list connections: {e.response.status_code}") from e
-        except (httpx.RequestError, ValueError) as e:
-            local_logger.error(f"Error listing connections for group {process_group_id}: {e}")
+            logger.error(f"Error listing connections: {e.response.status_code} - {e.response.text}")
+            raise ConnectionError(f"Failed to list connections: {e.response.status_code}, {e.response.text}") from e
+        except httpx.RequestError as e:
+            logger.error(f"Error listing connections: {e}")
             raise ConnectionError(f"Error listing connections: {e}") from e
-        except Exception as e:
-            local_logger.error(f"An unexpected error occurred listing connections: {e}", exc_info=True)
-            raise ConnectionError(f"An unexpected error occurred listing connections: {e}") from e
 
-    async def delete_connection(self, connection_id: str, version_number: int) -> bool:
-        """Deletes a connection given its ID and current revision version number."""
+    async def delete_connection(self, connection_id: str, version_number: Optional[int] = None) -> bool:
+        """Deletes a connection given its ID and optionally a revision version. 
+           If version is not provided, it will fetch the current version."""
         if not self._token:
             raise NiFiAuthenticationError("Client is not authenticated. Call authenticate() first.")
 
         client = await self._get_client()
-        # Use the integer version number in the query parameter
+        
+        # Get current version if not provided
+        if version_number is None:
+            try:
+                connection_details = await self.get_connection(connection_id)
+                version_number = connection_details.get("revision", {}).get("version")
+                if version_number is None:
+                    raise ValueError(f"Could not determine revision version for connection {connection_id}")
+                logger.info(f"Using fetched revision version {version_number} for connection {connection_id}")
+            except Exception as e:
+                logger.error(f"Failed to fetch connection {connection_id} details to get version: {e}")
+                raise
+
         endpoint = f"/connections/{connection_id}?version={version_number}&clientId={self._client_id}"
 
         try:
-            logger.info(f"Attempting to delete connection {connection_id} (version {version_number}) using {self.base_url}{endpoint}")
+            logger.info(f"Deleting connection {connection_id} (version {version_number}) from {self.base_url}{endpoint}")
             response = await client.delete(endpoint)
-            response.raise_for_status() # Raises HTTPStatusError for 4xx/5xx
+            response.raise_for_status()
 
             if response.status_code == 200:
-                 logger.info(f"Successfully deleted connection {connection_id}.")
-                 return True
+                logger.info(f"Successfully deleted connection {connection_id}.")
+                return True
             else:
-                 logger.warning(f"Connection deletion for {connection_id} returned status {response.status_code}, but expected 200.")
-                 return False
+                logger.warning(f"Connection deletion for {connection_id} returned status {response.status_code}, expected 200.")
+                return False
 
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 404:
-                 logger.warning(f"Connection {connection_id} not found for deletion.")
-                 return False
+                logger.warning(f"Connection {connection_id} not found for deletion.")
+                return False
             elif e.response.status_code == 409:
-                 logger.error(f"Conflict deleting connection {connection_id}. Check revision version ({version_number}). Response: {e.response.text}")
-                 raise ValueError(f"Conflict deleting connection {connection_id}. Ensure correct version ({version_number}) is used.") from e
+                logger.error(f"Conflict deleting connection {connection_id}. Check revision version ({version_number}) or ensure connection is empty. Response: {e.response.text}")
+                raise ValueError(f"Conflict deleting connection {connection_id}. Ensure correct version ({version_number}) and emptiness.") from e
             else:
-                 logger.error(f"Failed to delete connection {connection_id}: {e.response.status_code} - {e.response.text}")
-                 raise ConnectionError(f"Failed to delete connection: {e.response.status_code}, {e.response.text}") from e
+                logger.error(f"Failed to delete connection {connection_id}: {e.response.status_code} - {e.response.text}")
+                raise ConnectionError(f"Failed to delete connection: {e.response.status_code}, {e.response.text}") from e
         except httpx.RequestError as e:
             logger.error(f"Error deleting connection {connection_id}: {e}")
             raise ConnectionError(f"Error deleting connection: {e}") from e
@@ -729,7 +760,12 @@ class NiFiClient:
             logger.info(f"Fetching bulletins from {self.base_url}{endpoint} with params: {params}")
             response = await client.get(endpoint, params=params)
             response.raise_for_status()
-            bulletins = response.json().get("bulletins", [])
+
+            # Step 1: Get the raw JSON string from the response
+            raw_json_string = response.text  
+            cleaned_json_string = raw_json_string.replace('\n', '\\n')
+            parsed_json = json.loads(cleaned_json_string)
+            bulletins = parsed_json.get('bulletinBoard', {}).get('bulletins', [])
             logger.info(f"Successfully fetched {len(bulletins)} bulletins.")
             return bulletins
 
@@ -1364,538 +1400,318 @@ class NiFiClient:
         update_payload = {
             "id": pg_id,
             "state": normalized_state,
-            # No revision needed for this bulk endpoint
+            "disconnectedNodeAcknowledged": False
         }
 
         try:
-            logger.info(f"Setting state of all components in process group {pg_id} to {normalized_state} via {self.base_url}{endpoint}")
+            logger.info(f"Setting process group {pg_id} state to {normalized_state}")
             response = await client.put(endpoint, json=update_payload)
             response.raise_for_status()
-            updated_entity = response.json() # Response contains PG entity with potentially updated component counts/states
-            logger.info(f"Successfully initiated state change for process group {pg_id} to {normalized_state}.")
-            # Note: This action is asynchronous on the NiFi side. The response indicates submission success.
-            # The actual state of individual components might take time to update.
+            updated_entity = response.json()
+            logger.info(f"Successfully set process group {pg_id} state to {normalized_state}")
             return updated_entity
 
         except httpx.HTTPStatusError as e:
-            if e.response.status_code == 404:
-                logger.warning(f"Process group {pg_id} not found for state update.")
-                raise ValueError(f"Process group with ID {pg_id} not found.") from e
-            elif e.response.status_code == 409:
-                 # 409 could mean various things here, maybe permissions or invalid state transition request
-                 logger.error(f"Conflict updating state for process group {pg_id}. Response: {e.response.text}")
-                 raise ValueError(f"Conflict updating state for process group {pg_id}: {e.response.text}") from e
-            else:
-                logger.error(f"Failed to update state for process group {pg_id}: {e.response.status_code} - {e.response.text}")
-                raise ConnectionError(f"Failed to update process group state: {e.response.status_code}, {e.response.text}") from e
-        except (httpx.RequestError, ValueError) as e:
-            logger.error(f"Error updating state for process group {pg_id}: {e}")
-            raise ConnectionError(f"Error updating process group state: {e}") from e
+            logger.error(f"Failed to set process group {pg_id} state to {normalized_state}: {e.response.status_code} - {e.response.text}")
+            raise ConnectionError(f"Failed to set process group state: {e.response.status_code}, {e.response.text}") from e
         except Exception as e:
-            logger.error(f"An unexpected error occurred updating state for process group {pg_id}: {e}", exc_info=True)
-            raise ConnectionError(f"An unexpected error occurred updating process group state: {e}") from e
+            logger.error(f"Error setting process group {pg_id} state to {normalized_state}: {e}")
+            raise ConnectionError(f"Error setting process group state: {e}") from e
 
-    async def get_process_group_status_snapshot(self, process_group_id: str) -> dict:
-        """Fetches the status snapshot for a specific process group, including component states and queue sizes.
-
+    async def purge_process_group_flowfiles(self, process_group_id: str, timeout_seconds: int = 30) -> Dict[str, Any]:
+        """
+        Purges all flowfiles from all connections in a process group.
+        
         Args:
-            process_group_id: The ID of the target process group.
-
+            process_group_id: The ID of the process group containing connections to purge
+            timeout_seconds: Maximum time in seconds to wait for each purge operation
+            
         Returns:
-            A dictionary containing the process group status snapshot, typically under the 'processGroupStatus' key.
+            Dict containing purge results with success status, message, and detailed results
+        """
+        if not self._token:
+            raise NiFiAuthenticationError("Client is not authenticated. Call authenticate() first.")
+        
+        # First, get all connections in the process group
+        connections = await self.list_connections(process_group_id)
+        
+        if not connections:
+            return {
+                "success": True,
+                "message": f"No connections found in process group {process_group_id}",
+                "results": []
+            }
+        
+        results = []
+        success = True
+        
+        # Process each connection using the new handle_drop_request method
+        for connection in connections:
+            connection_id = connection.get("id")
+            if not connection_id:
+                continue
+                
+            result = await self.handle_drop_request(connection_id, timeout_seconds)
+            results.append(result)
+            if not result["success"]:
+                success = False
+        
+        return {
+            "success": success,
+            "message": f"Purged {sum(1 for r in results if r.get('success', False))} of {len(results)} connections in process group {process_group_id}",
+            "results": results
+        }
+
+    async def create_drop_request(self, connection_id: str) -> Dict[str, Any]:
+        """Creates a new drop request for a connection.
+        
+        Args:
+            connection_id: The ID of the connection to drop FlowFiles from
+            
+        Returns:
+            Dict containing the drop request details with ID directly accessible
         """
         if not self._token:
             raise NiFiAuthenticationError("Client is not authenticated. Call authenticate() first.")
 
         client = await self._get_client()
-        endpoint = f"/flow/process-groups/{process_group_id}/status"
+        endpoint = f"/flowfile-queues/{connection_id}/drop-requests"
+        
         try:
-            logger.info(f"Fetching status snapshot for process group {process_group_id} from {self.base_url}{endpoint}")
+            logger.info(f"Creating drop request for connection {connection_id}")
+            response = await client.post(endpoint)
+            response.raise_for_status()
+            drop_request_data = response.json()
+            
+            # Extract the drop request details from the response
+            drop_request = drop_request_data.get("dropRequest", {})
+            request_id = drop_request.get("id")
+            
+            if not request_id:
+                raise ValueError("No drop request ID returned from NiFi")
+                
+            logger.info(f"Successfully created drop request {request_id} for connection {connection_id}")
+            
+            # Return the drop request with ID directly accessible at the top level
+            # and also preserve the original structure
+            return {
+                "id": request_id,
+                "dropRequest": drop_request,
+                "original": drop_request_data
+            }
+            
+        except httpx.HTTPStatusError as e:
+            logger.error(f"Failed to create drop request for connection {connection_id}: {e.response.status_code} - {e.response.text}")
+            raise ConnectionError(f"Failed to create drop request: {e.response.status_code}, {e.response.text}") from e
+        except Exception as e:
+            logger.error(f"Error creating drop request for connection {connection_id}: {e}")
+            raise ConnectionError(f"Error creating drop request: {e}") from e
+
+    async def get_drop_request(self, connection_id: str, request_id: str) -> Dict[str, Any]:
+        """Gets the status of a drop request.
+        
+        Args:
+            connection_id: The ID of the connection
+            request_id: The ID of the drop request
+            
+        Returns:
+            Dict containing the drop request status
+        """
+        if not self._token:
+            raise NiFiAuthenticationError("Client is not authenticated. Call authenticate() first.")
+
+        client = await self._get_client()
+        endpoint = f"/flowfile-queues/{connection_id}/drop-requests/{request_id}"
+        
+        try:
             response = await client.get(endpoint)
             response.raise_for_status()
             status_data = response.json()
-            # The core data is usually within processGroupStatus
-            logger.info(f"Successfully fetched status snapshot for process group {process_group_id}")
-            return status_data.get("processGroupStatus", {}) # Return the main status part
-
+            
+            return status_data.get("dropRequest", {})
+            
         except httpx.HTTPStatusError as e:
-            if e.response.status_code == 404:
-                logger.warning(f"Process group {process_group_id} not found when fetching status snapshot.")
-                raise ValueError(f"Process group with ID {process_group_id} not found.") from e
-            else:
-                logger.error(f"Failed to get status snapshot for process group {process_group_id}: {e.response.status_code} - {e.response.text}")
-                raise ConnectionError(f"Failed to get process group status snapshot: {e.response.status_code}, {e.response.text}") from e
-        except (httpx.RequestError, ValueError) as e:
-            logger.error(f"Error getting status snapshot for process group {process_group_id}: {e}")
-            raise ConnectionError(f"Error getting process group status snapshot: {e}") from e
+            logger.error(f"Failed to get drop request status for {request_id}: {e.response.status_code} - {e.response.text}")
+            raise ConnectionError(f"Failed to get drop request status: {e.response.status_code}, {e.response.text}") from e
         except Exception as e:
-            logger.error(f"An unexpected error occurred getting status snapshot for {process_group_id}: {e}", exc_info=True)
-            raise ConnectionError(f"An unexpected error occurred getting process group status snapshot: {e}") from e
+            logger.error(f"Error getting drop request status for {request_id}: {e}")
+            raise ConnectionError(f"Error getting drop request status: {e}") from e
 
-    async def get_bulletin_board(self, group_id: Optional[str] = None, source_id: Optional[str] = None, limit: int = 100) -> List[Dict]:
-        """Fetches bulletins from the NiFi bulletin board, optionally filtered.
-
-        Args:
-            group_id: Optional process group ID to filter bulletins by.
-            source_id: Optional component ID (processor, port, etc.) to filter bulletins by.
-            limit: Maximum number of bulletins to return.
-
-        Returns:
-            A list of bulletin dictionaries.
-        """
+    async def delete_drop_request(self, connection_id: str, request_id: str) -> None:
+        """Delete a drop request for a connection to clean up."""
         if not self._token:
             raise NiFiAuthenticationError("Client is not authenticated. Call authenticate() first.")
 
         client = await self._get_client()
-        endpoint = "/flow/bulletin-board"
-        params = {"limit": limit}
-        log_filters = []
-        if group_id:
-            params["groupId"] = group_id
-            log_filters.append(f"group_id={group_id}")
-        if source_id:
-            params["sourceId"] = source_id
-            log_filters.append(f"source_id={source_id}")
-
-        filter_str = " and ".join(log_filters) if log_filters else "no filters"
-
+        endpoint = f"/flowfile-queues/{connection_id}/drop-requests/{request_id}"
+        
         try:
-            logger.info(f"Fetching bulletins from {self.base_url}{endpoint} with limit {limit} ({filter_str})")
-            response = await client.get(endpoint, params=params)
-            response.raise_for_status()
-            data = response.json()
-            bulletins = data.get("bulletinBoard", {}).get("bulletins", [])
-            logger.info(f"Successfully fetched {len(bulletins)} bulletins.")
-            return bulletins
-
-        except httpx.HTTPStatusError as e:
-            logger.error(f"Failed to get bulletins: {e.response.status_code} - {e.response.text}")
-            raise ConnectionError(f"Failed to get bulletins: {e.response.status_code}, {e.response.text}") from e
-        except (httpx.RequestError, ValueError) as e:
-            logger.error(f"Error getting bulletins: {e}")
-            raise ConnectionError(f"Error getting bulletins: {e}") from e
-        except Exception as e:
-            logger.error(f"An unexpected error occurred getting bulletins: {e}", exc_info=True)
-            raise ConnectionError(f"An unexpected error occurred getting bulletins: {e}") from e
-
-    def __repr__(self):
-        return f"<{type(self).__name__} base_url={self.base_url} authenticated={self.is_authenticated}>"
-
-    # --- FlowFile Queue Listing Methods ---
-
-    async def create_flowfile_listing_request(self, connection_id: str) -> dict:
-        """Submits a request to list FlowFiles in a connection's queue."""
-        if not self._token:
-            raise NiFiAuthenticationError("Client is not authenticated. Call authenticate() first.")
-
-        client = await self._get_client()
-        endpoint = f"/flowfile-queues/{connection_id}/listing-requests"
-        # Payload is empty for listing request creation
-        try:
-            logger.info(f"Submitting FlowFile listing request for connection {connection_id}")
-            response = await client.post(endpoint, json={}) # POST with empty JSON body
-            response.raise_for_status()
-            request_data = response.json()
-            # Returns the listing request entity, including its ID
-            logger.info(f"Successfully submitted listing request {request_data.get('listingRequest',{}).get('id')} for connection {connection_id}")
-            return request_data.get("listingRequest", {}) # Return just the request part
-
-        except httpx.HTTPStatusError as e:
-            if e.response.status_code == 404:
-                logger.warning(f"Connection {connection_id} not found for FlowFile listing request.")
-                raise ValueError(f"Connection with ID {connection_id} not found.") from e
-            else:
-                logger.error(f"Failed to create FlowFile listing request for connection {connection_id}: {e.response.status_code} - {e.response.text}")
-                raise ConnectionError(f"Failed to create FlowFile listing request: {e.response.status_code}, {e.response.text}") from e
-        except (httpx.RequestError, ValueError) as e:
-            logger.error(f"Error creating FlowFile listing request for connection {connection_id}: {e}")
-            raise ConnectionError(f"Error creating FlowFile listing request: {e}") from e
-        except Exception as e:
-            logger.error(f"An unexpected error occurred creating FlowFile listing request for {connection_id}: {e}", exc_info=True)
-            raise ConnectionError(f"An unexpected error occurred creating FlowFile listing request: {e}") from e
-
-    async def get_flowfile_listing_request(self, connection_id: str, request_id: str) -> dict:
-        """Retrieves the status and results of a specific FlowFile listing request."""
-        if not self._token:
-            raise NiFiAuthenticationError("Client is not authenticated. Call authenticate() first.")
-
-        client = await self._get_client()
-        endpoint = f"/flowfile-queues/{connection_id}/listing-requests/{request_id}"
-        try:
-            logger.debug(f"Fetching status for FlowFile listing request {request_id} on connection {connection_id}")
-            response = await client.get(endpoint)
-            response.raise_for_status()
-            request_data = response.json()
-            logger.debug(f"Successfully fetched status for listing request {request_id}. Finished: {request_data.get('listingRequest',{}).get('finished')}")
-            return request_data.get("listingRequest", {}) # Return just the request part
-
-        except httpx.HTTPStatusError as e:
-            if e.response.status_code == 404:
-                logger.warning(f"FlowFile listing request {request_id} or connection {connection_id} not found.")
-                raise ValueError(f"FlowFile listing request {request_id} or connection {connection_id} not found.") from e
-            else:
-                logger.error(f"Failed to get FlowFile listing request {request_id}: {e.response.status_code} - {e.response.text}")
-                raise ConnectionError(f"Failed to get FlowFile listing request: {e.response.status_code}, {e.response.text}") from e
-        except (httpx.RequestError, ValueError) as e:
-            logger.error(f"Error getting FlowFile listing request {request_id}: {e}")
-            raise ConnectionError(f"Error getting FlowFile listing request: {e}") from e
-        except Exception as e:
-            logger.error(f"An unexpected error occurred getting FlowFile listing request {request_id}: {e}", exc_info=True)
-            raise ConnectionError(f"An unexpected error occurred getting FlowFile listing request: {e}") from e
-
-    async def delete_flowfile_listing_request(self, connection_id: str, request_id: str) -> bool:
-        """Deletes a completed FlowFile listing request."""
-        if not self._token:
-            raise NiFiAuthenticationError("Client is not authenticated. Call authenticate() first.")
-
-        client = await self._get_client()
-        endpoint = f"/flowfile-queues/{connection_id}/listing-requests/{request_id}"
-        try:
-            logger.info(f"Deleting FlowFile listing request {request_id} on connection {connection_id}")
             response = await client.delete(endpoint)
-            response.raise_for_status() # Should return 200 OK
-            # The response body is the deleted request entity, we just need confirmation
-            logger.info(f"Successfully deleted listing request {request_id}.")
-            return True
-
-        except httpx.HTTPStatusError as e:
-            if e.response.status_code == 404:
-                 # If it's already gone, consider it success for cleanup purposes
-                 logger.warning(f"FlowFile listing request {request_id} not found for deletion (already deleted?).")
-                 return True
-            else:
-                 logger.error(f"Failed to delete FlowFile listing request {request_id}: {e.response.status_code} - {e.response.text}")
-                 raise ConnectionError(f"Failed to delete FlowFile listing request: {e.response.status_code}, {e.response.text}") from e
-        except httpx.RequestError as e:
-            logger.error(f"Error deleting FlowFile listing request {request_id}: {e}")
-            raise ConnectionError(f"Error deleting FlowFile listing request: {e}") from e
-        except Exception as e:
-            logger.error(f"An unexpected error occurred deleting FlowFile listing request {request_id}: {e}", exc_info=True)
-            raise ConnectionError(f"An unexpected error occurred deleting FlowFile listing request: {e}") from e
-
-    # --- Provenance Methods ---
-
-    async def update_process_group_state(self, pg_id: str, state: str) -> dict:
-        """Starts or stops all eligible components within a specific process group."""
-        if not self._token:
-            raise NiFiAuthenticationError("Client is not authenticated. Call authenticate() first.")
-
-        normalized_state = state.upper()
-        if normalized_state not in ["RUNNING", "STOPPED"]:
-            raise ValueError("Invalid state specified. Must be 'RUNNING' or 'STOPPED'.")
-
-        client = await self._get_client()
-        endpoint = f"/flow/process-groups/{pg_id}"
-
-        # The payload is simple for the bulk operation
-        update_payload = {
-            "id": pg_id,
-            "state": normalized_state,
-            # No revision needed for this bulk endpoint
-        }
-
-        try:
-            logger.info(f"Setting state of all components in process group {pg_id} to {normalized_state} via {self.base_url}{endpoint}")
-            response = await client.put(endpoint, json=update_payload)
             response.raise_for_status()
-            updated_entity = response.json() # Response contains PG entity with potentially updated component counts/states
-            logger.info(f"Successfully initiated state change for process group {pg_id} to {normalized_state}.")
-            # Note: This action is asynchronous on the NiFi side. The response indicates submission success.
-            # The actual state of individual components might take time to update.
-            return updated_entity
-
+            logger.info(f"Successfully deleted drop request {request_id} for connection {connection_id}")
+            
         except httpx.HTTPStatusError as e:
-            if e.response.status_code == 404:
-                logger.warning(f"Process group {pg_id} not found for state update.")
-                raise ValueError(f"Process group with ID {pg_id} not found.") from e
-            elif e.response.status_code == 409:
-                 # 409 could mean various things here, maybe permissions or invalid state transition request
-                 logger.error(f"Conflict updating state for process group {pg_id}. Response: {e.response.text}")
-                 raise ValueError(f"Conflict updating state for process group {pg_id}: {e.response.text}") from e
-            else:
-                logger.error(f"Failed to update state for process group {pg_id}: {e.response.status_code} - {e.response.text}")
-                raise ConnectionError(f"Failed to update process group state: {e.response.status_code}, {e.response.text}") from e
-        except (httpx.RequestError, ValueError) as e:
-            logger.error(f"Error updating state for process group {pg_id}: {e}")
-            raise ConnectionError(f"Error updating process group state: {e}") from e
+            logger.warning(f"Failed to delete drop request {request_id}: {e.response.status_code} - {e.response.text}")
+            # Don't raise an error here as this is cleanup
         except Exception as e:
-            logger.error(f"An unexpected error occurred updating state for process group {pg_id}: {e}", exc_info=True)
-            raise ConnectionError(f"An unexpected error occurred updating process group state: {e}") from e
+            logger.warning(f"Error deleting drop request {request_id}: {e}")
+            # Don't raise an error here as this is cleanup
 
-    async def submit_provenance_query(self, query_payload: Dict[str, Any]) -> dict:
-        """Submits a new provenance query.
-
+    async def delete_connections_batch(self, connection_ids: List[str]) -> Dict[str, Dict[str, Any]]:
+        """Deletes multiple connections in a single operation, handling version retrieval.
+        
         Args:
-            query_payload: The dictionary representing the ProvenanceRequestDTO.
-                           Example: {"searchTerms": {"flowFileUuid": "..."}, "maxResults": 100}
-
+            connection_ids: List of connection IDs to delete
+            
         Returns:
-            The dictionary representing the submitted ProvenanceQueryDTO, including the query ID.
+            Dictionary mapping connection IDs to their deletion results:
+            {
+                "connection_id": {
+                    "success": True/False,
+                    "message": "Success/error message",
+                    "error": Exception object if failed
+                }
+            }
         """
         if not self._token:
             raise NiFiAuthenticationError("Client is not authenticated. Call authenticate() first.")
-
+        
+        # Return dictionary mapping connection ID -> result
+        results = {}
+        
+        # Get the client just once and reuse it for all operations
         client = await self._get_client()
-        endpoint = "/provenance"
-        try:
-            # logger.info(f"Submitting provenance query: {query_payload}") # Moved logging
-            
-            # --- Restructure payload to match browser --- 
-            original_search_terms = query_payload.get("searchTerms", {})
-            formatted_search_terms = {}
-            for key, value in original_search_terms.items():
-                # Map known keys to NiFi's expected format
-                nifi_key = None
-                if key == "componentId":
-                    nifi_key = "ProcessorID" # Based on browser example for component
-                elif key == "flowFileUuid":
-                    nifi_key = "FlowFileUUID"
-                # Add other potential mappings here (e.g., eventType -> EventType?)
-                
-                if nifi_key:
-                    formatted_search_terms[nifi_key] = {"value": value, "inverse": False}
-                else:
-                    # Handle unknown keys - log warning and try a simple capitalization
-                    logger.warning(f"Unknown provenance search term key '{key}'. Attempting capitalization.")
-                    formatted_search_terms[key.capitalize()] = {"value": value, "inverse": False}
-            
-            # Build the final request payload structure
-            final_request_structure = {
-                "maxResults": query_payload.get("maxResults", 1000), # Re-added: Seems required by NiFi API
-                "summarize": query_payload.get("summarize", True), # Default like browser
-                "incrementalResults": query_payload.get("incrementalResults", False), # Default like browser
-                "searchTerms": formatted_search_terms,
-                # Add sorting to get most recent first
-                "sortColumn": "eventTime",
-                "sortOrder": "DESC",
-                # Add other optional fields from ProvenanceRequestDTO if needed (startDate, endDate etc.)
+        
+        # Process each connection
+        for connection_id in connection_ids:
+            results[connection_id] = {
+                "success": False,
+                "message": "",
+                "error": None
             }
             
-            # Wrap in the outer "provenance" -> "request" keys
-            final_payload_to_send = {"provenance": {"request": final_request_structure}}
-            # --------------------------------------------
-            
-            # --- Log the payload ACTUALLY being sent --- 
-            logger.info(f"Submitting restructured provenance query payload: {final_payload_to_send}")
-            # -------------------------------------------
+            try:
+                # Get current version
+                connection_details = None
+                try:
+                    # Use direct API call rather than self.get_connection to avoid potential client recreation
+                    endpoint = f"/connections/{connection_id}"
+                    response = await client.get(endpoint)
+                    response.raise_for_status()
+                    connection_details = response.json()
+                    
+                    version_number = connection_details.get("revision", {}).get("version")
+                    if version_number is None:
+                        raise ValueError(f"Could not determine revision version for connection {connection_id}")
+                    logger.info(f"Using fetched revision version {version_number} for batch deletion of connection {connection_id}")
+                except Exception as e:
+                    logger.error(f"Failed to fetch connection {connection_id} details to get version: {e}")
+                    results[connection_id]["message"] = f"Failed to get connection details: {e}"
+                    results[connection_id]["error"] = e
+                    continue
 
-            # Use the restructured payload
-            response = await client.post(endpoint, json=final_payload_to_send)
-            response.raise_for_status()
-            query_data = response.json()
-            # Returns ProvenanceDTO which contains the query details
-            logger.info(f"Successfully submitted provenance query {query_data.get('provenance',{}).get('id')}")
-            return query_data.get("provenance", {}) # Return the provenance query part
-
-        except httpx.HTTPStatusError as e:
-            logger.error(f"Failed to submit provenance query: {e.response.status_code} - {e.response.text}")
-            raise ConnectionError(f"Failed to submit provenance query: {e.response.status_code}, {e.response.text}") from e
-        except (httpx.RequestError, ValueError) as e:
-            logger.error(f"Error submitting provenance query: {e}")
-            raise ConnectionError(f"Error submitting provenance query: {e}") from e
-        except Exception as e:
-            logger.error(f"An unexpected error occurred submitting provenance query: {e}", exc_info=True)
-            raise ConnectionError(f"An unexpected error occurred submitting provenance query: {e}") from e
-
-    async def get_provenance_query(self, query_id: str) -> dict:
-        """Retrieves the status of a specific provenance query."""
-        if not self._token:
-            raise NiFiAuthenticationError("Client is not authenticated. Call authenticate() first.")
-
-        client = await self._get_client()
-        endpoint = f"/provenance/{query_id}"
-        try:
-            logger.debug(f"Fetching status for provenance query {query_id}")
-            response = await client.get(endpoint)
-            response.raise_for_status()
-            query_data = response.json()
-            logger.debug(f"Successfully fetched status for provenance query {query_id}. Finished: {query_data.get('provenance',{}).get('query', {}).get('finished')}")
-            return query_data.get("provenance", {}) # Return the provenance query part
-
-        except httpx.HTTPStatusError as e:
-            if e.response.status_code == 404:
-                logger.warning(f"Provenance query {query_id} not found.")
-                raise ValueError(f"Provenance query {query_id} not found.") from e
-            else:
-                logger.error(f"Failed to get provenance query {query_id}: {e.response.status_code} - {e.response.text}")
-                raise ConnectionError(f"Failed to get provenance query: {e.response.status_code}, {e.response.text}") from e
-        except (httpx.RequestError, ValueError) as e:
-            logger.error(f"Error getting provenance query {query_id}: {e}")
-            raise ConnectionError(f"Error getting provenance query: {e}") from e
-        except Exception as e:
-            logger.error(f"An unexpected error occurred getting provenance query {query_id}: {e}", exc_info=True)
-            raise ConnectionError(f"An unexpected error occurred getting provenance query: {e}") from e
-
-    async def get_provenance_results(self, query_id: str) -> List[Dict]:
-        """Retrieves the results (events) of a completed provenance query."""
-        if not self._token:
-            raise NiFiAuthenticationError("Client is not authenticated. Call authenticate() first.")
-
-        # First, get the query status to ensure it's finished and get results info
-        query_info = await self.get_provenance_query(query_id)
-        if not query_info.get("finished"): # Correct check directly on query_info
-            raise ValueError(f"Provenance query {query_id} is not finished yet.") 
+                # Attempt to delete
+                endpoint = f"/connections/{connection_id}?version={version_number}&clientId={self._client_id}"
+                logger.info(f"Batch deleting connection {connection_id} (version {version_number}) from {self.base_url}{endpoint}")
+                response = await client.delete(endpoint)
+                response.raise_for_status()
+                
+                # Record result
+                if response.status_code == 200:
+                    logger.info(f"Successfully batch deleted connection {connection_id}.")
+                    results[connection_id]["success"] = True
+                    results[connection_id]["message"] = "Successfully deleted"
+                else:
+                    logger.warning(f"Connection batch deletion for {connection_id} returned status {response.status_code}, expected 200.")
+                    results[connection_id]["message"] = f"Unexpected response status: {response.status_code}"
+                
+            except httpx.HTTPStatusError as e:
+                error_msg = ""
+                # Classify common error conditions
+                if e.response.status_code == 404:
+                    error_msg = f"Connection {connection_id} not found for deletion."
+                    logger.warning(error_msg)
+                elif e.response.status_code == 409:
+                    error_text = e.response.text
+                    if "running" in error_text.lower() or "active" in error_text.lower():
+                        error_msg = f"Cannot delete connection {connection_id} because upstream component is running"
+                        logger.warning(error_msg)
+                    elif "has data" in error_text.lower() or "queued" in error_text.lower():
+                        error_msg = f"Cannot delete connection {connection_id} because it has queued data"
+                        logger.warning(error_msg)
+                    else:
+                        error_msg = f"Conflict deleting connection {connection_id}. Check revision or state."
+                        logger.error(f"{error_msg} Response: {e.response.text}")
+                else:
+                    error_msg = f"Failed to delete connection: {e.response.status_code}, {e.response.text}"
+                    logger.error(f"Failed to delete connection {connection_id}: {e.response.status_code} - {e.response.text}")
+                    
+                results[connection_id]["message"] = error_msg
+                results[connection_id]["error"] = e
+                
+            except Exception as e:
+                error_msg = f"Error deleting connection: {str(e)}"
+                logger.error(f"An unexpected error occurred deleting connection {connection_id}: {e}", exc_info=True)
+                
+                results[connection_id]["message"] = error_msg
+                results[connection_id]["error"] = e
         
-        results = query_info.get("results", {})
-        provenance_events = results.get("provenanceEvents", [])
-        logger.info(f"Retrieved {len(provenance_events)} events from completed provenance query {query_id}")
-        return provenance_events # Return the list of events
+        # Return overall results
+        return results
 
-    async def delete_provenance_query(self, query_id: str) -> bool:
-        """Deletes a completed provenance query."""
-        if not self._token:
-            raise NiFiAuthenticationError("Client is not authenticated. Call authenticate() first.")
-
-        client = await self._get_client()
-        endpoint = f"/provenance/{query_id}"
+    async def handle_drop_request(self, connection_id: str, timeout_seconds: int = 30) -> Dict[str, Any]:
+        """Handles a drop request for a connection's flowfiles from creation through completion/polling."""
         try:
-            logger.info(f"Deleting provenance query {query_id}")
-            response = await client.delete(endpoint)
-            response.raise_for_status() # Should return 200 OK
-            logger.info(f"Successfully deleted provenance query {query_id}.")
-            return True
+            # Create the drop request
+            drop_request_result = await self.create_drop_request(connection_id)
+            request_id = drop_request_result.get("id")
+            
+            if not request_id:
+                raise ValueError("No drop request ID found in response")
+            
+            # Poll until complete or timeout
+            start_time = time.time()
+            final_status = None
+            
+            while True:
+                if time.time() - start_time > timeout_seconds:
+                    raise TimeoutError(f"Drop request timed out after {timeout_seconds} seconds")
 
-        except httpx.HTTPStatusError as e:
-            if e.response.status_code == 404:
-                 logger.warning(f"Provenance query {query_id} not found for deletion (already deleted?).")
-                 return True # Consider successful cleanup
-            else:
-                 logger.error(f"Failed to delete provenance query {query_id}: {e.response.status_code} - {e.response.text}")
-                 raise ConnectionError(f"Failed to delete provenance query: {e.response.status_code}, {e.response.text}") from e
-        except httpx.RequestError as e:
-            logger.error(f"Error deleting provenance query {query_id}: {e}")
-            raise ConnectionError(f"Error deleting provenance query: {e}") from e
+                status = await self.get_drop_request(connection_id, request_id)
+                if status.get("finished"):
+                    final_status = status
+                    break
+                await asyncio.sleep(0.5)  # Short delay between checks
+
+            # Always try to cleanup the request
+            await self.delete_drop_request(connection_id, request_id)
+
+            return {
+                "success": True,
+                "connection_id": connection_id,
+                "dropped_count": final_status.get("dropped", "0 / 0 bytes")
+            }
+
         except Exception as e:
-            logger.error(f"An unexpected error occurred deleting provenance query {query_id}: {e}", exc_info=True)
-            raise ConnectionError(f"An unexpected error occurred deleting provenance query: {e}") from e
+            logger.error(f"Error during drop request for connection {connection_id}: {e}")
+            return {
+                "success": False,
+                "connection_id": connection_id,
+                "error": str(e)
+            }
 
-    async def get_provenance_event_content(self, event_id: int, direction: Literal["input", "output"]) -> httpx.Response:
-        """Retrieves the content associated with a provenance event.
+    async def stop_processor(self, processor_id: str) -> dict:
+        """Convenience method to stop a processor."""
+        return await self.update_processor_state(processor_id, "STOPPED")
 
-        Args:
-            event_id: The numeric ID of the provenance event.
-            direction: 'input' or 'output' to specify which content claim to retrieve.
+    async def start_processor(self, processor_id: str) -> dict:
+        """Convenience method to start a processor."""
+        return await self.update_processor_state(processor_id, "RUNNING")
 
-        Returns:
-            The httpx.Response object. The caller is responsible for handling the content stream.
-            Example: `response.read()` or `response.aiter_bytes()`
-        """
-        if not self._token:
-            raise NiFiAuthenticationError("Client is not authenticated. Call authenticate() first.")
+    async def stop_process_group(self, pg_id: str) -> dict:
+        """Convenience method to stop a process group."""
+        return await self.update_process_group_state(pg_id, "STOPPED")
 
-        if direction not in ["input", "output"]:
-            raise ValueError("Direction must be either 'input' or 'output'.")
-
-        client = await self._get_client()
-        # --- Corrected Endpoint Path ---
-        # endpoint = f"/provenance/events/{event_id}/content/{direction}" # Old incorrect path
-        endpoint = f"/provenance-events/{event_id}/content/{direction}" # Correct path
-        # -----------------------------
-        try:
-            logger.info(f"Fetching {direction} content for provenance event {event_id}")
-            # Use stream=True to allow caller to handle large content
-            response = await client.get(endpoint, timeout=120.0) # Longer timeout for potential content download
-            response.raise_for_status()
-            logger.info(f"Successfully initiated content fetch for event {event_id} ({direction}). Status: {response.status_code}")
-            return response # Return the raw response for streaming
-
-        except httpx.HTTPStatusError as e:
-            if e.response.status_code == 404:
-                 logger.warning(f"Provenance event {event_id} or its {direction} content not found.")
-                 raise ValueError(f"Provenance event {event_id} or its {direction} content not found.") from e
-            else:
-                 logger.error(f"Failed to get content for provenance event {event_id} ({direction}): {e.response.status_code} - {e.response.text}")
-                 raise ConnectionError(f"Failed to get provenance event content: {e.response.status_code}, {e.response.text}") from e
-        except httpx.RequestError as e:
-            logger.error(f"Error getting content for provenance event {event_id} ({direction}): {e}")
-            raise ConnectionError(f"Error getting provenance event content: {e}") from e
-        except Exception as e:
-            logger.error(f"An unexpected error occurred getting content for provenance event {event_id} ({direction}): {e}", exc_info=True)
-            raise ConnectionError(f"An unexpected error occurred getting provenance event content: {e}") from e
-
-    async def get_provenance_event(self, event_id: int) -> Dict:
-        """Retrieves the details of a specific provenance event by its ID.
-
-        Args:
-            event_id: The numeric ID of the provenance event.
-
-        Returns:
-            A dictionary containing the provenance event details.
-        """
-        if not self._token:
-            raise NiFiAuthenticationError("Client is not authenticated. Call authenticate() first.")
-
-        client = await self._get_client()
-        endpoint = f"/provenance-events/{event_id}"
-        try:
-            logger.info(f"Fetching details for provenance event {event_id}")
-            response = await client.get(endpoint)
-            response.raise_for_status()
-            event_data = response.json()
-            # The relevant data is usually within the 'provenanceEvent' key
-            logger.info(f"Successfully fetched details for event {event_id}")
-            return event_data.get("provenanceEvent", {}) # Return the inner event details
-
-        except httpx.HTTPStatusError as e:
-            if e.response.status_code == 404:
-                logger.warning(f"Provenance event {event_id} not found.")
-                raise ValueError(f"Provenance event {event_id} not found.") from e
-            else:
-                logger.error(f"Failed to get provenance event {event_id}: {e.response.status_code} - {e.response.text}")
-                raise ConnectionError(f"Failed to get provenance event: {e.response.status_code}, {e.response.text}") from e
-        except (httpx.RequestError, ValueError) as e:
-            logger.error(f"Error getting provenance event {event_id}: {e}")
-            raise ConnectionError(f"Error getting provenance event: {e}") from e
-        except Exception as e:
-            logger.error(f"An unexpected error occurred getting provenance event {event_id}: {e}", exc_info=True)
-            raise ConnectionError(f"An unexpected error occurred getting provenance event: {e}") from e
-
-# Example usage (for testing or direct script execution)
-async def main():
-    # REMOVED direct os.getenv usage here - configuration should be loaded from config.yaml
-    # and passed to the client constructor externally.
-    logger.warning("Running main() requires manual configuration of NiFiClient parameters.")
-    # Example: Replace with actual config loading
-    # from config.settings import get_nifi_server_config
-    # server_conf = get_nifi_server_config("nifi-local") # Use an ID from your config.yaml
-    # if not server_conf:
-    #     logger.error("NiFi server config not found.")
-    #     return
-    # client = NiFiClient(
-    #     base_url=server_conf.get('url'),
-    #     username=server_conf.get('username'),
-    #     password=server_conf.get('password'),
-    #     tls_verify=server_conf.get('tls_verify', True)
-    # )
-    # ... rest of main function ...
-
-    # Dummy client for demonstration if needed, replace with actual configured client
-    client = NiFiClient(base_url="http://localhost:8443/nifi-api") # Minimal example
-
-    try:
-        await client.authenticate()
-        print(f"Authentication successful: {client.is_authenticated}")
-        root_id = await client.get_root_process_group_id()
-        print(f"Root Process Group ID: {root_id}")
-
-        # Example: List processors in root
-        processors = await client.list_processors(root_id)
-        print(f"Processors in root ({root_id}): {len(processors)}")
-        # for proc in processors:
-        #     print(f"  - {proc.get('component', {}).get('name')} (ID: {proc.get('id')})")
-
-    except NiFiAuthenticationError as e:
-        print(f"Authentication Error: {e}")
-    except Exception as e:
-        print(f"An error occurred: {e}")
-    finally:
-        await client.close()
-
-# Note: Running this directly requires NIFI_API_URL, NIFI_USERNAME, NIFI_PASSWORD
-# or manually providing the details in the main function.
-# Ensure NIFI_TLS_VERIFY=false is set in .env if using self-signed certs.
-# REMOVED references to .env as config is now centralized in config.yaml
-
-if __name__ == "__main__":
-    import asyncio
-    asyncio.run(main())
+    async def start_process_group(self, pg_id: str) -> dict:
+        """Convenience method to start a process group."""
+        return await self.update_process_group_state(pg_id, "RUNNING")

@@ -209,3 +209,61 @@ def filter_process_group_data(pg_entity):
         "inactiveRemotePortCount": status.get("inactiveRemotePortCount"),
         "version": revision.get("version"),
     }
+
+def filter_drop_request_data(drop_request: Dict[str, Any]) -> Dict[str, Any]:
+    """Filters and formats drop request data for API responses."""
+    if not drop_request:
+        return {}
+    
+    return {
+        "id": drop_request.get("id"),
+        "uri": drop_request.get("uri"),
+        "lastUpdated": drop_request.get("lastUpdated"),
+        "finished": drop_request.get("finished", False),
+        "failureReason": drop_request.get("failureReason"),
+        "percentCompleted": drop_request.get("percentCompleted", 0),
+        "currentCount": drop_request.get("currentCount", 0),
+        "currentSize": drop_request.get("currentSize", 0),
+        "current": drop_request.get("current", 0),
+        "originalCount": drop_request.get("originalCount", 0),
+        "originalSize": drop_request.get("originalSize", 0),
+        "dropped": drop_request.get("dropped", 0),
+        "state": drop_request.get("state", "UNKNOWN"),
+        "queueSize": {
+            "byteCount": drop_request.get("queueSize", {}).get("byteCount", 0),
+            "objectCount": drop_request.get("queueSize", {}).get("objectCount", 0)
+        }
+    }
+
+def format_drop_request_summary(drop_results: Dict[str, Any]) -> Dict[str, Any]:
+    """Formats the summary of drop request results for API responses."""
+    if not drop_results:
+        return {
+            "success": False,
+            "message": "No drop request results provided",
+            "summary": {}
+        }
+
+    total_connections = len(drop_results.get("results", []))
+    successful_drops = sum(1 for r in drop_results.get("results", []) if r.get("success", False))
+    total_dropped = sum(r.get("dropped_count", 0) for r in drop_results.get("results", []) if r.get("success", False))
+    
+    failed_connections = []
+    for result in drop_results.get("results", []):
+        if not result.get("success", False):
+            failed_connections.append({
+                "connection_id": result.get("connection_id"),
+                "error": result.get("error", "Unknown error")
+            })
+
+    return {
+        "success": drop_results.get("success", False),
+        "message": drop_results.get("message", ""),
+        "summary": {
+            "total_connections": total_connections,
+            "successful_drops": successful_drops,
+            "failed_drops": total_connections - successful_drops,
+            "total_flowfiles_dropped": total_dropped,
+            "failed_connections": failed_connections if failed_connections else None
+        }
+    }
