@@ -26,6 +26,11 @@ DEFAULT_APP_CONFIG = {
     'llm': {
         'google': {'api_key': None, 'models': ['gemini-1.5-pro-latest']},
         'openai': {'api_key': None, 'models': ['gpt-4-turbo-preview']}
+    },
+    'mcp_features': {
+        'auto_stop_enabled': True,
+        'auto_delete_enabled': True,
+        'auto_purge_enabled': True
     }
 }
 
@@ -84,6 +89,37 @@ def get_nifi_server_config(server_id: str) -> dict | None:
     print(f"Warning: NiFi server configuration not found for ID: {server_id}")
     return None
 
+# --- MCP Feature Flags --- Accessors ---
+def get_feature_auto_stop_enabled(headers: dict | None = None) -> bool:
+    """Returns whether the Auto-Stop feature is enabled, checking header override first."""
+    if headers:
+        # Convert header keys to lowercase for case-insensitive comparison
+        headers = {k.lower(): v for k, v in headers.items()}
+        header_value = headers.get("x-mcp-auto-stop-enabled") # Headers are case-insensitive
+        if header_value is not None:
+            return str(header_value).lower() == "true"
+    return _APP_CONFIG.get('mcp_features', {}).get('auto_stop_enabled', DEFAULT_APP_CONFIG['mcp_features']['auto_stop_enabled'])
+
+def get_feature_auto_delete_enabled(headers: dict | None = None) -> bool:
+    """Returns whether the Auto-Delete feature is enabled, checking header override first."""
+    if headers:
+        # Convert header keys to lowercase for case-insensitive comparison
+        headers = {k.lower(): v for k, v in headers.items()}
+        header_value = headers.get("x-mcp-auto-delete-enabled")
+        if header_value is not None:
+            return str(header_value).lower() == "true"
+    return _APP_CONFIG.get('mcp_features', {}).get('auto_delete_enabled', DEFAULT_APP_CONFIG['mcp_features']['auto_delete_enabled'])
+
+def get_feature_auto_purge_enabled(headers: dict | None = None) -> bool:
+    """Returns whether the Auto-Purge feature is enabled, checking header override first."""
+    if headers:
+        # Convert header keys to lowercase for case-insensitive comparison
+        headers = {k.lower(): v for k, v in headers.items()}
+        header_value = headers.get("x-mcp-auto-purge-enabled")
+        if header_value is not None:
+            return str(header_value).lower() == "true"
+    return _APP_CONFIG.get('mcp_features', {}).get('auto_purge_enabled', DEFAULT_APP_CONFIG['mcp_features']['auto_purge_enabled'])
+
 # --- Specific Config Values ---
 
 # Load API keys using nested gets for safety
@@ -103,6 +139,12 @@ print(f"OPENAI_API_KEY configured: {'Yes' if OPENAI_API_KEY else 'No'}")
 nifi_server_summary = [(s.get('id', 'N/A'), s.get('name', 'N/A')) for s in get_nifi_servers()]
 print(f"NiFi Servers configured: {len(nifi_server_summary)} {nifi_server_summary if nifi_server_summary else '(None)'}")
 print(f"Logging config loaded: {'Yes' if LOGGING_CONFIG != DEFAULT_LOGGING_CONFIG else 'No (Using Defaults)'}")
+
+# Print MCP Feature Flags status
+print("\nMCP Feature Flags:")
+print(f"  Auto-Stop Enabled: {get_feature_auto_stop_enabled()}")
+print(f"  Auto-Delete Enabled: {get_feature_auto_delete_enabled()}")
+print(f"  Auto-Purge Enabled: {get_feature_auto_purge_enabled()}")
 
 # --- Deprecated Functions (Keep temporarily for reference/smooth transition if needed, but remove eventually) ---
 

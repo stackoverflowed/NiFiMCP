@@ -22,5 +22,10 @@ llm:
     api_key: "" # Your OpenAI API Key (e.g., sk-...)
     models: ["gpt-4-turbo-preview", "gpt-3.5-turbo"] # Comma-separated list of allowed models
 
+mcp_features:
+  auto_stop_enabled: true
+  auto_delete_enabled: true
+  auto_purge_enabled: true
+
 # general:
 #   setting_1: "value" # Example for other potential app settings 

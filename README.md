@@ -15,6 +15,26 @@ LLM responses can be copied to the clipboard with the white icons under the resp
 
 The Tool Phase filter dropdown is to allow you to expose different tools to the LLM at the different phases you are working on, for example if you just want it to document flows, you can set the dropdown to "Review" which only gives it read tools and not write ones.
 
+## Automatic Features
+NiFi MCP includes several automatic features that simplify component management:
+
+1. **Auto-Stop**: Automatically stops running processors before deleting them. This prevents errors when trying to delete a running processor.
+
+2. **Auto-Delete**: Automatically deletes connections to/from a processor being deleted. This eliminates the need to manually delete connections before removing a processor.
+
+3. **Auto-Purge**: Automatically purges data from connections before deleting them. This prevents errors when trying to delete connections with data in the queue.
+
+These features can be configured in the `config.yaml` file:
+
+```yaml
+features:
+  auto_stop_enabled: true    # Controls the Auto-Stop feature
+  auto_delete_enabled: true  # Controls the Auto-Delete feature
+  auto_purge_enabled: true   # Controls the Auto-Purge feature
+```
+
+You can enable or disable these features globally by changing these settings. The server will use these default settings for all operations unless overridden specifically.
+
 ## Setup Instructions
 
 To set up the development environment and install all dependencies, follow these steps:
@@ -64,6 +84,7 @@ To set up the development environment and install all dependencies, follow these
 
 ## Running Automated Tests
 
+### Basic API Tests
 A test script is included to verify the core functionality of the NiFi MCP tools via the REST API.
 
 1.  **Ensure the MCP Server is Running:**
@@ -95,6 +116,35 @@ A test script is included to verify the core functionality of the NiFi MCP tools
     ```
     The script will output logs indicating the progress and success or failure of each step. It will create and then clean up a process group named `mcp-auto-test-pg-...` on the target NiFi instance.
 
+### Core Operations Tests
+
+The core operations tests verify specific functionality of the NiFi MCP server, including the Auto-Stop, Auto-Delete, and Auto-Purge features.
+
+1. **Ensure the MCP Server is Running:**
+   Start the server in debug mode for more detailed logs:
+   ```bash
+   python -m nifi_mcp_server.server --debug
+   ```
+
+2. **Run the Tests:**
+   - To run all core operations tests:
+     ```bash
+     python -m pytest tests/core_operations/
+     ```
+   - To run specific auto-feature tests:
+     ```bash
+     # Auto-Stop tests
+     python -m pytest tests/core_operations/test_nifi_processor_cleanup_operations.py::test_auto_stop_delete_running_processor -v
+     
+     # Auto-Delete tests
+     python -m pytest tests/core_operations/test_nifi_processor_cleanup_operations.py::test_auto_delete_processor_with_connections -v
+     
+     # Auto-Purge tests
+     python -m pytest tests/core_operations/test_nifi_connection_operations.py::test_auto_purge_connection_with_queued_data -v
+     ```
+
+3. **Check the Server Logs:**
+   The server logs (located in `logs/server.log`) contain detailed information about how the auto-features function during tests.
 
 ## Conversation History: This is the actual log of a conversation using the ChatGPT 4.1 LLM to build a new flow
 
@@ -107,7 +157,7 @@ We are going to build a new flow according to the following spec.  We'll build i
 
 **Overview**
 
-Design a NiFi flow that receives a web request containing a structured JSON payload, processes the data through parsing, decision-making, transformation, and business logic, and returns a response. The flow should be complex enough to test an AI’s ability to build, configure, and validate the flow against expected outputs.
+Design a NiFi flow that receives a web request containing a structured JSON payload, processes the data through parsing, decision-making, transformation, and business logic, and returns a response. The flow should be complex enough to test an AI's ability to build, configure, and validate the flow against expected outputs.
 
 ---
 

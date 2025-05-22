@@ -324,7 +324,11 @@ async def add_context_to_logger(request: Request, call_next):
     request.state.action_id = action_id
 
     # --- Set ContextVar for Loguru Patcher --- 
-    context_data = {"user_request_id": user_request_id, "action_id": action_id}
+    context_data = {
+        "user_request_id": user_request_id,
+        "action_id": action_id,
+        "headers": dict(request.headers)  # Add all headers to context
+    }
     loguru_context_token = request_context.set(context_data) # Set context for Loguru patcher
     # -----------------------------------------
     
