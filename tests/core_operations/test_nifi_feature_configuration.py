@@ -376,6 +376,27 @@ async def test_auto_delete_feature(
         # Brief pause to ensure processors are running
         await asyncio.sleep(1)
 
+        # Stop processors before attempting deletion
+        for proc_id in [source_proc_id, dest_proc_id]:
+            stop_args = {
+                "object_type": "processor",
+                "object_id": proc_id,
+                "operation_type": "stop"
+            }
+            stop_result = await call_tool(
+                client=async_client,
+                base_url=base_url,
+                tool_name="operate_nifi_object",
+                arguments=stop_args,
+                headers=mcp_headers,
+                custom_logger=global_logger
+            )
+            assert stop_result[0].get("status") == "success", f"Failed to stop processor {proc_id}"
+            global_logger.info(f"Auto-Delete Test: Stopped processor {proc_id}")
+
+        # Brief pause to ensure processors are stopped
+        await asyncio.sleep(1)
+
         # Test deletion with Auto-Delete enabled
         headers_enabled = {**mcp_headers, "X-Mcp-Auto-Delete-Enabled": "true"}
         delete_args = {
@@ -554,6 +575,8 @@ async def test_auto_delete_feature(
     finally:
         # Clean up process groups
         for cur_pg_id in [pg_id, disabled_pg_id]:
+            if cur_pg_id is None:  # Skip if pg_id is None
+                continue
             try:
                 # Try to stop the process group first
                 stop_pg_args = {

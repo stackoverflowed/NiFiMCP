@@ -4,8 +4,9 @@ import os
 import sys
 import uuid
 from loguru import logger
-from typing import AsyncGenerator, Any
+from typing import AsyncGenerator, Any, Dict
 from config.settings import get_nifi_servers
+from tests.utils.nifi_test_utils import call_tool
 
 # Enable anyio for async test support
 pytest_plugins = ("anyio",)
@@ -104,9 +105,7 @@ async def test_pg(
     global_logger.info(f"Fixture: Creating test process group: {pg_name}")
     create_pg_args = {"name": pg_name, "position_x": 0, "position_y": 0}
     
-    from .utils.nifi_test_utils import call_tool as util_call_tool
-
-    pg_result_list = await util_call_tool(
+    pg_result_list = await call_tool(
         client=async_client, 
         base_url=base_url, 
         tool_name="create_nifi_process_group", 
@@ -126,7 +125,7 @@ async def test_pg(
 
     # Get the process group details
     details_args = {"object_type": "process_group", "object_id": pg_id}
-    details_result_list = await util_call_tool(
+    details_result_list = await call_tool(
         client=async_client,
         base_url=base_url,
         tool_name="get_nifi_object_details",
@@ -158,7 +157,7 @@ async def test_pg(
             "timeout_seconds": 30
         }
         try:
-            purge_result_list = await util_call_tool(
+            purge_result_list = await call_tool(
                 client=async_client,
                 base_url=base_url,
                 tool_name="purge_flowfiles",
@@ -176,7 +175,7 @@ async def test_pg(
 
         # Then delete the process group
         delete_pg_args = {"object_type": "process_group", "object_id": pg_id, "kwargs": {}}
-        delete_pg_result_list = await util_call_tool(
+        delete_pg_result_list = await call_tool(
             client=async_client, 
             base_url=base_url,
             tool_name="delete_nifi_object", 
@@ -202,13 +201,14 @@ async def test_pg_with_processors(
     mcp_headers: dict,
     nifi_test_server_id: str, # Changed from test_run_id
     global_logger: Any
-):
+) -> AsyncGenerator[Dict[str, Any], None]:
     """Creates a test PG and two standard processors (Generate & Log) within it."""
     pg_id = test_pg["id"]
     pg_name = test_pg["name"]
     global_logger.info(f"Fixture: test_pg_with_processors using PG ID: {pg_id}")
 
-    from .utils.nifi_test_utils import call_tool as util_call_tool
+    # Initialize components dictionary
+    components: Dict[str, Any] = {}
 
     # 1. Create GenerateFlowFile Processor
     gen_proc_name = f"mcp-test-generate-{nifi_test_server_id}"  # Use server ID instead of run ID
@@ -220,7 +220,7 @@ async def test_pg_with_processors(
         "position_y": 0
     }
     global_logger.info(f"Fixture: Creating GenerateFlowFile processor: {gen_proc_name} in PG {pg_id}")
-    gen_result_list = await util_call_tool(
+    gen_result_list = await call_tool(
         client=async_client,
         base_url=base_url,
         tool_name="create_nifi_processor",
@@ -239,7 +239,7 @@ async def test_pg_with_processors(
 
     # Get Generate processor details
     gen_details_args = {"object_type": "processor", "object_id": generate_proc_id}
-    gen_details_list = await util_call_tool(
+    gen_details_list = await call_tool(
         client=async_client,
         base_url=base_url,
         tool_name="get_nifi_object_details",
@@ -260,7 +260,7 @@ async def test_pg_with_processors(
         "position_y": 200
     }
     global_logger.info(f"Fixture: Creating LogAttribute processor: {log_proc_name} in PG {pg_id}")
-    log_result_list = await util_call_tool(
+    log_result_list = await call_tool(
         client=async_client,
         base_url=base_url,
         tool_name="create_nifi_processor",
@@ -279,7 +279,7 @@ async def test_pg_with_processors(
 
     # Get Log processor details
     log_details_args = {"object_type": "processor", "object_id": log_proc_id}
-    log_details_list = await util_call_tool(
+    log_details_list = await call_tool(
         client=async_client,
         base_url=base_url,
         tool_name="get_nifi_object_details",
@@ -289,6 +289,36 @@ async def test_pg_with_processors(
     )
     assert isinstance(log_details_list, list) and log_details_list and isinstance(log_details_list[0], dict)
     log_details = log_details_list[0].get("component", log_details_list[0])
+
+    # 3. Create Split Processor (RouteOnAttribute)
+    split_proc_result_list = await call_tool(
+        client=async_client,
+        base_url=base_url,
+        tool_name="create_nifi_processor",
+        arguments={
+            "process_group_id": pg_id,
+            "processor_type": "org.apache.nifi.processors.standard.RouteOnAttribute",
+            "name": "Split Flow",
+            "position_x": 300,
+            "position_y": 100,
+            "properties": {
+                "Route Strategy": "Route to Property name",
+                "Routing Strategy": "Route to Property name",
+                "success": "${status:equals('success')}",
+                "failure": "${status:equals('failure')}",
+                "original": "${status:equals('original')}"
+            }
+        },
+        headers=mcp_headers,
+        custom_logger=global_logger
+    )
+    
+    assert isinstance(split_proc_result_list, list) and len(split_proc_result_list) > 0
+    split_proc_result = split_proc_result_list[0]
+    assert split_proc_result.get("status") in ["success", "warning"]
+    split_proc_id = split_proc_result.get("entity", {}).get("id")
+    assert split_proc_id
+    components["split_processor"] = split_proc_id
 
     # Return the process group details and processors
     result = {
@@ -318,14 +348,13 @@ async def test_connection(
     log_proc_id = test_pg_with_processors["log_proc_id"]
 
     global_logger.info(f"Fixture: Connecting {generate_proc_id} -> {log_proc_id}")
-    from .utils.nifi_test_utils import call_tool as util_call_tool # Relative import
 
     connect_args = {
         "source_id": generate_proc_id,
         "relationships": ["success"], # Default relationship for GenerateFlowFile
         "target_id": log_proc_id
     }
-    conn_result_list = await util_call_tool(
+    conn_result_list = await call_tool(
         client=async_client,
         base_url=base_url,
         tool_name="create_nifi_connection",
@@ -348,7 +377,7 @@ async def test_connection(
     global_logger.info(f"Fixture: Cleaning up test connection: {connection_id}")
     try:
         delete_conn_args = {"object_type": "connection", "object_id": connection_id, "kwargs": {}}
-        delete_conn_result_list = await util_call_tool(
+        delete_conn_result_list = await call_tool(
             client=async_client,
             base_url=base_url,
             tool_name="delete_nifi_object",
@@ -374,4 +403,647 @@ def nifi_test_server_id():
     server_id = servers[0].get('id')
     if not server_id:
         pytest.fail("First NiFi server in config.yaml has no ID")
-    return server_id 
+    return server_id
+
+@pytest.fixture
+async def test_complex_flow(
+    async_client: httpx.AsyncClient,
+    base_url: str,
+    mcp_headers: Dict[str, str],
+    global_logger: Any
+) -> AsyncGenerator[Dict[str, Any], None]:
+    """Creates a more complex flow for testing documentation features.
+    
+    Flow structure:
+    Input Port -> Split -> [Success] -> Transform -> [Success] -> Merge
+                       -> [Failure] -> LogError
+                       -> [Original] -> LogOriginal
+    """
+    components: Dict[str, Any] = {}
+    
+    # Create a process group to contain our test flow
+    pg_creation = {
+        "name": f"mcp-test-doc-flow-{mcp_headers['X-Nifi-Server-Id']}",
+        "position_x": 0,
+        "position_y": 0
+    }
+    
+    # Create the process group
+    pg_result_list = await call_tool(
+        client=async_client,
+        base_url=base_url,
+        tool_name="create_nifi_process_group",
+        arguments=pg_creation,
+        headers=mcp_headers,
+        custom_logger=global_logger
+    )
+    
+    assert isinstance(pg_result_list, list) and len(pg_result_list) > 0, "Expected non-empty list response"
+    pg_result = pg_result_list[0]
+    assert pg_result.get("status") in ["success", "warning"], f"Failed to create process group: {pg_result.get('message')}"
+    
+    pg_id = pg_result.get("entity", {}).get("id")
+    assert pg_id, "Process group ID not found in response"
+    components["process_group_id"] = pg_id
+
+    try:
+        # Input Port
+        input_port_result_list = await call_tool(
+            client=async_client,
+            base_url=base_url,
+            tool_name="create_nifi_port",
+            arguments={
+                "process_group_id": pg_id,
+                "name": "Test Input",
+                "position_x": 100,
+                "position_y": 100,
+                "port_type": "input"
+            },
+            headers=mcp_headers,
+            custom_logger=global_logger
+        )
+        
+        assert isinstance(input_port_result_list, list) and len(input_port_result_list) > 0
+        input_port_result = input_port_result_list[0]
+        assert input_port_result.get("status") in ["success", "warning"]
+        input_port_id = input_port_result.get("entity", {}).get("id")
+        assert input_port_id
+        components["input_port"] = input_port_id
+        
+        # Split Processor (RouteOnAttribute)
+        split_proc_result_list = await call_tool(
+            client=async_client,
+            base_url=base_url,
+            tool_name="create_nifi_processor",
+            arguments={
+                "process_group_id": pg_id,
+                "processor_type": "org.apache.nifi.processors.standard.RouteOnAttribute",
+                "name": "Split Flow",
+                "position_x": 300,
+                "position_y": 100,
+                "properties": {
+                    "Route Strategy": "Route to Property name",
+                    "Routing Strategy": "Route to Property name",
+                    "success": "${status:equals('success')}",
+                    "failure": "${status:equals('failure')}",
+                    "original": "${status:equals('original')}"
+                }
+            },
+            headers=mcp_headers,
+            custom_logger=global_logger
+        )
+        
+        assert isinstance(split_proc_result_list, list) and len(split_proc_result_list) > 0
+        split_proc_result = split_proc_result_list[0]
+        assert split_proc_result.get("status") in ["success", "warning"]
+        split_proc_id = split_proc_result.get("entity", {}).get("id")
+        assert split_proc_id
+        components["split_processor"] = split_proc_id
+        
+        # Transform Processor (Success Path)
+        transform_proc_result_list = await call_tool(
+            client=async_client,
+            base_url=base_url,
+            tool_name="create_nifi_processor",
+            arguments={
+                "process_group_id": pg_id,
+                "processor_type": "org.apache.nifi.processors.attributes.UpdateAttribute",
+                "name": "Transform Data",
+                "position_x": 500,
+                "position_y": 0,
+                "properties": {
+                    "transformed": "true"
+                }
+            },
+            headers=mcp_headers,
+            custom_logger=global_logger
+        )
+        
+        assert isinstance(transform_proc_result_list, list) and len(transform_proc_result_list) > 0
+        transform_proc_result = transform_proc_result_list[0]
+        assert transform_proc_result.get("status") in ["success", "warning"]
+        transform_proc_id = transform_proc_result.get("entity", {}).get("id")
+        assert transform_proc_id
+        components["transform_processor"] = transform_proc_id
+        
+        # Merge Processor
+        merge_proc_result_list = await call_tool(
+            client=async_client,
+            base_url=base_url,
+            tool_name="create_nifi_processor",
+            arguments={
+                "process_group_id": pg_id,
+                "processor_type": "org.apache.nifi.processors.standard.MergeContent",
+                "name": "Merge Results",
+                "position_x": 700,
+                "position_y": 0,
+                "properties": {
+                    "Merge Strategy": "Defragment",
+                    "Correlation Attribute Name": "fragment.identifier"
+                }
+            },
+            headers=mcp_headers,
+            custom_logger=global_logger
+        )
+        
+        assert isinstance(merge_proc_result_list, list) and len(merge_proc_result_list) > 0
+        merge_proc_result = merge_proc_result_list[0]
+        assert merge_proc_result.get("status") in ["success", "warning"]
+        merge_proc_id = merge_proc_result.get("entity", {}).get("id")
+        assert merge_proc_id
+        components["merge_processor"] = merge_proc_id
+        
+        # Error Logger (Failure Path)
+        error_log_result_list = await call_tool(
+            client=async_client,
+            base_url=base_url,
+            tool_name="create_nifi_processor",
+            arguments={
+                "process_group_id": pg_id,
+                "processor_type": "org.apache.nifi.processors.standard.LogAttribute",
+                "name": "Log Error",
+                "position_x": 500,
+                "position_y": 200,
+                "properties": {
+                    "Log Level": "WARN",
+                    "Log Prefix": "Flow Error"
+                }
+            },
+            headers=mcp_headers,
+            custom_logger=global_logger
+        )
+        
+        assert isinstance(error_log_result_list, list) and len(error_log_result_list) > 0
+        error_log_result = error_log_result_list[0]
+        assert error_log_result.get("status") in ["success", "warning"]
+        error_log_id = error_log_result.get("entity", {}).get("id")
+        assert error_log_id
+        components["error_logger"] = error_log_id
+        
+        # Original Path Logger
+        orig_log_result_list = await call_tool(
+            client=async_client,
+            base_url=base_url,
+            tool_name="create_nifi_processor",
+            arguments={
+                "process_group_id": pg_id,
+                "processor_type": "org.apache.nifi.processors.standard.LogAttribute",
+                "name": "Log Original",
+                "position_x": 500,
+                "position_y": 400,
+                "properties": {
+                    "Log Level": "INFO",
+                    "Log Prefix": "Original Flow"
+                }
+            },
+            headers=mcp_headers,
+            custom_logger=global_logger
+        )
+        
+        assert isinstance(orig_log_result_list, list) and len(orig_log_result_list) > 0
+        orig_log_result = orig_log_result_list[0]
+        assert orig_log_result.get("status") in ["success", "warning"]
+        orig_log_id = orig_log_result.get("entity", {}).get("id")
+        assert orig_log_id
+        components["original_logger"] = orig_log_id
+        
+        # Create connections
+        # Input Port -> Split
+        input_port_conn_result = await call_tool(
+            client=async_client,
+            base_url=base_url,
+            tool_name="create_nifi_connection",
+            arguments={
+                "source_id": input_port_id,
+                "target_id": split_proc_id,
+                "relationships": []  # Empty list for port connections
+            },
+            headers=mcp_headers,
+            custom_logger=global_logger
+        )
+        
+        # Verify the connection was created
+        assert isinstance(input_port_conn_result, list) and len(input_port_conn_result) > 0
+        input_port_conn = input_port_conn_result[0]
+        assert input_port_conn.get("status") in ["success", "warning"], \
+            f"Failed to create input port connection: {input_port_conn.get('message')}"
+        
+        # Split -> Transform (Success)
+        await call_tool(
+            client=async_client,
+            base_url=base_url,
+            tool_name="create_nifi_connection",
+            arguments={
+                "source_id": split_proc_id,
+                "target_id": transform_proc_id,
+                "relationships": ["success"]
+            },
+            headers=mcp_headers,
+            custom_logger=global_logger
+        )
+        
+        # Split -> Error Log (Failure)
+        await call_tool(
+            client=async_client,
+            base_url=base_url,
+            tool_name="create_nifi_connection",
+            arguments={
+                "source_id": split_proc_id,
+                "target_id": error_log_id,
+                "relationships": ["failure"]
+            },
+            headers=mcp_headers,
+            custom_logger=global_logger
+        )
+
+        # Split -> Original Log (Original)
+        await call_tool(
+            client=async_client,
+            base_url=base_url,
+            tool_name="create_nifi_connection",
+            arguments={
+                "source_id": split_proc_id,
+                "target_id": orig_log_id,
+                "relationships": ["original"]
+            },
+            headers=mcp_headers,
+            custom_logger=global_logger
+        )
+        
+        # Transform -> Merge (Success)
+        await call_tool(
+            client=async_client,
+            base_url=base_url,
+            tool_name="create_nifi_connection",
+            arguments={
+                "source_id": transform_proc_id,
+                "target_id": merge_proc_id,
+                "relationships": ["success"]
+            },
+            headers=mcp_headers,
+            custom_logger=global_logger
+        )
+        
+        yield components
+
+    finally:
+        # Teardown: First stop the process group, then purge flowfiles, then delete
+        global_logger.info(f"Fixture: Cleaning up test complex flow in process group: {pg_id}")
+        try:
+            # 1. Stop the process group
+            stop_args = {
+                "object_type": "process_group",
+                "object_id": pg_id,
+                "operation_type": "stop"
+            }
+            try:
+                stop_result_list = await call_tool(
+                    client=async_client,
+                    base_url=base_url,
+                    tool_name="operate_nifi_object",
+                    arguments=stop_args,
+                    headers=mcp_headers,
+                    custom_logger=global_logger
+                )
+                if stop_result_list and stop_result_list[0].get("status") == "success":
+                    global_logger.info(f"Fixture: Successfully stopped Process Group {pg_id}")
+                else:
+                    global_logger.warning(f"Fixture: Could not confirm Process Group {pg_id} stopped")
+            except Exception as e_stop:
+                global_logger.warning(f"Fixture: Error stopping Process Group {pg_id} (continuing with cleanup): {e_stop}")
+
+            # 2. Purge any queued flowfiles
+            purge_args = {
+                "target_id": pg_id,
+                "target_type": "process_group",
+                "timeout_seconds": 30
+            }
+            try:
+                purge_result_list = await call_tool(
+                    client=async_client,
+                    base_url=base_url,
+                    tool_name="purge_flowfiles",
+                    arguments=purge_args,
+                    headers=mcp_headers,
+                    custom_logger=global_logger
+                )
+                if purge_result_list and purge_result_list[0].get("status") == "success":
+                    global_logger.info(f"Fixture: Successfully purged flowfiles from Process Group {pg_id}")
+                else:
+                    global_logger.warning(f"Fixture: Some flowfiles may remain in Process Group {pg_id}")
+            except Exception as e_purge:
+                global_logger.warning(f"Fixture: Error purging flowfiles (continuing with cleanup): {e_purge}")
+
+            # 3. Delete the process group
+            delete_pg_args = {"object_type": "process_group", "object_id": pg_id, "kwargs": {}}
+            delete_pg_result_list = await call_tool(
+                client=async_client,
+                base_url=base_url,
+                tool_name="delete_nifi_object",
+                arguments=delete_pg_args,
+                headers=mcp_headers,
+                custom_logger=global_logger
+            )
+            assert isinstance(delete_pg_result_list, list) and len(delete_pg_result_list) > 0 and isinstance(delete_pg_result_list[0], dict), \
+                "Unexpected response format for delete_nifi_object (process group) in fixture teardown"
+            delete_pg_result = delete_pg_result_list[0]
+            if delete_pg_result.get("status") == "success":
+                global_logger.info(f"Fixture: Successfully deleted Test Process Group {pg_id}")
+            else:
+                global_logger.error(f"Fixture: Failed to delete Test Process Group {pg_id}: {delete_pg_result.get('message')}")
+        except Exception as e_del_pg:
+            global_logger.error(f"Fixture: Error during Test Process Group {pg_id} cleanup: {e_del_pg}", exc_info=False) 
+
+@pytest.fixture
+async def test_merge_flow(
+    async_client: httpx.AsyncClient,
+    base_url: str,
+    mcp_headers: Dict[str, str],
+    global_logger: Any
+) -> AsyncGenerator[Dict[str, Any], None]:
+    """Creates a flow with multiple inputs converging to a single processor.
+    
+    Flow structure:
+    GenerateFlowFile1 -> UpdateAttribute1 -----> Merge
+    GenerateFlowFile2 -> UpdateAttribute2 -----> Merge
+    """
+    components: Dict[str, Any] = {}
+    
+    # Create a process group
+    pg_creation = {
+        "name": f"mcp-test-merge-flow-{mcp_headers['X-Nifi-Server-Id']}",
+        "position_x": 0,
+        "position_y": 0
+    }
+    
+    pg_result_list = await call_tool(
+        client=async_client,
+        base_url=base_url,
+        tool_name="create_nifi_process_group",
+        arguments=pg_creation,
+        headers=mcp_headers,
+        custom_logger=global_logger
+    )
+    
+    assert isinstance(pg_result_list, list) and len(pg_result_list) > 0
+    pg_result = pg_result_list[0]
+    assert pg_result.get("status") in ["success", "warning"]
+    pg_id = pg_result.get("entity", {}).get("id")
+    assert pg_id
+    components["process_group_id"] = pg_id
+
+    try:
+        # Create first Generate processor
+        gen1_result_list = await call_tool(
+            client=async_client,
+            base_url=base_url,
+            tool_name="create_nifi_processor",
+            arguments={
+                "process_group_id": pg_id,
+                "processor_type": "org.apache.nifi.processors.standard.GenerateFlowFile",
+                "name": "Generate Flow 1",
+                "position_x": 100,
+                "position_y": 100,
+                "properties": {
+                    "Custom Text": "Data from source 1"
+                }
+            },
+            headers=mcp_headers,
+            custom_logger=global_logger
+        )
+        
+        assert isinstance(gen1_result_list, list) and len(gen1_result_list) > 0
+        gen1_result = gen1_result_list[0]
+        assert gen1_result.get("status") in ["success", "warning"]
+        gen1_id = gen1_result.get("entity", {}).get("id")
+        assert gen1_id
+        components["generate1"] = gen1_id
+
+        # Create second Generate processor
+        gen2_result_list = await call_tool(
+            client=async_client,
+            base_url=base_url,
+            tool_name="create_nifi_processor",
+            arguments={
+                "process_group_id": pg_id,
+                "processor_type": "org.apache.nifi.processors.standard.GenerateFlowFile",
+                "name": "Generate Flow 2",
+                "position_x": 100,
+                "position_y": 300,
+                "properties": {
+                    "Custom Text": "Data from source 2"
+                }
+            },
+            headers=mcp_headers,
+            custom_logger=global_logger
+        )
+        
+        assert isinstance(gen2_result_list, list) and len(gen2_result_list) > 0
+        gen2_result = gen2_result_list[0]
+        assert gen2_result.get("status") in ["success", "warning"]
+        gen2_id = gen2_result.get("entity", {}).get("id")
+        assert gen2_id
+        components["generate2"] = gen2_id
+
+        # Create first UpdateAttribute processor
+        update1_result_list = await call_tool(
+            client=async_client,
+            base_url=base_url,
+            tool_name="create_nifi_processor",
+            arguments={
+                "process_group_id": pg_id,
+                "processor_type": "org.apache.nifi.processors.attributes.UpdateAttribute",
+                "name": "Update 1",
+                "position_x": 400,
+                "position_y": 100,
+                "properties": {
+                    "source": "flow1"
+                }
+            },
+            headers=mcp_headers,
+            custom_logger=global_logger
+        )
+        
+        assert isinstance(update1_result_list, list) and len(update1_result_list) > 0
+        update1_result = update1_result_list[0]
+        assert update1_result.get("status") in ["success", "warning"]
+        update1_id = update1_result.get("entity", {}).get("id")
+        assert update1_id
+        components["update1"] = update1_id
+
+        # Create second UpdateAttribute processor
+        update2_result_list = await call_tool(
+            client=async_client,
+            base_url=base_url,
+            tool_name="create_nifi_processor",
+            arguments={
+                "process_group_id": pg_id,
+                "processor_type": "org.apache.nifi.processors.attributes.UpdateAttribute",
+                "name": "Update 2",
+                "position_x": 400,
+                "position_y": 300,
+                "properties": {
+                    "source": "flow2"
+                }
+            },
+            headers=mcp_headers,
+            custom_logger=global_logger
+        )
+        
+        assert isinstance(update2_result_list, list) and len(update2_result_list) > 0
+        update2_result = update2_result_list[0]
+        assert update2_result.get("status") in ["success", "warning"]
+        update2_id = update2_result.get("entity", {}).get("id")
+        assert update2_id
+        components["update2"] = update2_id
+
+        # Create Merge processor
+        merge_result_list = await call_tool(
+            client=async_client,
+            base_url=base_url,
+            tool_name="create_nifi_processor",
+            arguments={
+                "process_group_id": pg_id,
+                "processor_type": "org.apache.nifi.processors.standard.MergeContent",
+                "name": "Merge Flows",
+                "position_x": 700,
+                "position_y": 200,
+                "properties": {
+                    "Merge Strategy": "Defragment",
+                    "Correlation Attribute Name": "source"
+                }
+            },
+            headers=mcp_headers,
+            custom_logger=global_logger
+        )
+        
+        assert isinstance(merge_result_list, list) and len(merge_result_list) > 0
+        merge_result = merge_result_list[0]
+        assert merge_result.get("status") in ["success", "warning"]
+        merge_id = merge_result.get("entity", {}).get("id")
+        assert merge_id
+        components["merge"] = merge_id
+
+        # Create connections
+        # Generate1 -> Update1
+        await call_tool(
+            client=async_client,
+            base_url=base_url,
+            tool_name="create_nifi_connection",
+            arguments={
+                "source_id": gen1_id,
+                "target_id": update1_id,
+                "relationships": ["success"]
+            },
+            headers=mcp_headers,
+            custom_logger=global_logger
+        )
+
+        # Generate2 -> Update2
+        await call_tool(
+            client=async_client,
+            base_url=base_url,
+            tool_name="create_nifi_connection",
+            arguments={
+                "source_id": gen2_id,
+                "target_id": update2_id,
+                "relationships": ["success"]
+            },
+            headers=mcp_headers,
+            custom_logger=global_logger
+        )
+
+        # Update1 -> Merge
+        await call_tool(
+            client=async_client,
+            base_url=base_url,
+            tool_name="create_nifi_connection",
+            arguments={
+                "source_id": update1_id,
+                "target_id": merge_id,
+                "relationships": ["success"]
+            },
+            headers=mcp_headers,
+            custom_logger=global_logger
+        )
+
+        # Update2 -> Merge
+        await call_tool(
+            client=async_client,
+            base_url=base_url,
+            tool_name="create_nifi_connection",
+            arguments={
+                "source_id": update2_id,
+                "target_id": merge_id,
+                "relationships": ["success"]
+            },
+            headers=mcp_headers,
+            custom_logger=global_logger
+        )
+
+        yield components
+
+    finally:
+        # Teardown: Stop, purge, and delete the process group
+        global_logger.info(f"Fixture: Cleaning up test merge flow in process group: {pg_id}")
+        try:
+            # Stop the process group
+            stop_args = {
+                "object_type": "process_group",
+                "object_id": pg_id,
+                "operation_type": "stop"
+            }
+            try:
+                stop_result_list = await call_tool(
+                    client=async_client,
+                    base_url=base_url,
+                    tool_name="operate_nifi_object",
+                    arguments=stop_args,
+                    headers=mcp_headers,
+                    custom_logger=global_logger
+                )
+                if stop_result_list and stop_result_list[0].get("status") == "success":
+                    global_logger.info(f"Fixture: Successfully stopped Process Group {pg_id}")
+                else:
+                    global_logger.warning(f"Fixture: Could not confirm Process Group {pg_id} stopped")
+            except Exception as e_stop:
+                global_logger.warning(f"Fixture: Error stopping Process Group {pg_id} (continuing with cleanup): {e_stop}")
+
+            # Purge flowfiles
+            purge_args = {
+                "target_id": pg_id,
+                "target_type": "process_group",
+                "timeout_seconds": 30
+            }
+            try:
+                purge_result_list = await call_tool(
+                    client=async_client,
+                    base_url=base_url,
+                    tool_name="purge_flowfiles",
+                    arguments=purge_args,
+                    headers=mcp_headers,
+                    custom_logger=global_logger
+                )
+                if purge_result_list and purge_result_list[0].get("status") == "success":
+                    global_logger.info(f"Fixture: Successfully purged flowfiles from Process Group {pg_id}")
+                else:
+                    global_logger.warning(f"Fixture: Some flowfiles may remain in Process Group {pg_id}")
+            except Exception as e_purge:
+                global_logger.warning(f"Fixture: Error purging flowfiles (continuing with cleanup): {e_purge}")
+
+            # Delete the process group
+            delete_pg_args = {"object_type": "process_group", "object_id": pg_id, "kwargs": {}}
+            delete_pg_result_list = await call_tool(
+                client=async_client,
+                base_url=base_url,
+                tool_name="delete_nifi_object",
+                arguments=delete_pg_args,
+                headers=mcp_headers,
+                custom_logger=global_logger
+            )
+            if delete_pg_result_list[0].get("status") == "success":
+                global_logger.info(f"Fixture: Successfully deleted Test Process Group {pg_id}")
+            else:
+                global_logger.error(f"Fixture: Failed to delete Test Process Group {pg_id}")
+        except Exception as e:
+            global_logger.error(f"Fixture: Error during Test Process Group {pg_id} cleanup: {e}", exc_info=False) 

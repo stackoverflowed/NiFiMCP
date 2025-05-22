@@ -151,7 +151,7 @@ async def create_nifi_connection(
 
     Args:
         source_id: The UUID of the source component.
-        relationships: A non-empty list of relationship names.
+        relationships: A list of relationship names. Must be non-empty for processors, but should be empty for ports.
         target_id: The UUID of the target component.
 
     Returns:
@@ -166,18 +166,11 @@ async def create_nifi_connection(
          raise ToolError("Request logger context is not set.")
          
     # Authentication handled by factory
-    # context = local_logger._context # REMOVED
-    # user_request_id = context.get("user_request_id", "-") # REMOVED
-    # action_id = context.get("action_id", "-") # REMOVED
-    # --- Get IDs from context ---
     user_request_id = current_user_request_id.get() or "-"
     action_id = current_action_id.get() or "-"
-    # --------------------------
 
     local_logger = local_logger.bind(source_id=source_id, target_id=target_id, relationships=relationships)
          
-    if not relationships:
-        raise ToolError("The 'relationships' list cannot be empty.")
     if not isinstance(relationships, list) or not all(isinstance(item, str) for item in relationships):
         raise ToolError("Invalid 'relationships' elements.")
 
@@ -192,16 +185,27 @@ async def create_nifi_connection(
             source_entity = await nifi_client.get_processor_details(source_id)
             source_type = "PROCESSOR"
             local_logger.info(f"Source component {source_id} identified as a PROCESSOR.")
+            # Validate relationships for processors
+            if not relationships:
+                raise ToolError("The 'relationships' list cannot be empty for processor connections.")
         except ValueError:
             try:
                 source_entity = await nifi_client.get_input_port_details(source_id)
                 source_type = "INPUT_PORT"
                 local_logger.info(f"Source component {source_id} identified as an INPUT_PORT.")
+                # Input ports should have empty relationships
+                if relationships:
+                    local_logger.warning(f"Relationships specified for input port connection will be ignored: {relationships}")
+                relationships = []
             except ValueError:
                 try:
                     source_entity = await nifi_client.get_output_port_details(source_id)
                     source_type = "OUTPUT_PORT"
                     local_logger.info(f"Source component {source_id} identified as an OUTPUT_PORT.")
+                    # Output ports should have empty relationships
+                    if relationships:
+                        local_logger.warning(f"Relationships specified for output port connection will be ignored: {relationships}")
+                    relationships = []
                 except ValueError:
                     raise ToolError(f"Source component with ID {source_id} not found or is not connectable.")
 
@@ -356,14 +360,14 @@ async def create_nifi_port(
     if not local_logger:
          raise ToolError("Request logger context is not set.")
          
+    # Normalize port type to lowercase
+    port_type = port_type.lower()
+    if port_type not in ["input", "output"]:
+        raise ToolError(f"Invalid port_type: {port_type}. Must be 'input' or 'output'.")
+
     # Authentication handled by factory
-    # context = local_logger._context # REMOVED
-    # user_request_id = context.get("user_request_id", "-") # REMOVED
-    # action_id = context.get("action_id", "-") # REMOVED
-    # --- Get IDs from context ---
     user_request_id = current_user_request_id.get() or "-"
     action_id = current_action_id.get() or "-"
-    # --------------------------
 
     target_pg_id = process_group_id
     if target_pg_id is None:

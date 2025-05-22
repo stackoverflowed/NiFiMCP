@@ -21,11 +21,11 @@ from nifi_mcp_server.nifi_client import NiFiClient, NiFiAuthenticationError
 from mcp.server.fastmcp.exceptions import ToolError
 
 # Import flow documentation tools specifically needed by document_nifi_flow
-from nifi_mcp_server.flow_documenter import (
+from nifi_mcp_server.flow_documenter_improved import (
+    document_nifi_flow_improved,
     extract_important_properties,
-    analyze_expressions,
-    build_graph_structure,
     format_connection,
+    build_graph_structure,
     find_decision_branches
 )
 
@@ -518,7 +518,6 @@ async def document_nifi_flow(
     max_depth: int = 10,
     include_properties: bool = True,
     include_descriptions: bool = True,
-    # mcp_context: dict = {} # Removed context parameter
 ) -> Dict[str, Any]:
     """
     Analyzes and documents a NiFi flow starting from a given process group or processor.
@@ -538,17 +537,15 @@ async def document_nifi_flow(
         Whether to include important processor properties in the documentation. Defaults to True.
     include_descriptions : bool, optional
         Whether to include processor and connection descriptions/comments (if available). Defaults to True.
-    # Removed mcp_context from docstring
 
     Returns
     -------
     Dict[str, Any]
         A dictionary containing the documented flow, including:
-        - 'start_point': Information about the starting process group or processor.
-        - 'flow_structure': A list representing the main flow path(s).
-        - 'decision_branches': Information about identified decision branches (e.g., RouteOnAttribute).
-        - 'unconnected_components': Lists of processors or ports not connected in the main flow.
-        - 'errors': Any errors encountered during documentation.
+        - 'components': Dictionary of all components by type (processors, connections, ports)
+        - 'flows': List of flow paths from source components
+        - 'decision_points': List of processors with multiple outgoing paths
+        - 'unconnected_components': List of components not connected to any flow
     """
     # Get client and logger from context variables
     nifi_client: Optional[NiFiClient] = current_nifi_client.get()
@@ -559,26 +556,15 @@ async def document_nifi_flow(
     if not isinstance(nifi_client, NiFiClient):
          raise ToolError(f"Invalid NiFi client type found in context: {type(nifi_client)}")
          
-    # await ensure_authenticated(nifi_client, local_logger) # Removed
-    
-    # --- Get IDs from context --- 
+    # Get IDs from context
     user_request_id = current_user_request_id.get() or "-"
     action_id = current_action_id.get() or "-"
-    # --------------------------
     
     local_logger.info(f"Starting NiFi flow documentation. PG: {process_group_id}, Start Proc: {starting_processor_id}, Max Depth: {max_depth}")
-    results = {
-        "start_point": None,
-        "flow_structure": [],
-        "decision_branches": [],
-        "unconnected_components": {"processors": [], "ports": []},
-        "errors": []
-    }
 
-    target_pg_id = process_group_id
-    
     try:
         # Determine the target process group ID
+        target_pg_id = process_group_id
         if starting_processor_id and not target_pg_id:
             local_logger.info(f"No process_group_id provided, finding parent group for starting processor {starting_processor_id}")
             nifi_req = {"operation": "get_processor_details", "id": starting_processor_id}
@@ -590,20 +576,13 @@ async def document_nifi_flow(
             target_pg_id = proc_details.get("component", {}).get("parentGroupId")
             if not target_pg_id:
                 raise ToolError(f"Could not determine parent process group ID for processor {starting_processor_id}")
-            results["start_point"] = {"type": "processor", "id": starting_processor_id, "name": proc_details.get("component", {}).get("name"), "process_group_id": target_pg_id}
             local_logger.info(f"Determined target process group ID: {target_pg_id} from starting processor.")
         elif not target_pg_id:
             local_logger.info("No process_group_id or starting_processor_id provided, defaulting to root process group.")
             target_pg_id = await nifi_client.get_root_process_group_id(user_request_id=user_request_id, action_id=action_id)
             if not target_pg_id:
                  raise ToolError("Could not retrieve the root process group ID.")
-            results["start_point"] = {"type": "process_group", "id": target_pg_id, "name": "Root"}
             local_logger.info(f"Resolved root process group ID: {target_pg_id}")
-        else:
-            # PG ID was provided, get its name for the start point
-            pg_name = await _get_process_group_name(target_pg_id)
-            results["start_point"] = {"type": "process_group", "id": target_pg_id, "name": pg_name}
-            local_logger.info(f"Using provided process group ID: {target_pg_id} ({pg_name})")
             
         if not target_pg_id:
              raise ToolError("Failed to determine a target process group ID for documentation.")
@@ -625,198 +604,31 @@ async def document_nifi_flow(
         }
         local_logger.bind(interface="nifi", direction="response", data=nifi_resp_components).debug("Received from NiFi API (multiple calls)")
 
-        processors = {p['id']: p for p in processors_resp if 'id' in p}
-        connections = {c['id']: c for c in connections_resp if 'id' in c}
-        input_ports = {p['id']: p for p in input_ports_resp if 'id' in p}
-        output_ports = {p['id']: p for p in output_ports_resp if 'id' in p}
-        all_components = {**processors, **input_ports, **output_ports}
-
-        # Build the graph structure (new return format)
-        local_logger.info("Building graph structure from fetched components...")
-        graph_data = build_graph_structure(list(processors.values()), list(connections.values())) # Pass lists
-        outgoing_graph = graph_data.get("outgoing", {}) # Use the 'outgoing' part
-        incoming_graph = graph_data.get("incoming", {}) # Keep if needed
-
-        # Manually create nodes_by_id map for easy lookup
-        nodes_by_id = {}
-        for comp_id, comp_details in all_components.items():
-            comp_type = comp_details.get('component', {}).get('type', 'UNKNOWN')
-            # Map NiFi types to documentation types if needed
-            comp_type_lower = comp_type.lower() # Convert to lowercase for case-insensitive check
-            doc_type = "UNKNOWN"
-            if "processor" in comp_type_lower:
-                doc_type = "PROCESSOR"
-            elif "input_port" in comp_type_lower:
-                doc_type = "INPUT_PORT"
-            elif "output_port" in comp_type_lower:
-                doc_type = "OUTPUT_PORT"
-                
-            nodes_by_id[comp_id] = {
-                "name": comp_details.get('component', {}).get('name', 'Unknown'),
-                "type": doc_type # Use mapped type
-            }
-        
-        # --- Debugging Graph and Source Node Logic ---
-        local_logger.debug(f"Nodes identified (nodes_by_id keys): {list(nodes_by_id.keys())}")
-        local_logger.debug(f"Incoming graph keys (nodes with inputs): {list(incoming_graph.keys())}")
-
-        # Check Generate Flow File node specifically
-        gen_flow_file_id = '2ca23583-0196-1000-8dfe-fdf4f50b40d8' # Hardcode ID from image/logs
-        if gen_flow_file_id in nodes_by_id:
-             gen_node_info = nodes_by_id[gen_flow_file_id]
-             gen_node_type = gen_node_info['type']
-             is_processor = gen_node_type == 'PROCESSOR'
-             not_in_incoming = gen_flow_file_id not in incoming_graph
-             local_logger.debug(f"Check for {gen_flow_file_id}: Type is '{gen_node_type}'. Is 'PROCESSOR'? {is_processor}. Not in incoming keys? {not_in_incoming}")
-        else:
-             local_logger.warning(f"Generate Flow File ID {gen_flow_file_id} not found in nodes_by_id!")
-
-        _potential_source_nodes = [nid for nid, node in nodes_by_id.items()
-                                   if node['type'] == 'INPUT_PORT' or 
-                                   (node['type'] == 'PROCESSOR' and nid not in incoming_graph)]
-        local_logger.debug(f"Calculated potential source nodes: {_potential_source_nodes}")
-        # --- End Debugging ---
-
-        # Analyze and document the flow
-        local_logger.info("Analyzing flow structure...")
-        start_node_id = starting_processor_id # Use provided start if available
-        
-        # If no specific processor start, try to find source nodes (input ports or processors with no incoming connections)
-        if not start_node_id:
-            # Use the PREVIOUSLY calculated source nodes from the debug step
-            if _potential_source_nodes:
-                start_node_id = _potential_source_nodes[0] # Pick the first source node found
-                local_logger.info(f"No starting_processor_id given, starting analysis from calculated source node: {start_node_id}")
-            else:
-                # Fallback if no clear source, maybe pick first processor?
-                if processors:
-                    start_node_id = list(processors.keys())[0]
-                    local_logger.warning(f"No source nodes identified, starting analysis from arbitrary processor: {start_node_id}")
-                else:
-                    raise ToolError("Cannot document flow: No starting point specified and no processors found in the group.")
-        else:
-             local_logger.info(f"Using provided starting processor ID: {start_node_id}")
-
-        if not start_node_id: # Final safety check before traversal
-             raise ToolError("Could not determine a valid starting node ID for traversal.")
-                    
-        traversed_path = []
-        visited_nodes = set()
-        queue = [(start_node_id, 0)] # (node_id, current_depth)
-        unconnected_processors = set(processors.keys())
-        unconnected_ports = set(input_ports.keys()) | set(output_ports.keys())
-
-        local_logger.debug(f"Starting traversal. Initial Queue: {queue}") # Log initial queue
-
-        while queue:
-            current_node_id, depth = queue.pop(0)
-
-            local_logger.debug(f"Processing Node: {current_node_id} at depth {depth}. Current Queue: {queue}") # Log current node and queue
-
-            if current_node_id in visited_nodes or depth > max_depth:
-                local_logger.debug(f"Skipping Node {current_node_id}: Visited or max depth reached.") # Log skip reason
-                continue
-            visited_nodes.add(current_node_id)
-            local_logger.debug(f"Added Node {current_node_id} to visited set.") # Log visited add
-
-            if current_node_id in unconnected_processors: unconnected_processors.remove(current_node_id)
-            if current_node_id in unconnected_ports: unconnected_ports.remove(current_node_id)
-
-            node_info = nodes_by_id.get(current_node_id)
-            if not node_info:
-                local_logger.warning(f"Node details not found for ID: {current_node_id} in nodes_by_id map.") # Changed log level
-                results["errors"].append(f"Node details not found for ID: {current_node_id}")
-                continue
-
-            component_details = all_components.get(current_node_id, {})
-            component_config = component_details.get('component', {}).get('config', {})
-            component_props = component_config.get('properties', {})
-
-            doc_entry = {
-                "id": current_node_id,
-                "name": node_info["name"],
-                "type": node_info["type"],
-                "outgoing_connections": [] # Initialize list for outgoing connections
-            }
-            if include_descriptions:
-                doc_entry["description"] = component_details.get("component", {}).get("comments", "") or component_details.get("component", {}).get("name", "")
-            if include_properties and node_info["type"] == "PROCESSOR":
-                 # Use extract_important_properties which now returns all props + expressions
-                 prop_analysis = extract_important_properties(component_details) # Pass full details
-                 doc_entry["properties"] = prop_analysis["all_properties"]
-                 doc_entry["expressions"] = prop_analysis["expressions"]
-                 
-            # Relationship info will be added in the loop below
-            traversed_path.append(doc_entry)
-            local_logger.debug(f"Appended {current_node_id} ({node_info['name']}) to traversed_path.") # Log path append
-            
-            # Add neighbors to queue
-            # Use outgoing_graph now
-            if current_node_id in outgoing_graph:
-                 # Corrected loop: iterate directly over the list of connection details
-                 connection_details_list = outgoing_graph[current_node_id]
-                 local_logger.debug(f"Found {len(connection_details_list)} outgoing connections for {current_node_id}.") # Log connection count
-                 for connection_detail in connection_details_list: # Iterate list directly
-                     neighbor_id = connection_detail.get("destination", {}).get("id")
-                     if not neighbor_id:
-                         neighbor_id = connection_detail.get("destinationId")
-                         
-                     if neighbor_id:
-                         local_logger.debug(f"  Checking neighbor: {neighbor_id} via connection {connection_detail.get('id')}") # Log neighbor check
-                         # Format connection info
-                         formatted_conn = format_connection(connection_detail, all_components) # Pass all_components for name lookup
-                         # Append connection info to the CURRENT node's entry in traversed_path
-                         # Since doc_entry was just appended, it's the last item
-                         if traversed_path:
-                              traversed_path[-1]["outgoing_connections"].append(formatted_conn)
-                          
-                         if neighbor_id not in visited_nodes:
-                             queue.append((neighbor_id, depth + 1))
-                             local_logger.debug(f"    Added neighbor {neighbor_id} to queue.") # Log queue add
-                         else:
-                              local_logger.debug(f"    Neighbor {neighbor_id} already visited.") # Log neighbor visited
-                     else:
-                         local_logger.warning(f"  Could not find destination ID in connection detail: {connection_detail}") # Log missing ID
-            else:
-                 local_logger.debug(f"Node {current_node_id} has no outgoing connections in graph.") # Log no outgoing
-
-        local_logger.debug(f"Traversal loop finished. Final traversed_path: {traversed_path}") # Log final path
-        results["flow_structure"] = traversed_path
-        results["decision_branches"] = find_decision_branches(all_components, graph_data) # Pass all_components and the raw graph_data
-        
-        # Populate unconnected
-        for proc_id in unconnected_processors:
-             proc_info = processors.get(proc_id, {})
-             results["unconnected_components"]["processors"].append({
-                "id": proc_id,
-                "name": proc_info.get('component', {}).get('name', 'Unknown Processor'),
-                "type": proc_info.get('component', {}).get('type', 'Unknown Type')
-             })
-        for port_id in unconnected_ports:
-             port_info = all_components.get(port_id, {})
-             results["unconnected_components"]["ports"].append({
-                "id": port_id,
-                "name": port_info.get('component', {}).get('name', 'Unknown Port'),
-                "type": port_info.get('component', {}).get('type', 'Unknown Port Type') 
-             })
+        # Use the improved implementation
+        doc_result = document_nifi_flow_improved(
+            processors=processors_resp or [],
+            connections=connections_resp or [],
+            input_ports=input_ports_resp or [],
+            output_ports=output_ports_resp or [],
+            include_properties=include_properties,
+            include_descriptions=include_descriptions
+        )
         
         local_logger.info("Flow documentation analysis complete.")
-        return results
+        return {
+            "status": "success",
+            "documentation": doc_result
+        }
 
     except NiFiAuthenticationError as e:
          local_logger.error(f"Authentication error during document_nifi_flow: {e}", exc_info=False)
-         results["errors"].append(f"Authentication error accessing NiFi: {e}")
-         raise ToolError(f"Authentication error accessing NiFi: {e}") from e # Re-raise as ToolError
+         raise ToolError(f"Authentication error accessing NiFi: {e}") from e
     except (ValueError, ConnectionError, ToolError) as e:
         local_logger.error(f"Error documenting NiFi flow: {e}", exc_info=False)
-        results["errors"].append(f"Error documenting flow: {e}")
-        # Don't re-raise, return partial results with errors
-        return results
+        raise ToolError(f"Error documenting flow: {e}") from e
     except Exception as e:
         local_logger.error(f"Unexpected error documenting NiFi flow: {e}", exc_info=True)
-        results["errors"].append(f"An unexpected error occurred: {e}")
-        # Don't re-raise, return partial results with errors
-        return results
+        raise ToolError(f"An unexpected error occurred: {e}") from e
 
 @mcp.tool()
 @tool_phases(["Review", "Operate"])
