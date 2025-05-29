@@ -22,11 +22,8 @@ from mcp.server.fastmcp.exceptions import ToolError
 
 # Import flow documentation tools specifically needed by document_nifi_flow
 from nifi_mcp_server.flow_documenter_improved import (
-    document_nifi_flow_improved,
-    extract_important_properties,
-    format_connection,
-    build_graph_structure,
-    find_decision_branches
+    document_nifi_flow_simplified,
+    extract_important_properties
 )
 
 # Import context variables
@@ -522,8 +519,8 @@ async def document_nifi_flow(
     """
     Analyzes and documents a NiFi flow starting from a given process group or processor.
 
-    This tool traverses the flow graph, extracts key information about processors and connections,
-    identifies decision points, and generates a structured representation of the flow logic.
+    This tool extracts processor information with embedded connection details, providing
+    a simplified and token-efficient representation of the flow structure.
 
     Parameters
     ----------
@@ -532,7 +529,7 @@ async def document_nifi_flow(
     starting_processor_id : str, optional
         The ID of a specific processor to focus the documentation around. The tool will analyze the flow connected to this processor within its parent group.
     max_depth : int, optional
-        The maximum depth to traverse the flow graph from the starting point. Defaults to 10.
+        DEPRECATED: This parameter is kept for compatibility but is not used in the simplified implementation.
     include_properties : bool, optional
         Whether to include important processor properties in the documentation. Defaults to True.
     include_descriptions : bool, optional
@@ -541,11 +538,15 @@ async def document_nifi_flow(
     Returns
     -------
     Dict[str, Any]
-        A dictionary containing the documented flow, including:
-        - 'components': Dictionary of all components by type (processors, connections, ports)
-        - 'flows': List of flow paths from source components
-        - 'decision_points': List of processors with multiple outgoing paths
-        - 'unconnected_components': List of components not connected to any flow
+        A dictionary containing the documented flow with simplified structure:
+        - 'components': Dictionary containing:
+            - 'processors': Dict of processors with embedded incoming/outgoing connection info
+            - 'ports': Dict of input/output ports
+        Each processor includes:
+        - Basic info (id, name, type, state, properties, description)
+        - 'outgoing_connections': List of connections where this processor is the source
+        - 'incoming_connections': List of connections where this processor is the destination
+        - 'auto_terminated_relationships': List of relationships that are auto-terminated
     """
     # Get client and logger from context variables
     nifi_client: Optional[NiFiClient] = current_nifi_client.get()
@@ -564,8 +565,8 @@ async def document_nifi_flow(
 
     try:
         # Determine the target process group ID
-        target_pg_id = process_group_id
-        if starting_processor_id and not target_pg_id:
+        pg_id = process_group_id
+        if starting_processor_id and not pg_id:
             local_logger.info(f"No process_group_id provided, finding parent group for starting processor {starting_processor_id}")
             nifi_req = {"operation": "get_processor_details", "id": starting_processor_id}
             local_logger.bind(interface="nifi", direction="request", data=nifi_req).debug("Calling NiFi API")
@@ -573,51 +574,55 @@ async def document_nifi_flow(
             nifi_resp = {"has_proc_details": bool(proc_details and 'component' in proc_details)}
             local_logger.bind(interface="nifi", direction="response", data=nifi_resp).debug("Received from NiFi API")
             
-            target_pg_id = proc_details.get("component", {}).get("parentGroupId")
-            if not target_pg_id:
+            pg_id = proc_details.get("component", {}).get("parentGroupId")
+            if not pg_id:
                 raise ToolError(f"Could not determine parent process group ID for processor {starting_processor_id}")
-            local_logger.info(f"Determined target process group ID: {target_pg_id} from starting processor.")
-        elif not target_pg_id:
+            local_logger.info(f"Determined target process group ID: {pg_id} from starting processor.")
+        elif not pg_id:
             local_logger.info("No process_group_id or starting_processor_id provided, defaulting to root process group.")
-            target_pg_id = await nifi_client.get_root_process_group_id(user_request_id=user_request_id, action_id=action_id)
-            if not target_pg_id:
+            pg_id = await nifi_client.get_root_process_group_id(user_request_id=user_request_id, action_id=action_id)
+            if not pg_id:
                  raise ToolError("Could not retrieve the root process group ID.")
-            local_logger.info(f"Resolved root process group ID: {target_pg_id}")
+            local_logger.info(f"Resolved root process group ID: {pg_id}")
             
-        if not target_pg_id:
+        if not pg_id:
              raise ToolError("Failed to determine a target process group ID for documentation.")
 
         # Fetch components for the target process group
-        local_logger.info(f"Fetching components for process group {target_pg_id}...")
-        nifi_req_components = {"operation": "list_all", "process_group_id": target_pg_id}
+        local_logger.info(f"Fetching components for process group {pg_id}...")
+        nifi_req_components = {"operation": "list_all", "process_group_id": pg_id}
         local_logger.bind(interface="nifi", direction="request", data=nifi_req_components).debug("Calling NiFi API (multiple calls)")
         
-        processors_resp = await nifi_client.list_processors(target_pg_id, user_request_id=user_request_id, action_id=action_id)
-        connections_resp = await nifi_client.list_connections(target_pg_id, user_request_id=user_request_id, action_id=action_id)
-        input_ports_resp = await nifi_client.get_input_ports(target_pg_id)
-        output_ports_resp = await nifi_client.get_output_ports(target_pg_id)
+        processors_list = await nifi_client.list_processors(pg_id, user_request_id=user_request_id, action_id=action_id)
+        connections_list = await nifi_client.list_connections(pg_id, user_request_id=user_request_id, action_id=action_id)
+        input_ports_list = await nifi_client.get_input_ports(pg_id)
+        output_ports_list = await nifi_client.get_output_ports(pg_id)
         
         nifi_resp_components = {
-            "processor_count": len(processors_resp or []),
-            "connection_count": len(connections_resp or []),
-            "port_count": len(input_ports_resp or []) + len(output_ports_resp or [])
+            "processor_count": len(processors_list) if isinstance(processors_list, list) else -1,
+            "connection_count": len(connections_list) if isinstance(connections_list, list) else -1,
+            "port_count": len(input_ports_list) if isinstance(input_ports_list, list) else -1,
+            "output_port_count": len(output_ports_list) if isinstance(output_ports_list, list) else -1,
         }
-        local_logger.bind(interface="nifi", direction="response", data=nifi_resp_components).debug("Received from NiFi API (multiple calls)")
+        local_logger.bind(interface="nifi", direction="response", data=nifi_resp_components).debug("Received from NiFi API (multiple component lists)")
 
-        # Use the improved implementation
-        doc_result = document_nifi_flow_improved(
-            processors=processors_resp or [],
-            connections=connections_resp or [],
-            input_ports=input_ports_resp or [],
-            output_ports=output_ports_resp or [],
+        # Use the simplified documentation function that embeds connections in processors
+        documentation = await document_nifi_flow_simplified(
+            processors=processors_list or [],
+            connections=connections_list or [],
+            input_ports=input_ports_list or [],
+            output_ports=output_ports_list or [],
             include_properties=include_properties,
-            include_descriptions=include_descriptions
+            include_descriptions=include_descriptions,
+            nifi_client=nifi_client,  # Pass the client for detailed processor info
+            user_request_id=user_request_id,
+            action_id=action_id
         )
         
         local_logger.info("Flow documentation analysis complete.")
         return {
             "status": "success",
-            "documentation": doc_result
+            "documentation": documentation
         }
 
     except NiFiAuthenticationError as e:

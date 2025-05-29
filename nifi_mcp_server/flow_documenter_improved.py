@@ -210,6 +210,230 @@ def identify_flow_paths(
     
     return flows
 
+async def fetch_detailed_processor_info(processor_id: str, nifi_client, user_request_id: str = "-", action_id: str = "-") -> Optional[Dict[str, Any]]:
+    """Fetch detailed processor information including configuration."""
+    try:
+        # This will include the full configuration with autoTerminatedRelationships
+        return await nifi_client.get_processor_details(processor_id)
+    except Exception as e:
+        logger.warning(f"Failed to fetch detailed processor info for {processor_id}: {e}")
+        return None
+
+async def document_nifi_flow_simplified(
+    processors: List[Dict[str, Any]],
+    connections: List[Dict[str, Any]],
+    input_ports: List[Dict[str, Any]],
+    output_ports: List[Dict[str, Any]],
+    include_properties: bool = True,
+    include_descriptions: bool = True,
+    nifi_client=None,  # Added parameter for fetching detailed info
+    user_request_id: str = "-",
+    action_id: str = "-"
+) -> Dict[str, Any]:
+    """
+    Document a NiFi flow with a simplified structure that embeds connection information in processors.
+    
+    Args:
+        processors: List of processor entities (may be from list endpoint without full config)
+        connections: List of connection entities
+        input_ports: List of input port entities
+        output_ports: List of output port entities
+        include_properties: Whether to include processor properties
+        include_descriptions: Whether to include descriptions
+        nifi_client: NiFi client instance for fetching detailed processor info (optional)
+        user_request_id: User request ID for logging
+        action_id: Action ID for logging
+        
+    Returns:
+        Dict with the following structure:
+        {
+            "components": {
+                "processors": {
+                    id: {
+                        ...existing details,
+                        "outgoing_connections": [
+                            {
+                                "connection_id": "id",
+                                "destination_name": "name", 
+                                "destination_id": "id",
+                                "destination_type": "PROCESSOR|INPUT_PORT|OUTPUT_PORT",
+                                "relationship": "success"
+                            }
+                        ],
+                        "incoming_connections": [
+                            {
+                                "connection_id": "id",
+                                "source_name": "name",
+                                "source_id": "id", 
+                                "source_type": "PROCESSOR|INPUT_PORT|OUTPUT_PORT",
+                                "relationship": "success"
+                            }
+                        ],
+                        "auto_terminated_relationships": [
+                            {
+                                "relationship": "failure"
+                            }
+                        ]
+                    }
+                },
+                "ports": {id: {details}}
+            }
+        }
+    """
+    # Initialize result structure
+    result = {
+        "components": {
+            "processors": {},
+            "ports": {}
+        }
+    }
+    
+    # Build lookup maps for easy access
+    all_components = {}  # id -> entity (for name resolution)
+    
+    # Add processors to lookup
+    for proc in processors:
+        proc_id = proc.get("id")
+        if proc_id:
+            all_components[proc_id] = proc
+    
+    # Add ports to lookup  
+    for port in input_ports + output_ports:
+        port_id = port.get("id")
+        if port_id:
+            all_components[port_id] = port
+    
+    # Process processors with embedded connection info
+    for proc in processors:
+        proc_id = proc.get("id")
+        if not proc_id:
+            continue
+            
+        component = proc.get("component", {})
+        config = component.get("config", {})
+        
+        # Try to fetch detailed processor info if client is available
+        detailed_processor = None
+        if nifi_client:
+            try:
+                detailed_processor = await fetch_detailed_processor_info(processor_id=proc_id, nifi_client=nifi_client, user_request_id=user_request_id, action_id=action_id)
+                if detailed_processor:
+                    # Use the detailed component and config
+                    component = detailed_processor.get("component", component)
+                    config = component.get("config", config)
+                    logger.debug(f"Using detailed processor info for {proc_id}")
+                else:
+                    logger.debug(f"Using basic processor info for {proc_id} (detailed fetch failed)")
+            except Exception as e:
+                logger.warning(f"Error fetching detailed processor info for {proc_id}: {e}")
+        
+        # Extract basic processor info
+        proc_info = {
+            "id": proc_id,
+            "name": component.get("name", "Unknown"),
+            "type": "PROCESSOR",
+            "processor_type": component.get("type", "Unknown"),
+            "state": component.get("state", "UNKNOWN"),
+            "outgoing_connections": [],
+            "incoming_connections": [],
+            "auto_terminated_relationships": []
+        }
+        
+        # Add properties if requested
+        if include_properties:
+            if detailed_processor:
+                # Use extract_important_properties with the detailed processor
+                prop_analysis = extract_important_properties(detailed_processor)
+            else:
+                # Fallback to basic processor
+                prop_analysis = extract_important_properties(proc)
+            proc_info["properties"] = prop_analysis["all_properties"]
+            proc_info["expressions"] = prop_analysis["expressions"]
+        
+        # Add description if requested
+        if include_descriptions:
+            proc_info["description"] = component.get("comments", "")
+        
+        # Get auto-terminated relationships from processor relationships array
+        relationships = component.get("relationships", [])
+        auto_terminated = set()
+        for rel in relationships:
+            if rel.get("autoTerminate", False):
+                auto_terminated.add(rel.get("name"))
+        
+        # Find outgoing connections for this processor
+        for conn in connections:
+            conn_comp = conn.get("component", {})
+            source = conn_comp.get("source", {})
+            dest = conn_comp.get("destination", {})
+            
+            # Check if this processor is the source
+            if source.get("id") == proc_id:
+                dest_id = dest.get("id")
+                dest_entity = all_components.get(dest_id, {})
+                dest_component = dest_entity.get("component", {})
+                relationship = conn_comp.get("selectedRelationships", [""])[0]
+                
+                proc_info["outgoing_connections"].append({
+                    "connection_id": conn.get("id"),
+                    "destination_name": dest_component.get("name", dest.get("name", "Unknown")),
+                    "destination_id": dest_id,
+                    "destination_type": dest.get("type", "UNKNOWN"),
+                    "relationship": relationship
+                })
+        
+        # Add auto-terminated relationships as separate entries
+        for relationship in auto_terminated:
+            proc_info["auto_terminated_relationships"].append({
+                "relationship": relationship
+            })
+        
+        # Find incoming connections for this processor
+        for conn in connections:
+            conn_comp = conn.get("component", {})
+            source = conn_comp.get("source", {})
+            dest = conn_comp.get("destination", {})
+            
+            # Check if this processor is the destination
+            if dest.get("id") == proc_id:
+                source_id = source.get("id")
+                source_entity = all_components.get(source_id, {})
+                source_component = source_entity.get("component", {})
+                relationship = conn_comp.get("selectedRelationships", [""])[0]
+                
+                proc_info["incoming_connections"].append({
+                    "connection_id": conn.get("id"),
+                    "source_name": source_component.get("name", source.get("name", "Unknown")),
+                    "source_id": source_id,
+                    "source_type": source.get("type", "UNKNOWN"),
+                    "relationship": relationship
+                })
+        
+        result["components"]["processors"][proc_id] = proc_info
+    
+    # Process ports (keeping them as they may be useful for understanding flow entry/exit points)
+    for port in input_ports + output_ports:
+        port_id = port.get("id")
+        if not port_id:
+            continue
+            
+        component = port.get("component", {})
+        port_info = {
+            "id": port_id,
+            "name": component.get("name", "Unknown"),
+            "type": "PORT",
+            "port_type": "INPUT_PORT" if port in input_ports else "OUTPUT_PORT",
+            "state": component.get("state", "UNKNOWN")
+        }
+        
+        if include_descriptions:
+            port_info["description"] = component.get("comments", "")
+        
+        result["components"]["ports"][port_id] = port_info
+    
+    return result
+
+# Keep the original function for backward compatibility, but mark as deprecated
 def document_nifi_flow_improved(
     processors: List[Dict[str, Any]],
     connections: List[Dict[str, Any]],
@@ -219,154 +443,11 @@ def document_nifi_flow_improved(
     include_descriptions: bool = True
 ) -> Dict[str, Any]:
     """
-    Document a NiFi flow with the improved structure.
-    
-    Args:
-        processors: List of processor entities
-        connections: List of connection entities
-        input_ports: List of input port entities
-        output_ports: List of output port entities
-        include_properties: Whether to include processor properties
-        include_descriptions: Whether to include descriptions
-        
-    Returns:
-        Dict with the following structure:
-        {
-            "components": {
-                "processors": {id: {details}},
-                "connections": {id: {details}},
-                "ports": {id: {details}}
-            },
-            "flows": [
-                {
-                    "source": "name",
-                    "source_type": "type",
-                    "path": [{component details}]
-                }
-            ],
-            "decision_points": [
-                {
-                    "processor_id": "id",
-                    "processor_name": "name",
-                    "processor_type": "type",
-                    "branches": [{branch details}]
-                }
-            ],
-            "unconnected_components": [
-                {
-                    "id": "id",
-                    "name": "name",
-                    "type": "type"
-                }
-            ]
-        }
+    DEPRECATED: Use document_nifi_flow_simplified instead.
+    This function is kept for backward compatibility but will be removed in future versions.
     """
-    # Initialize result structure
-    result = {
-        "components": {
-            "processors": {},
-            "connections": {},
-            "ports": {}
-        },
-        "flows": [],
-        "decision_points": [],
-        "unconnected_components": []
-    }
-    
-    # Build lookup of all components
-    all_components = {}  # id -> entity
-    components_by_type = {}  # id -> simplified component info
-    
-    # Process processors
-    for proc in processors:
-        proc_id = proc.get("id")
-        if proc_id:
-            all_components[proc_id] = proc
-            
-            # Extract basic info
-            component = proc.get("component", {})
-            proc_info = {
-                "id": proc_id,
-                "name": component.get("name", "Unknown"),
-                "type": "PROCESSOR",
-                "processor_type": component.get("type", "Unknown"),
-                "is_source": False  # Will be updated later
-            }
-            
-            # Add properties if requested
-            if include_properties:
-                prop_analysis = extract_important_properties(proc)
-                proc_info["properties"] = prop_analysis["all_properties"]
-                proc_info["expressions"] = prop_analysis["expressions"]
-            
-            # Add description if requested
-            if include_descriptions:
-                proc_info["description"] = component.get("comments", "")
-            
-            components_by_type[proc_id] = proc_info
-            result["components"]["processors"][proc_id] = proc_info
-    
-    # Process ports
-    for port in input_ports + output_ports:
-        port_id = port.get("id")
-        if port_id:
-            all_components[port_id] = port
-            
-            component = port.get("component", {})
-            port_info = {
-                "id": port_id,
-                "name": component.get("name", "Unknown"),
-                "type": "PORT",
-                "port_type": "INPUT_PORT" if port in input_ports else "OUTPUT_PORT",
-                "is_source": port in input_ports  # Input ports are sources
-            }
-            
-            if include_descriptions:
-                port_info["description"] = component.get("comments", "")
-            
-            components_by_type[port_id] = port_info
-            result["components"]["ports"][port_id] = port_info
-    
-    # Build graph structure
-    graph_data = build_graph_structure(processors, connections, input_ports, output_ports)
-    outgoing_graph = graph_data.get("outgoing", {})
-    incoming_graph = graph_data.get("incoming", {})
-    
-    # Process connections
-    for conn in connections:
-        conn_id = conn.get("id")
-        if conn_id:
-            formatted_conn = format_connection(conn, all_components)
-            result["components"]["connections"][conn_id] = formatted_conn
-    
-    # Identify source components (no incoming connections or input ports)
-    source_components = []
-    for comp_id, comp_info in components_by_type.items():
-        if comp_info["type"] == "PORT" and comp_info["port_type"] == "INPUT_PORT":
-            source_components.append(comp_info)
-        elif comp_id not in incoming_graph:
-            comp_info["is_source"] = True
-            source_components.append(comp_info)
-    
-    # Find decision points
-    result["decision_points"] = find_decision_branches(all_components, graph_data)
-    
-    # Document flow paths
-    result["flows"] = identify_flow_paths(components_by_type, graph_data, source_components)
-    
-    # Identify unconnected components
-    connected_ids = set()
-    for comp_id in outgoing_graph.keys():
-        connected_ids.add(comp_id)
-    for comp_id in incoming_graph.keys():
-        connected_ids.add(comp_id)
-        
-    for comp_id, comp_info in components_by_type.items():
-        if comp_id not in connected_ids:
-            result["unconnected_components"].append({
-                "id": comp_id,
-                "name": comp_info["name"],
-                "type": comp_info["type"]
-            })
-    
-    return result 
+    logger.warning("document_nifi_flow_improved is deprecated, use document_nifi_flow_simplified instead")
+    return document_nifi_flow_simplified(
+        processors, connections, input_ports, output_ports, 
+        include_properties, include_descriptions
+    ) 
