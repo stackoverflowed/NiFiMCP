@@ -31,6 +31,9 @@ DEFAULT_APP_CONFIG = {
         'auto_stop_enabled': True,
         'auto_delete_enabled': True,
         'auto_purge_enabled': True
+    },
+    'logging': {
+        'llm_enqueue_enabled': True
     }
 }
 
@@ -120,6 +123,17 @@ def get_feature_auto_purge_enabled(headers: dict | None = None) -> bool:
             return str(header_value).lower() == "true"
     return _APP_CONFIG.get('mcp_features', {}).get('auto_purge_enabled', DEFAULT_APP_CONFIG['mcp_features']['auto_purge_enabled'])
 
+# --- Logging Configuration Accessors ---
+
+def get_llm_enqueue_enabled() -> bool:
+    """Returns whether LLM logging should use enqueue for thread safety."""
+    return _APP_CONFIG.get('logging', {}).get('llm_enqueue_enabled', DEFAULT_APP_CONFIG['logging']['llm_enqueue_enabled'])
+
+def get_interface_debug_enabled() -> bool:
+    """Returns whether detailed interface debug logging is enabled."""
+    # Check the logging config (logging_config.yaml) where this setting belongs
+    return LOGGING_CONFIG.get('interface_debug_enabled', False)
+
 # --- Specific Config Values ---
 
 # Load API keys using nested gets for safety
@@ -145,6 +159,11 @@ print("\nMCP Feature Flags:")
 print(f"  Auto-Stop Enabled: {get_feature_auto_stop_enabled()}")
 print(f"  Auto-Delete Enabled: {get_feature_auto_delete_enabled()}")
 print(f"  Auto-Purge Enabled: {get_feature_auto_purge_enabled()}")
+
+# Print Logging Configuration status
+print("\nLogging Configuration:")
+print(f"  LLM Enqueue Enabled: {get_llm_enqueue_enabled()}")
+print(f"  Interface Debug Enabled: {get_interface_debug_enabled()}")
 
 # --- Deprecated Functions (Keep temporarily for reference/smooth transition if needed, but remove eventually) ---
 
