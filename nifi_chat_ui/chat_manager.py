@@ -659,12 +659,41 @@ def get_gemini_response(
                 # Handle function_call
                 if hasattr(part, 'function_call') and part.function_call:
                     fc = part.function_call
-                    try:
-                        # Try to convert MapComposite args to dict
-                        args_dict = dict(fc.args) if hasattr(fc, 'args') and fc.args else {}
-                    except:
-                        # If conversion fails, use string representation
-                        args_dict = str(fc.args) if hasattr(fc, 'args') else {}
+                    
+                    # More robust args handling for MapComposite and similar objects
+                    if hasattr(fc, 'args'):
+                        try:
+                            # Convert MapComposite to plain dict recursively
+                            args_dict = {}
+                            if hasattr(fc.args, 'items') and callable(fc.args.items):
+                                for key, value in fc.args.items():
+                                    # Convert any complex objects to serializable types
+                                    if hasattr(value, '__dict__') or hasattr(value, '_pb') or str(type(value)).startswith('<google'):
+                                        args_dict[key] = str(value)
+                                    elif hasattr(value, 'items') and callable(value.items):
+                                        # Handle nested MapComposite objects
+                                        args_dict[key] = dict(value.items())
+                                    else:
+                                        # Test if the value is JSON serializable
+                                        try:
+                                            json.dumps(value)
+                                            args_dict[key] = value
+                                        except (TypeError, OverflowError):
+                                            args_dict[key] = str(value)
+                            elif isinstance(fc.args, dict):
+                                # Already a dict, but check each value for serializability
+                                for key, value in fc.args.items():
+                                    try:
+                                        json.dumps(value)
+                                        args_dict[key] = value
+                                    except (TypeError, OverflowError):
+                                        args_dict[key] = str(value)
+                            else:
+                                args_dict = {"raw_args": str(fc.args)}
+                        except Exception as e:
+                            args_dict = {"serialization_error": str(e), "raw_args": str(fc.args)}
+                    else:
+                        args_dict = {}
                     
                     data['function_call'] = {'name': fc.name, 'args': args_dict}
                 
@@ -775,16 +804,44 @@ def get_gemini_response(
                         fc_attrs = dir(fc)
                         bound_logger.debug(f"Function call attributes: {fc_attrs}")
                         
-                        # More careful args handling
+                        # More careful args handling with improved MapComposite support
                         if hasattr(fc, 'args'):
-                            if isinstance(fc.args, dict):
-                                args_str = json.dumps(fc.args)
-                            elif hasattr(fc.args, 'items') and callable(fc.args.items):
-                                # It's dict-like but not a dict
-                                args_str = json.dumps(dict(fc.args))
-                            else:
-                                # Not a dict or dict-like, convert to string
-                                args_str = json.dumps({"raw_args": str(fc.args)})
+                            try:
+                                # Handle MapComposite and similar objects more robustly
+                                if hasattr(fc.args, 'items') and callable(fc.args.items):
+                                    # Convert MapComposite to plain dict with safe serialization
+                                    safe_args = {}
+                                    for key, value in fc.args.items():
+                                        # Convert any complex objects to serializable types
+                                        if hasattr(value, '__dict__') or hasattr(value, '_pb') or str(type(value)).startswith('<google'):
+                                            safe_args[key] = str(value)
+                                        elif hasattr(value, 'items') and callable(value.items):
+                                            # Handle nested MapComposite objects
+                                            safe_args[key] = dict(value.items())
+                                        else:
+                                            # Test if the value is JSON serializable
+                                            try:
+                                                json.dumps(value)
+                                                safe_args[key] = value
+                                            except (TypeError, OverflowError):
+                                                safe_args[key] = str(value)
+                                    args_str = json.dumps(safe_args)
+                                elif isinstance(fc.args, dict):
+                                    # Already a dict, but check each value for serializability
+                                    safe_args = {}
+                                    for key, value in fc.args.items():
+                                        try:
+                                            json.dumps(value)
+                                            safe_args[key] = value
+                                        except (TypeError, OverflowError):
+                                            safe_args[key] = str(value)
+                                    args_str = json.dumps(safe_args)
+                                else:
+                                    # Not a dict or dict-like, convert to string
+                                    args_str = json.dumps({"raw_args": str(fc.args)})
+                            except Exception as args_error:
+                                # If all else fails, create a safe fallback
+                                args_str = json.dumps({"serialization_error": str(args_error), "raw_args": str(fc.args)})
                         else:
                             args_str = "{}"
                         

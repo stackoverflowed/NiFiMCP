@@ -27,5 +27,12 @@ mcp_features:
   auto_delete_enabled: true
   auto_purge_enabled: true
 
+# Logging configuration
+logging:
+  # Enable/disable thread-safe logging queue for LLM debug logs
+  # Setting to false may resolve pickle serialization errors with Google Protocol Buffers
+  # but may reduce thread safety in high-concurrency scenarios
+  llm_enqueue_enabled: true  # Set to false if experiencing MapComposite pickle errors
+
 # general:
 #   setting_1: "value" # Example for other potential app settings 

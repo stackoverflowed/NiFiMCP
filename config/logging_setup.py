@@ -10,12 +10,12 @@ request_context = ContextVar('request_context', default={})
 
 # Assuming settings.py is in the same directory or accessible
 try:
-    from .settings import LOGGING_CONFIG, PROJECT_ROOT
+    from .settings import LOGGING_CONFIG, PROJECT_ROOT, get_llm_enqueue_enabled, get_interface_debug_enabled
 except ImportError:
     # Fallback for potential execution context issues, adjust as needed
     print("Could not import settings relative to logging_setup. Trying absolute.")
     try:
-        from config.settings import LOGGING_CONFIG, PROJECT_ROOT
+        from config.settings import LOGGING_CONFIG, PROJECT_ROOT, get_llm_enqueue_enabled, get_interface_debug_enabled
     except ImportError:
         print("FATAL: Could not import LOGGING_CONFIG or PROJECT_ROOT from config.settings")
         # Provide minimal default config to prevent crashing if import fails completely
@@ -30,6 +30,11 @@ except ImportError:
             'mcp_debug_file': {},
             'nifi_debug_file': {}
         }
+        # Fallback functions for when settings can't be imported
+        def get_llm_enqueue_enabled():
+            return True
+        def get_interface_debug_enabled():
+            return False
 
 # Define module patterns for client and server components
 CLIENT_MODULES = [
@@ -219,7 +224,7 @@ def setup_logging(context: str | None = None):
             )
 
     # --- Interface Debug File Sinks (Conditional) ---
-    if config.get('interface_debug_enabled', False):
+    if get_interface_debug_enabled():
         # Common format for interface logs
         interface_format = """
 {time:YYYY-MM-DD HH:mm:ss.SSS} | {level:<8} | {extra[interface]}-{extra[direction]} | Req:{extra[user_request_id]} | Act:{extra[action_id]}
@@ -241,6 +246,11 @@ def setup_logging(context: str | None = None):
                 # Filter to only log messages from this specific interface
                 sink_filter = lambda record, name=interface_name: record["extra"].get("interface") == name
 
+                # Use configurable enqueue setting for LLM logs to avoid pickle errors
+                use_enqueue = True
+                if interface_name == 'llm':
+                    use_enqueue = get_llm_enqueue_enabled()
+
                 logger.add(
                     debug_path,
                     level=debug_level.upper(),
@@ -248,7 +258,7 @@ def setup_logging(context: str | None = None):
                     format=interface_format,  # Use the simple format string that accesses json_data
                     mode="w", # Changed back to write/overwrite
                     encoding='utf8',
-                    enqueue=True, # Add for thread/process safety
+                    enqueue=use_enqueue, # Configurable for LLM logs to resolve pickle issues
                     backtrace=False,  # Disable backtrace for cleaner logs
                     diagnose=False # Disable traceback to avoid recursion issues
                 )
@@ -272,7 +282,7 @@ def setup_logging(context: str | None = None):
                     format=interface_format,  # Use the simple format string that accesses json_data
                     mode="w", # Changed back to write/overwrite
                     encoding='utf8',
-                    enqueue=True, # Add for thread/process safety
+                    enqueue=True, # Keep enqueue enabled for NiFi logs (they don't have pickle issues)
                     backtrace=False,  # Disable backtrace for cleaner logs
                     diagnose=False # Disable traceback to avoid recursion issues
                 )
