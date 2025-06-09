@@ -1124,11 +1124,8 @@ async def list_flowfiles(
             try:
                 # 1. Submit query
                 provenance_payload = {
-                    "searchTerms": {"componentId": target_id},
-                    # "maxResults": max_results, # Removed - Let client handle default, limit applied after fetch/sort
-                    # "summarize": True, # May be useful later?
-                    # "sortColumn": "eventTime", # Default is usually time - sorting handled client-side now
-                    # "sortOrder": "DESC"     # Default is usually time - sorting handled client-side now
+                    "processor_id": target_id,
+                    "max_results": max_results  # Pass max_results to the client method
                 }
                 nifi_req_create = {"operation": "submit_provenance_query", "payload": provenance_payload}
                 local_logger.bind(interface="nifi", direction="request", data=nifi_req_create).debug("Calling NiFi API")
@@ -1160,9 +1157,18 @@ async def list_flowfiles(
                     if query_status.get("finished"): # Correct check directly on the status dict
                     # ------------------------------
                         local_logger.info(f"Provenance query {query_id} finished.")
-                        # 3. Get results
-                        # get_provenance_results already handles getting from completed query
-                        events = await nifi_client.get_provenance_results(query_id)
+                        
+                        # Check if events are already in the query status response
+                        events = query_status.get("provenanceEvents", [])
+                        
+                        if not events:
+                            # If not in status, try to get results from separate endpoint
+                            try:
+                                events = await nifi_client.get_provenance_results(query_id)
+                            except Exception as e:
+                                local_logger.warning(f"Could not get provenance results from /results endpoint: {e}")
+                                # Try to extract from the query response itself
+                                events = query_status.get("results", {}).get("provenanceEvents", [])
                         
                         # --- Added Logging for Raw Events --- 
                         local_logger.debug(f"Retrieved {len(events)} raw provenance events from client.")
@@ -1170,29 +1176,6 @@ async def list_flowfiles(
                         #      local_logger.trace(f"First raw event details: {events[0]}") # Log first event details
                         # ------------------------------------
 
-                        # --- Client-side Sorting & Limiting --- 
-                        def parse_event_time(event_time_str: str) -> Optional[datetime]:
-                            """Helper to parse NiFi timestamp string, stripping timezone."""
-                            try:
-                                # Expect format like "04/27/2025 10:55:06.137 EDT"
-                                time_part = event_time_str.rsplit(' ', 1)[0] # Remove timezone part
-                                return datetime.strptime(time_part, "%m/%d/%Y %H:%M:%S.%f")
-                            except (ValueError, IndexError, AttributeError) as e:
-                                local_logger.warning(f"Could not parse eventTime '{event_time_str}': {e}")
-                                return None
-
-                        # Sort events by time descending (most recent first)
-                        sorted_events = sorted(
-                            [e for e in events if parse_event_time(e.get("eventTime", "")) is not None], # Filter out unparseable
-                            key=lambda e: parse_event_time(e["eventTime"]), 
-                            reverse=True
-                        )
-                        
-                        # Apply max_results limit
-                        limited_events = sorted_events[:max_results]
-                        local_logger.debug(f"Applied max_results={max_results}, using {len(limited_events)} events for summary.")
-                        # -------------------------------------
-                        
                         # Format events into summaries
                         # Note: Provenance events might show multiple stages for the same FlowFile.
                         # We will return one entry per event for simplicity, ordered by event time (default). 
@@ -1208,7 +1191,7 @@ async def list_flowfiles(
                                 "component_name": event.get("componentName"),
                                 "attributes": event.get("updatedAttributes", {}), # Use updated attributes for the event
                             }
-                            for event in limited_events # Use the sorted and limited list
+                            for event in events # Use the retrieved list
                         ]
                         break
                     await asyncio.sleep(polling_interval)
@@ -1244,21 +1227,20 @@ async def list_flowfiles(
 
 @mcp.tool()
 @tool_phases(["Review", "Operate"])
-async def get_flowfile_event_details( # Renamed function
-    event_id: int, # Changed parameter from flowfile_uuid
-    max_content_bytes: int = 4096
-    # Removed target_id, target_type, polling params
+async def get_flowfile_event_details(
+    event_id: int,
+    max_content_bytes: int = 4096  # Reasonable default to avoid overwhelming LLM
 ) -> Dict[str, Any]:
     """
     Retrieves detailed attributes and content for a specific FlowFile provenance event.
 
-    Fetches the event details using the event ID and attempts to retrieve both the 
-    input and output content associated with that event, subject to availability and limits.
+    Fetches the event details and intelligently retrieves content based on size limits.
+    If input and output content are identical, only returns one copy to avoid duplication.
 
     Args:
         event_id: The specific numeric ID of the provenance event.
-        max_content_bytes: Max bytes of content to return for EACH direction (input/output).
-                           -1 for unlimited (use with caution).
+        max_content_bytes: Max bytes of content to return. If content is larger, 
+                          returns size info instead of actual content.
 
     Returns:
         A dictionary containing the event and content details.
@@ -1269,10 +1251,7 @@ async def get_flowfile_event_details( # Renamed function
     if not nifi_client:
         raise ToolError("NiFi client context is not set.")
 
-    local_logger = local_logger.bind(
-        event_id=event_id, 
-        max_content_bytes=max_content_bytes
-    )
+    local_logger = local_logger.bind(event_id=event_id, max_content_bytes=max_content_bytes)
     local_logger.info("Getting FlowFile event details.")
 
     # Initialize results structure
@@ -1280,114 +1259,155 @@ async def get_flowfile_event_details( # Renamed function
         "status": "error",
         "message": "",
         "event_id": event_id,
-        "event_details": None,
-        "attributes": None,
-        "input_content_available": False,
-        "input_content_truncated": False,
-        "input_content_bytes": 0,
-        "input_content": None, # Store content as string (decoded or base64)
-        "output_content_available": False,
-        "output_content_truncated": False,
-        "output_content_bytes": 0,
-        "output_content": None # Store content as string (decoded or base64)
+        # Essential event info (filtered to avoid overwhelming LLM)
+        "event_type": None,
+        "event_time": None,
+        "component_name": None,
+        "flowfile_uuid": None,
+        "attributes": [],
+        # Content size info
+        "input_content_size_bytes": 0,
+        "output_content_size_bytes": 0,
+        "content_identical": False,
+        # Content data (only if reasonably sized)
+        "content_included": False,
+        "content_too_large": False,
+        "content": None,  # Will contain actual content if included
+        "content_type": None  # "input", "output", or "both" if different
     }
-    
-    # Helper function to process content stream
-    async def _process_content(direction: Literal["input", "output"]) -> None:
-        nonlocal results # Allow modifying the outer results dict
-        content_resp = None
-        try:
-            nifi_req_content = {"operation": "get_provenance_event_content", "event_id": event_id, "direction": direction}
-            local_logger.bind(interface="nifi", direction="request", data=nifi_req_content).debug(f"Calling NiFi API for {direction} content")
-            content_resp = await nifi_client.get_provenance_event_content(event_id, direction)
-            local_logger.bind(interface="nifi", direction="response", data={
-                "status_code": content_resp.status_code, 
-                "headers": dict(content_resp.headers)
-                }).debug(f"Received from NiFi API for {direction} content")
-            
-            results[f"{direction}_content_available"] = True
-            content_bytes_list = []
-            bytes_read = 0
-            async for chunk in content_resp.aiter_bytes():
-                if max_content_bytes != -1 and (bytes_read + len(chunk)) > max_content_bytes:
-                    chunk = chunk[:max_content_bytes - bytes_read]
-                    content_bytes_list.append(chunk)
-                    bytes_read += len(chunk)
-                    results[f"{direction}_content_truncated"] = True
-                    local_logger.warning(f"{direction.capitalize()} content truncated to {max_content_bytes} bytes.")
-                    break
-                content_bytes_list.append(chunk)
-                bytes_read += len(chunk)
-            
-            results[f"{direction}_content_bytes"] = bytes_read
-            full_content_bytes = b"".join(content_bytes_list)
-            
-            # Attempt to decode as UTF-8, fallback to base64
-            try:
-                results[f"{direction}_content"] = full_content_bytes.decode('utf-8')
-                local_logger.info(f"Successfully fetched and decoded {bytes_read} bytes of {direction} content.")
-            except UnicodeDecodeError:
-                import base64
-                results[f"{direction}_content"] = base64.b64encode(full_content_bytes).decode('ascii')
-                local_logger.warning(f"Fetched {bytes_read} bytes of {direction} content, but failed to decode as UTF-8. Returning as base64.")
-        
-        except ValueError as content_err:
-             # Specific error from get_provenance_event_content (e.g., 404)
-             local_logger.warning(f"Could not retrieve {direction} content for event {event_id}: {content_err}")
-             results[f"{direction}_content_available"] = False
-        except Exception as content_exc:
-             local_logger.error(f"Unexpected error retrieving {direction} content for event {event_id}: {content_exc}", exc_info=True)
-             results[f"{direction}_content_available"] = False
-             results["message"] += f" Unexpected error retrieving {direction} content." # Append error info
-        finally:
-             if content_resp:
-                 await content_resp.aclose()
-                 local_logger.debug(f"Closed {direction} content response stream.")
 
     try:
-        # --- Step 1: Get Event Details --- 
+        # Step 1: Get Event Details
         local_logger.info(f"Fetching details for provenance event {event_id}...")
-        nifi_req_event = {"operation": "get_provenance_event", "event_id": event_id}
-        local_logger.bind(interface="nifi", direction="request", data=nifi_req_event).debug("Calling NiFi API")
         event_details = await nifi_client.get_provenance_event(event_id)
-        local_logger.bind(interface="nifi", direction="response", data=event_details).debug("Received from NiFi API")
 
         if not event_details:
-             raise ValueError(f"No details returned for event {event_id}.")
+            raise ValueError(f"No details returned for event {event_id}.")
 
-        results["event_details"] = event_details # Store raw event details
-        # Attributes can be complex, decide how much to expose
-        # Using the flattened list structure like the UI might be good
-        results["attributes"] = event_details.get("attributes", []) 
-        local_logger.info(f"Found event {event_id} (Type: {event_details.get('eventType')}). Details retrieved.")
-
-        # --- Step 2: Get Input Content --- 
-        if event_details.get("inputContentAvailable"): # Check if claim exists
-            local_logger.info(f"Input content reported as available for event {event_id}. Attempting fetch...")
-            await _process_content("input")
-        else:
-             local_logger.info(f"Input content not available for event {event_id}.")
-             results["input_content_available"] = False
-
-        # --- Step 3: Get Output Content --- 
-        if event_details.get("outputContentAvailable"): # Check if claim exists
-            local_logger.info(f"Output content reported as available for event {event_id}. Attempting fetch...")
-            await _process_content("output")
-        else:
-             local_logger.info(f"Output content not available for event {event_id}.")
-             results["output_content_available"] = False
-
-        # --- Final Status --- 
-        if results["attributes"] is not None:
-            results["status"] = "success"
-            if results["input_content_available"] or results["output_content_available"]:
-                results["message"] = f"Successfully retrieved event details and available content for event {event_id}."
-            else:
-                 results["message"] = f"Successfully retrieved event details for event {event_id}. No content was available."
-        else:
-            # Should have errored earlier if event details failed, but good fallback
-            results["message"] = f"Failed to retrieve details for event {event_id}."
+        # Extract essential event information (filtered for LLM consumption)
+        results["event_type"] = event_details.get("eventType")
+        results["event_time"] = event_details.get("eventTime")  
+        results["component_name"] = event_details.get("componentName")
+        results["flowfile_uuid"] = event_details.get("flowFileUuid")
         
+        # Get attributes list (limit to avoid overwhelming LLM)
+        attributes = event_details.get("attributes", [])
+        if len(attributes) > 20:  # Limit to most important attributes
+            results["attributes"] = attributes[:20]
+            local_logger.warning(f"Event has {len(attributes)} attributes, truncated to 20 for LLM")
+        else:
+            results["attributes"] = attributes
+
+        # Get content size information
+        input_size = event_details.get("inputContentClaimFileSizeBytes", 0) or 0
+        output_size = event_details.get("outputContentClaimFileSizeBytes", 0) or 0
+        results["input_content_size_bytes"] = input_size
+        results["output_content_size_bytes"] = output_size
+
+        local_logger.info(f"Event {event_id}: input_size={input_size}, output_size={output_size}")
+
+        # Step 2: Determine content retrieval strategy
+        max_size = max(input_size, output_size)
+        
+        if max_size == 0:
+            # No content available
+            results["status"] = "success"
+            results["message"] = f"Event details retrieved. No content available for event {event_id}."
+            results["content_included"] = False
+            return results
+        
+        elif max_size > max_content_bytes:
+            # Content too large to include
+            results["status"] = "success"
+            results["message"] = f"Event details retrieved. Content available but too large ({max_size} bytes > {max_content_bytes} limit)."
+            results["content_too_large"] = True
+            results["content_included"] = False
+            return results
+
+        # Step 3: Retrieve content (both input and output to check for duplication)
+        input_content = None
+        output_content = None
+        
+        if input_size > 0:
+            try:
+                local_logger.info(f"Retrieving input content ({input_size} bytes)")
+                content_resp = await nifi_client.get_provenance_event_content(event_id, "input")
+                input_content = await content_resp.aread()
+                await content_resp.aclose()
+            except Exception as e:
+                local_logger.warning(f"Could not retrieve input content: {e}")
+
+        if output_size > 0:
+            try:
+                local_logger.info(f"Retrieving output content ({output_size} bytes)")
+                content_resp = await nifi_client.get_provenance_event_content(event_id, "output")
+                output_content = await content_resp.aread()
+                await content_resp.aclose()
+            except Exception as e:
+                local_logger.warning(f"Could not retrieve output content: {e}")
+
+        # Step 4: Check for identical content and prepare response
+        if input_content is not None and output_content is not None:
+            if input_content == output_content:
+                # Content is identical, only return one copy
+                results["content_identical"] = True
+                results["content_type"] = "both"
+                try:
+                    results["content"] = input_content.decode('utf-8')
+                except UnicodeDecodeError:
+                    import base64
+                    results["content"] = base64.b64encode(input_content).decode('ascii')
+                local_logger.info(f"Input and output content are identical ({len(input_content)} bytes)")
+            else:
+                # Content is different, return both
+                results["content_identical"] = False
+                results["content_type"] = "both"
+                try:
+                    input_str = input_content.decode('utf-8')
+                    output_str = output_content.decode('utf-8')
+                    results["content"] = {
+                        "input": input_str,
+                        "output": output_str
+                    }
+                except UnicodeDecodeError:
+                    import base64
+                    results["content"] = {
+                        "input": base64.b64encode(input_content).decode('ascii'),
+                        "output": base64.b64encode(output_content).decode('ascii')
+                    }
+                local_logger.info(f"Input and output content are different (input: {len(input_content)}, output: {len(output_content)} bytes)")
+        
+        elif input_content is not None:
+            # Only input content available
+            results["content_identical"] = False
+            results["content_type"] = "input"
+            try:
+                results["content"] = input_content.decode('utf-8')
+            except UnicodeDecodeError:
+                import base64
+                results["content"] = base64.b64encode(input_content).decode('ascii')
+            local_logger.info(f"Only input content available ({len(input_content)} bytes)")
+            
+        elif output_content is not None:
+            # Only output content available
+            results["content_identical"] = False
+            results["content_type"] = "output"
+            try:
+                results["content"] = output_content.decode('utf-8')
+            except UnicodeDecodeError:
+                import base64
+                results["content"] = base64.b64encode(output_content).decode('ascii')
+            local_logger.info(f"Only output content available ({len(output_content)} bytes)")
+
+        # Final status
+        if results["content"] is not None:
+            results["content_included"] = True
+            results["status"] = "success"
+            results["message"] = f"Successfully retrieved event details and content for event {event_id}."
+        else:
+            results["status"] = "success"
+            results["message"] = f"Successfully retrieved event details for event {event_id}. Content was not accessible."
+
         return results
 
     except (NiFiAuthenticationError, ConnectionError, ToolError, ValueError, TimeoutError) as e:
@@ -1400,4 +1420,3 @@ async def get_flowfile_event_details( # Renamed function
         results["status"] = "error"
         results["message"] = f"An unexpected error occurred: {e}"
         return results
-    # Removed finally block with query cleanup as query is no longer submitted here
