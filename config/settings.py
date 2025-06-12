@@ -25,7 +25,10 @@ DEFAULT_APP_CONFIG = {
     },
     'llm': {
         'google': {'api_key': None, 'models': ['gemini-1.5-pro-latest']},
-        'openai': {'api_key': None, 'models': ['gpt-4-turbo-preview']}
+        'openai': {'api_key': None, 'models': ['gpt-4-turbo-preview']},
+        'perplexity': {'api_key': None, 'models': ['sonar-pro']},
+        'anthropic': {'api_key': None, 'models': ['claude-sonnet-4-20250109']},
+        'expert_help_model': {'provider': None, 'model': None}
     },
     'mcp_features': {
         'auto_stop_enabled': True,
@@ -139,17 +142,54 @@ def get_interface_debug_enabled() -> bool:
 # Load API keys using nested gets for safety
 GOOGLE_API_KEY = _APP_CONFIG.get('llm', {}).get('google', {}).get('api_key')
 OPENAI_API_KEY = _APP_CONFIG.get('llm', {}).get('openai', {}).get('api_key')
+PERPLEXITY_API_KEY = _APP_CONFIG.get('llm', {}).get('perplexity', {}).get('api_key')
+ANTHROPIC_API_KEY = _APP_CONFIG.get('llm', {}).get('anthropic', {}).get('api_key')
 
 # Load model configurations with defaults from DEFAULT_APP_CONFIG if necessary
 OPENAI_MODELS = _APP_CONFIG.get('llm', {}).get('openai', {}).get('models', DEFAULT_APP_CONFIG['llm']['openai']['models'])
 GEMINI_MODELS = _APP_CONFIG.get('llm', {}).get('google', {}).get('models', DEFAULT_APP_CONFIG['llm']['google']['models'])
+PERPLEXITY_MODELS = _APP_CONFIG.get('llm', {}).get('perplexity', {}).get('models', DEFAULT_APP_CONFIG['llm']['perplexity']['models'])
+ANTHROPIC_MODELS = _APP_CONFIG.get('llm', {}).get('anthropic', {}).get('models', DEFAULT_APP_CONFIG['llm']['anthropic']['models'])
+
+# Expert Help Model Configuration
+EXPERT_HELP_PROVIDER = _APP_CONFIG.get('llm', {}).get('expert_help_model', {}).get('provider')
+EXPERT_HELP_MODEL = _APP_CONFIG.get('llm', {}).get('expert_help_model', {}).get('model')
+
+def get_expert_help_config() -> tuple[str | None, str | None]:
+    """Returns the expert help model configuration as (provider, model)."""
+    return EXPERT_HELP_PROVIDER, EXPERT_HELP_MODEL
+
+def is_expert_help_available() -> bool:
+    """Returns True if expert help is properly configured and the API key is available."""
+    provider, model = get_expert_help_config()
+    if not provider or not model:
+        return False
+    
+    # Check if API key is available for the specified provider
+    if provider == 'openai':
+        return OPENAI_API_KEY is not None
+    elif provider == 'google':
+        return GOOGLE_API_KEY is not None
+    elif provider == 'perplexity':
+        return PERPLEXITY_API_KEY is not None
+    elif provider == 'anthropic':
+        return ANTHROPIC_API_KEY is not None
+    else:
+        return False
 
 # Print loaded configuration (excluding sensitive values like full NiFi server details)
 print("\nLoaded application configuration:")
 print(f"OPENAI_MODELS: {OPENAI_MODELS}")
 print(f"GEMINI_MODELS: {GEMINI_MODELS}")
+print(f"PERPLEXITY_MODELS: {PERPLEXITY_MODELS}")
+print(f"ANTHROPIC_MODELS: {ANTHROPIC_MODELS}")
 print(f"GOOGLE_API_KEY configured: {'Yes' if GOOGLE_API_KEY else 'No'}")
 print(f"OPENAI_API_KEY configured: {'Yes' if OPENAI_API_KEY else 'No'}")
+print(f"PERPLEXITY_API_KEY configured: {'Yes' if PERPLEXITY_API_KEY else 'No'}")
+print(f"ANTHROPIC_API_KEY configured: {'Yes' if ANTHROPIC_API_KEY else 'No'}")
+expert_provider, expert_model = get_expert_help_config()
+print(f"Expert Help Model: {expert_provider}:{expert_model if expert_provider and expert_model else 'Not configured'}")
+print(f"Expert Help Available: {'Yes' if is_expert_help_available() else 'No'}")
 nifi_server_summary = [(s.get('id', 'N/A'), s.get('name', 'N/A')) for s in get_nifi_servers()]
 print(f"NiFi Servers configured: {len(nifi_server_summary)} {nifi_server_summary if nifi_server_summary else '(None)'}")
 print(f"Logging config loaded: {'Yes' if LOGGING_CONFIG != DEFAULT_LOGGING_CONFIG else 'No (Using Defaults)'}")

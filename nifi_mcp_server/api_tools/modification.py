@@ -30,6 +30,9 @@ async def update_nifi_processor_properties(
 ) -> Dict:
     """
     Updates a processor's configuration properties by *replacing* the existing property dictionary.
+    
+    Automatically stops running processors if Auto-Stop feature is enabled, then performs the update.
+    If Auto-Stop is disabled, running processors will cause an error.
 
     Example:
     ```python
@@ -89,10 +92,59 @@ async def update_nifi_processor_properties(
         precheck_resp = {"id": processor_id, "state": current_state, "version": current_revision.get('version') if current_revision else None}
         local_logger.bind(interface="nifi", direction="response", data=precheck_resp).debug("Received from NiFi API (pre-check)")
         
+        # --- AUTO-STOP LOGIC ---
         if current_state == "RUNNING":
-            error_msg = f"Processor '{component_precheck.get('name', processor_id)}' is RUNNING. Stop it before updating properties."
-            local_logger.warning(error_msg)
-            return {"status": "error", "message": error_msg, "entity": None}
+            local_logger.info(f"Processor '{component_precheck.get('name', processor_id)}' is RUNNING. Checking Auto-Stop feature.")
+            
+            # Get headers from request context
+            from config.logging_setup import request_context
+            context_data = request_context.get()
+            request_headers = context_data.get('headers', {}) if context_data else {}
+            
+            # Convert header keys to lowercase for case-insensitive comparison
+            if request_headers:
+                request_headers = {k.lower(): v for k, v in request_headers.items()}
+            
+            is_auto_stop_feature_enabled = mcp_settings.get_feature_auto_stop_enabled(headers=request_headers)
+            local_logger.info(f"[Auto-Stop] Feature flag check - headers: {request_headers}")
+            local_logger.info(f"[Auto-Stop] Feature enabled: {is_auto_stop_feature_enabled}")
+
+            if is_auto_stop_feature_enabled:
+                # Stop the processor first
+                local_logger.info(f"[Auto-Stop] Stopping processor {processor_id}")
+                try:
+                    nifi_request_data = {"operation": "stop_processor", "processor_id": processor_id}
+                    local_logger.bind(interface="nifi", direction="request", data=nifi_request_data).debug("Calling NiFi API")
+                    await nifi_client.stop_processor(processor_id)
+                    local_logger.bind(interface="nifi", direction="response", data={"status": "success"}).debug("Received from NiFi API")
+                    
+                    # Wait for processor to fully stop
+                    max_wait_seconds = 15
+                    for attempt in range(max_wait_seconds):
+                        updated_details = await nifi_client.get_processor_details(processor_id)
+                        current_state = updated_details.get("component", {}).get("state")
+                        if current_state == "STOPPED":
+                            local_logger.info(f"[Auto-Stop] Confirmed processor {processor_id} is stopped")
+                            # Update our references with the latest details
+                            current_entity = updated_details
+                            component_precheck = current_entity.get("component", {})
+                            current_revision = current_entity.get("revision")
+                            break
+                        
+                        if attempt == max_wait_seconds - 1:
+                            raise ToolError(f"Processor {processor_id} did not stop after {max_wait_seconds} seconds")
+                        
+                        local_logger.info(f"[Auto-Stop] Waiting for processor to stop (attempt {attempt + 1}/{max_wait_seconds})")
+                        await asyncio.sleep(1)
+
+                except Exception as e:
+                    local_logger.error(f"[Auto-Stop] Failed to stop processor: {e}", exc_info=True)
+                    local_logger.bind(interface="nifi", direction="response", data={"error": str(e)}).debug("Received error from NiFi API")
+                    return {"status": "error", "message": f"Failed to auto-stop processor for update: {e}", "entity": None}
+            else:
+                error_msg = f"Processor '{component_precheck.get('name', processor_id)}' is RUNNING. Stop it before updating properties or enable Auto-Stop."
+                local_logger.warning(error_msg)
+                return {"status": "error", "message": error_msg, "entity": None}
         
         if not current_revision:
              raise ToolError(f"Could not retrieve revision for processor {processor_id}.")
@@ -156,6 +208,9 @@ async def delete_nifi_processor_properties(
 ) -> Dict:
     """
     Deletes specific properties from a processor's configuration by setting their values to null.
+    
+    Automatically stops running processors if Auto-Stop feature is enabled, then performs the update.
+    If Auto-Stop is disabled, running processors will cause an error.
 
     Args:
         processor_id: The UUID of the processor to modify.
@@ -195,10 +250,59 @@ async def delete_nifi_processor_properties(
         current_properties = current_config.get("properties", {})
         current_state = current_component.get("state")
 
+        # --- AUTO-STOP LOGIC ---
         if current_state == "RUNNING":
-            error_msg = f"Processor '{current_component.get('name', processor_id)}' is RUNNING. Stop it before deleting properties."
-            local_logger.warning(error_msg)
-            return {"status": "error", "message": error_msg, "entity": None}
+            local_logger.info(f"Processor '{current_component.get('name', processor_id)}' is RUNNING. Checking Auto-Stop feature.")
+            
+            # Get headers from request context
+            from config.logging_setup import request_context
+            context_data = request_context.get()
+            request_headers = context_data.get('headers', {}) if context_data else {}
+            
+            # Convert header keys to lowercase for case-insensitive comparison
+            if request_headers:
+                request_headers = {k.lower(): v for k, v in request_headers.items()}
+            
+            is_auto_stop_feature_enabled = mcp_settings.get_feature_auto_stop_enabled(headers=request_headers)
+            local_logger.info(f"[Auto-Stop] Feature flag check - headers: {request_headers}")
+            local_logger.info(f"[Auto-Stop] Feature enabled: {is_auto_stop_feature_enabled}")
+
+            if is_auto_stop_feature_enabled:
+                # Stop the processor first
+                local_logger.info(f"[Auto-Stop] Stopping processor {processor_id}")
+                try:
+                    nifi_request_data = {"operation": "stop_processor", "processor_id": processor_id}
+                    local_logger.bind(interface="nifi", direction="request", data=nifi_request_data).debug("Calling NiFi API")
+                    await nifi_client.stop_processor(processor_id)
+                    local_logger.bind(interface="nifi", direction="response", data={"status": "success"}).debug("Received from NiFi API")
+                    
+                    # Wait for processor to fully stop
+                    max_wait_seconds = 15
+                    for attempt in range(max_wait_seconds):
+                        updated_details = await nifi_client.get_processor_details(processor_id)
+                        current_state = updated_details.get("component", {}).get("state")
+                        if current_state == "STOPPED":
+                            local_logger.info(f"[Auto-Stop] Confirmed processor {processor_id} is stopped")
+                            # Update our references with the latest details
+                            current_entity = updated_details
+                            current_component = current_entity.get("component", {})
+                            current_revision = current_entity.get("revision")
+                            break
+                        
+                        if attempt == max_wait_seconds - 1:
+                            raise ToolError(f"Processor {processor_id} did not stop after {max_wait_seconds} seconds")
+                        
+                        local_logger.info(f"[Auto-Stop] Waiting for processor to stop (attempt {attempt + 1}/{max_wait_seconds})")
+                        await asyncio.sleep(1)
+
+                except Exception as e:
+                    local_logger.error(f"[Auto-Stop] Failed to stop processor: {e}", exc_info=True)
+                    local_logger.bind(interface="nifi", direction="response", data={"error": str(e)}).debug("Received error from NiFi API")
+                    return {"status": "error", "message": f"Failed to auto-stop processor for update: {e}", "entity": None}
+            else:
+                error_msg = f"Processor '{current_component.get('name', processor_id)}' is RUNNING. Stop it before deleting properties or enable Auto-Stop."
+                local_logger.warning(error_msg)
+                return {"status": "error", "message": error_msg, "entity": None}
         
         if not current_revision:
              raise ToolError(f"Could not retrieve revision for processor {processor_id}.")
@@ -287,6 +391,9 @@ async def update_nifi_processor_relationships(
     """
     Updates the list of auto-terminated relationships for a processor.
     Replaces the entire existing list with the provided list.
+    
+    Automatically stops running processors if Auto-Stop feature is enabled, then performs the update.
+    If Auto-Stop is disabled, running processors will cause an error.
 
     Args:
         processor_id: The UUID of the processor to update.
@@ -322,10 +429,59 @@ async def update_nifi_processor_relationships(
         current_state = component_precheck.get("state")
         local_logger.bind(interface="nifi", direction="response", data=current_entity).debug("Received from NiFi API (pre-check)")
 
+        # --- AUTO-STOP LOGIC ---
         if current_state == "RUNNING":
-            error_msg = f"Processor '{component_precheck.get('name', processor_id)}' is RUNNING. Stop it before updating relationships."
-            local_logger.warning(error_msg)
-            return {"status": "error", "message": error_msg, "entity": None}
+            local_logger.info(f"Processor '{component_precheck.get('name', processor_id)}' is RUNNING. Checking Auto-Stop feature.")
+            
+            # Get headers from request context
+            from config.logging_setup import request_context
+            context_data = request_context.get()
+            request_headers = context_data.get('headers', {}) if context_data else {}
+            
+            # Convert header keys to lowercase for case-insensitive comparison
+            if request_headers:
+                request_headers = {k.lower(): v for k, v in request_headers.items()}
+            
+            is_auto_stop_feature_enabled = mcp_settings.get_feature_auto_stop_enabled(headers=request_headers)
+            local_logger.info(f"[Auto-Stop] Feature flag check - headers: {request_headers}")
+            local_logger.info(f"[Auto-Stop] Feature enabled: {is_auto_stop_feature_enabled}")
+
+            if is_auto_stop_feature_enabled:
+                # Stop the processor first
+                local_logger.info(f"[Auto-Stop] Stopping processor {processor_id}")
+                try:
+                    nifi_request_data = {"operation": "stop_processor", "processor_id": processor_id}
+                    local_logger.bind(interface="nifi", direction="request", data=nifi_request_data).debug("Calling NiFi API")
+                    await nifi_client.stop_processor(processor_id)
+                    local_logger.bind(interface="nifi", direction="response", data={"status": "success"}).debug("Received from NiFi API")
+                    
+                    # Wait for processor to fully stop
+                    max_wait_seconds = 15
+                    for attempt in range(max_wait_seconds):
+                        updated_details = await nifi_client.get_processor_details(processor_id)
+                        current_state = updated_details.get("component", {}).get("state")
+                        if current_state == "STOPPED":
+                            local_logger.info(f"[Auto-Stop] Confirmed processor {processor_id} is stopped")
+                            # Update our references with the latest details
+                            current_entity = updated_details
+                            component_precheck = current_entity.get("component", {})
+                            current_revision = current_entity.get("revision")
+                            break
+                        
+                        if attempt == max_wait_seconds - 1:
+                            raise ToolError(f"Processor {processor_id} did not stop after {max_wait_seconds} seconds")
+                        
+                        local_logger.info(f"[Auto-Stop] Waiting for processor to stop (attempt {attempt + 1}/{max_wait_seconds})")
+                        await asyncio.sleep(1)
+
+                except Exception as e:
+                    local_logger.error(f"[Auto-Stop] Failed to stop processor: {e}", exc_info=True)
+                    local_logger.bind(interface="nifi", direction="response", data={"error": str(e)}).debug("Received error from NiFi API")
+                    return {"status": "error", "message": f"Failed to auto-stop processor for update: {e}", "entity": None}
+            else:
+                error_msg = f"Processor '{component_precheck.get('name', processor_id)}' is RUNNING. Stop it before updating relationships or enable Auto-Stop."
+                local_logger.warning(error_msg)
+                return {"status": "error", "message": error_msg, "entity": None}
             
         nifi_update_req = {
             "operation": "update_processor_config",

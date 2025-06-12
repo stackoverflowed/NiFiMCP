@@ -48,11 +48,19 @@ except ImportError:
 # ---------------------
 
 # Restore imports
-from chat_manager import get_gemini_response, get_openai_response, get_formatted_tool_definitions, calculate_input_tokens
+from chat_manager import get_llm_response, get_formatted_tool_definitions, calculate_input_tokens
 from chat_manager import configure_llms, is_initialized
 from mcp_handler import get_available_tools, execute_mcp_tool, get_nifi_servers
 # Import config from the new location
 try:
+    # Add parent directory to Python path so we can import config
+    import sys
+    import os
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    parent_dir = os.path.dirname(current_dir)
+    if parent_dir not in sys.path:
+        sys.path.insert(0, parent_dir)
+    
     from config import settings as config # Updated import
 except ImportError:
     logger.error("Failed to import config.settings. Ensure config/__init__.py exists if needed, or check PYTHONPATH.")
@@ -117,18 +125,19 @@ with st.sidebar:
     st.title("Settings")
     
     # --- Model Selection (Combined) --- 
-    available_models = []
-    model_to_provider = {}
-    
-    if config.GOOGLE_API_KEY and config.GEMINI_MODELS:
-        for model in config.GEMINI_MODELS:
-            available_models.append(f"Gemini: {model}")
-            model_to_provider[f"Gemini: {model}"] = ("Gemini", model)
-            
+    available_models = {}
     if config.OPENAI_API_KEY and config.OPENAI_MODELS:
         for model in config.OPENAI_MODELS:
-            available_models.append(f"OpenAI: {model}")
-            model_to_provider[f"OpenAI: {model}"] = ("OpenAI", model)
+            available_models[f"OpenAI: {model}"] = ("openai", model)
+    if config.GOOGLE_API_KEY and config.GEMINI_MODELS:
+        for model in config.GEMINI_MODELS:
+            available_models[f"Google: {model}"] = ("gemini", model)
+    if config.PERPLEXITY_API_KEY and config.PERPLEXITY_MODELS:
+        for model in config.PERPLEXITY_MODELS:
+            available_models[f"Perplexity: {model}"] = ("perplexity", model)
+    if config.ANTHROPIC_API_KEY and config.ANTHROPIC_MODELS:
+        for model in config.ANTHROPIC_MODELS:
+            available_models[f"Anthropic: {model}"] = ("anthropic", model)
     
     selected_model_display_name = None
     provider = None # Will be derived from selection
@@ -141,7 +150,7 @@ with st.sidebar:
         # Prioritize Gemini if available, otherwise first OpenAI, else first in list
         default_selection = None
         if config.GOOGLE_API_KEY and config.GEMINI_MODELS:
-            default_selection = f"Gemini: {config.GEMINI_MODELS[0]}"
+            default_selection = f"Google: {config.GEMINI_MODELS[0]}"
         elif config.OPENAI_API_KEY and config.OPENAI_MODELS:
              default_selection = f"OpenAI: {config.OPENAI_MODELS[0]}"
         
@@ -149,17 +158,17 @@ with st.sidebar:
         if default_selection not in available_models:
             default_selection = available_models[0] # Fallback to first item
         
-        default_index = available_models.index(default_selection)
+        default_index = list(available_models.keys()).index(default_selection)
         
         selected_model_display_name = st.selectbox(
             "Select LLM Model:", 
-            available_models, 
+            list(available_models.keys()), 
             index=default_index,
             key="model_select" # Use a key to track selection
         )
         
         if selected_model_display_name:
-            provider, model_name = model_to_provider[selected_model_display_name]
+            provider, model_name = available_models[selected_model_display_name]
             logger.debug(f"Selected Model: {model_name}, Provider: {provider}")
             
             # Check if provider changed and reconfigure if needed
@@ -511,24 +520,14 @@ def run_execution_loop(provider: str, model_name: str, base_sys_prompt: str, use
         with st.spinner(f"Thinking... (Step {loop_count}) / Tokens: ~{current_tokens if 'current_tokens' in locals() else 'N/A'}"):
             try:
                 current_loop_logger.info(f"Calling LLM ({provider} - {model_name})...")
-                if provider == "Gemini":
-                    response_data = get_gemini_response(messages=llm_context_messages, 
-                                                        system_prompt=effective_system_prompt,
-                                                        tools=formatted_tools, 
-                                                        model_name=model_name, 
-                                                        user_request_id=user_req_id, 
-                                                        action_id=llm_action_id)
-                elif provider == "OpenAI":
-                    response_data = get_openai_response(messages=llm_context_messages, 
-                                                        system_prompt=effective_system_prompt, 
-                                                        tools=formatted_tools, 
-                                                        model_name=model_name, 
-                                                        user_request_id=user_req_id,
-                                                        action_id=llm_action_id)
-                else:
-                    st.error("Invalid provider selected.")
-                    current_loop_logger.error(f"Invalid provider selected: {provider}")
-                    break
+                response_data = get_llm_response(
+                    messages=llm_context_messages, 
+                    system_prompt=effective_system_prompt,
+                    tools=formatted_tools,
+                    provider=provider,
+                    model_name=model_name,
+                    user_request_id=user_req_id
+                )
                 if response_data is None:
                      st.error("LLM response was empty.")
                      current_loop_logger.error("LLM response data was None.")
