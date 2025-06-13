@@ -23,9 +23,8 @@ from mcp.server.fastmcp.exceptions import ToolError
 
 # --- Tool Definitions --- 
 
-@mcp.tool()
-@tool_phases(["Modify"])
-async def create_nifi_processor(
+# --- Private helpers for single-object creation ---
+async def _create_nifi_processor_single(
     processor_type: str,
     name: str,
     position_x: int,
@@ -38,7 +37,13 @@ async def create_nifi_processor(
 
     Example Call:
     ```tool_code
-    print(default_api.create_nifi_processor(processor_type='org.apache.nifi.processors.standard.LogAttribute', name='Log Test Attribute', position_x=200, position_y=300, properties={'Log Level': 'info', 'Attributes to Log': 'uuid, filename'}))
+    print(default_api.create_nifi_processors(processors=[{
+        'processor_type': 'org.apache.nifi.processors.standard.LogAttribute', 
+        'name': 'Log Test Attribute', 
+        'position_x': 200, 
+        'position_y': 300, 
+        'properties': {'Log Level': 'info', 'Attributes to Log': 'uuid, filename'}
+    }]))
     ```
 
     Args:
@@ -138,10 +143,7 @@ async def create_nifi_processor(
         local_logger.bind(interface="nifi", direction="response", data={"error": str(e)}).debug("Received error from NiFi API")
         return {"status": "error", "message": f"An unexpected error occurred during processor creation: {e}", "entity": None}
 
-
-@mcp.tool()
-@tool_phases(["Modify"])
-async def create_nifi_connection(
+async def _create_nifi_connection_single(
     source_id: str,
     relationships: List[str],
     target_id: str,
@@ -329,10 +331,7 @@ async def create_nifi_connection(
         local_logger.bind(interface="nifi", direction="response", data={"error": str(e)}).debug("Received error from NiFi API")
         return {"status": "error", "message": f"An unexpected error occurred during connection creation: {e}", "entity": None}
 
-
-@mcp.tool()
-@tool_phases(["Modify"])
-async def create_nifi_port(
+async def _create_nifi_port_single(
     port_type: Literal["input", "output"],
     name: str,
     position_x: int,
@@ -421,6 +420,83 @@ async def create_nifi_port(
         local_logger.bind(interface="nifi", direction="response", data={"error": str(e)}).debug("Received error from NiFi API")
         return {"status": "error", "message": f"An unexpected error occurred during {port_type} port creation: {e}", "entity": None}
 
+# --- Plural batch tools ---
+
+@mcp.tool()
+@tool_phases(["Modify"])
+async def create_nifi_processors(
+    processors: List[Dict[str, Any]]
+) -> List[Dict]:
+    """
+    Creates one or more NiFi processors in batch. Each input dict should contain:
+      - processor_type
+      - name
+      - position_x
+      - position_y
+      - process_group_id (optional)
+      - properties (optional)
+    Returns a list of result dicts, one per input.
+    """
+    results = []
+    for proc in processors:
+        result = await _create_nifi_processor_single(
+            processor_type=proc.get("processor_type"),
+            name=proc.get("name"),
+            position_x=proc.get("position_x"),
+            position_y=proc.get("position_y"),
+            process_group_id=proc.get("process_group_id"),
+            properties=proc.get("properties")
+        )
+        results.append(result)
+    return results
+
+@mcp.tool()
+@tool_phases(["Modify"])
+async def create_nifi_connections(
+    connections: List[Dict[str, Any]]
+) -> List[Dict]:
+    """
+    Creates one or more NiFi connections in batch. Each input dict should contain:
+      - source_id
+      - relationships
+      - target_id
+    Returns a list of result dicts, one per input.
+    """
+    results = []
+    for conn in connections:
+        result = await _create_nifi_connection_single(
+            source_id=conn.get("source_id"),
+            relationships=conn.get("relationships"),
+            target_id=conn.get("target_id")
+        )
+        results.append(result)
+    return results
+
+@mcp.tool()
+@tool_phases(["Modify"])
+async def create_nifi_ports(
+    ports: List[Dict[str, Any]]
+) -> List[Dict]:
+    """
+    Creates one or more NiFi ports in batch. Each input dict should contain:
+      - port_type ("input" or "output")
+      - name
+      - position_x
+      - position_y
+      - process_group_id (optional)
+    Returns a list of result dicts, one per input.
+    """
+    results = []
+    for port in ports:
+        result = await _create_nifi_port_single(
+            port_type=port.get("port_type"),
+            name=port.get("name"),
+            position_x=port.get("position_x"),
+            position_y=port.get("position_y"),
+            process_group_id=port.get("process_group_id")
+        )
+        results.append(result)
+    return results
 
 @mcp.tool()
 @tool_phases(["Modify"])
@@ -630,7 +706,7 @@ async def create_nifi_flow(
 
                 local_logger.info(f"Attempting to create processor: Name='{proc_name}', Type='{proc_type}'")
                 # Call create_nifi_processor tool logic
-                proc_creation_result = await create_nifi_processor(
+                proc_creation_result = await _create_nifi_processor_single(
                     processor_type=proc_type,
                     name=proc_name,
                     position_x=pos_x,
@@ -682,7 +758,7 @@ async def create_nifi_flow(
 
                 local_logger.info(f"Attempting to create connection: From='{source_name}' ({source_nifi_id}) To='{target_name}' ({target_nifi_id}) Rel='{relationships}'")
                 # Call create_nifi_connection tool logic
-                conn_creation_result = await create_nifi_connection(
+                conn_creation_result = await _create_nifi_connection_single(
                     source_id=source_nifi_id,
                     target_id=target_nifi_id,
                     relationships=relationships

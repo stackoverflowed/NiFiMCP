@@ -35,8 +35,8 @@ async def test_create_and_verify_connection(
     conn_result_list = await call_tool(
         client=async_client,
         base_url=base_url,
-        tool_name="create_nifi_connection",
-        arguments=connect_args,
+        tool_name="create_nifi_connections",
+        arguments={"connections": [connect_args]},
         headers=mcp_headers,
         custom_logger=global_logger
     )
@@ -94,8 +94,8 @@ async def test_delete_connection(
     conn_result_list = await call_tool(
         client=async_client,
         base_url=base_url,
-        tool_name="create_nifi_connection",
-        arguments=connect_args,
+        tool_name="create_nifi_connections",
+        arguments={"connections": [connect_args]},
         headers=mcp_headers,
         custom_logger=global_logger
     )
@@ -184,8 +184,8 @@ async def test_auto_purge_connection_with_queued_data(
     conn_result_list = await call_tool(
         client=async_client,
         base_url=base_url,
-        tool_name="create_nifi_connection",
-        arguments=connect_args,
+        tool_name="create_nifi_connections",
+        arguments={"connections": [connect_args]},
         headers=mcp_headers,
         custom_logger=global_logger
     )
@@ -289,8 +289,8 @@ async def test_auto_purge_connection_with_queued_data(
     new_conn_result_list = await call_tool(
         client=async_client,
         base_url=base_url,
-        tool_name="create_nifi_connection",
-        arguments=connect_args,
+        tool_name="create_nifi_connections",
+        arguments={"connections": [connect_args]},
         headers=mcp_headers,
         custom_logger=global_logger
     )
@@ -395,8 +395,8 @@ async def test_purge_single_connection(
     conn_result_list = await call_tool(
         client=async_client,
         base_url=base_url,
-        tool_name="create_nifi_connection",
-        arguments=connect_args,
+        tool_name="create_nifi_connections",
+        arguments={"connections": [connect_args]},
         headers=mcp_headers,
         custom_logger=global_logger
     )
@@ -517,8 +517,8 @@ async def test_purge_process_group(
         proc_result_list = await call_tool(
             client=async_client,
             base_url=base_url,
-            tool_name="create_nifi_processor",
-            arguments=create_proc_args,
+            tool_name="create_nifi_processors",
+            arguments={"processors": [create_proc_args]},
             headers=mcp_headers,
             custom_logger=global_logger
         )
@@ -580,8 +580,8 @@ async def test_purge_process_group(
         conn_result_list = await call_tool(
             client=async_client,
             base_url=base_url,
-            tool_name="create_nifi_connection",
-            arguments=connect_args,
+            tool_name="create_nifi_connections",
+            arguments={"connections": [connect_args]},
             headers=mcp_headers,
             custom_logger=global_logger
         )

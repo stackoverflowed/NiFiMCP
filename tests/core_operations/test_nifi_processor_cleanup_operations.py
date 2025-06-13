@@ -123,8 +123,8 @@ async def test_auto_stop_delete_running_processor(
     create_result_list = await call_tool(
         client=async_client,
         base_url=base_url,
-        tool_name="create_nifi_processor",
-        arguments=create_args,
+        tool_name="create_nifi_processors",
+        arguments={"processors": [create_args]},
         headers=mcp_headers,
         custom_logger=global_logger
     )
@@ -189,8 +189,8 @@ async def test_auto_delete_processor_with_connections(
     conn_result_list = await call_tool(
         client=async_client,
         base_url=base_url,
-        tool_name="create_nifi_connection",
-        arguments=connect_args,
+        tool_name="create_nifi_connections",
+        arguments={"connections": [connect_args]},
         headers=mcp_headers,
         custom_logger=global_logger
     )

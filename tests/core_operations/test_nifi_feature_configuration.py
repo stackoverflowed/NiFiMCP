@@ -44,8 +44,8 @@ async def test_auto_stop_feature(
         create_result_list = await call_tool(
             client=async_client,
             base_url=base_url,
-            tool_name="create_nifi_processor",
-            arguments=processor_args,
+            tool_name="create_nifi_processors",
+            arguments={"processors": [processor_args]},
             headers=mcp_headers,
             custom_logger=global_logger
         )
@@ -130,8 +130,8 @@ async def test_auto_stop_feature(
         create_result_list = await call_tool(
             client=async_client,
             base_url=base_url,
-            tool_name="create_nifi_processor",
-            arguments=processor_args,
+            tool_name="create_nifi_processors",
+            arguments={"processors": [processor_args]},
             headers=mcp_headers,
             custom_logger=global_logger
         )
@@ -273,8 +273,8 @@ async def test_auto_delete_feature(
         create_result_list = await call_tool(
             client=async_client,
             base_url=base_url,
-            tool_name="create_nifi_processor",
-            arguments=processor_args,
+            tool_name="create_nifi_processors",
+            arguments={"processors": [processor_args]},
             headers=mcp_headers,
             custom_logger=global_logger
         )
@@ -310,8 +310,8 @@ async def test_auto_delete_feature(
         dest_create_result = await call_tool(
             client=async_client,
             base_url=base_url,
-            tool_name="create_nifi_processor",
-            arguments=dest_processor_args,
+            tool_name="create_nifi_processors",
+            arguments={"processors": [dest_processor_args]},
             headers=mcp_headers,
             custom_logger=global_logger
         )
@@ -345,8 +345,8 @@ async def test_auto_delete_feature(
         conn_result = await call_tool(
             client=async_client,
             base_url=base_url,
-            tool_name="create_nifi_connection",
-            arguments=connect_args,
+            tool_name="create_nifi_connections",
+            arguments={"connections": [connect_args]},
             headers=mcp_headers,
             custom_logger=global_logger
         )
@@ -450,8 +450,8 @@ async def test_auto_delete_feature(
         disabled_create_result = await call_tool(
             client=async_client,
             base_url=base_url,
-            tool_name="create_nifi_processor",
-            arguments=disabled_processor_args,
+            tool_name="create_nifi_processors",
+            arguments={"processors": [disabled_processor_args]},
             headers=mcp_headers,
             custom_logger=global_logger
         )
@@ -487,8 +487,8 @@ async def test_auto_delete_feature(
         disabled_dest_result = await call_tool(
             client=async_client,
             base_url=base_url,
-            tool_name="create_nifi_processor",
-            arguments=disabled_dest_args,
+            tool_name="create_nifi_processors",
+            arguments={"processors": [disabled_dest_args]},
             headers=mcp_headers,
             custom_logger=global_logger
         )
@@ -522,8 +522,8 @@ async def test_auto_delete_feature(
         disabled_conn_result = await call_tool(
             client=async_client,
             base_url=base_url,
-            tool_name="create_nifi_connection",
-            arguments=disabled_connect_args,
+            tool_name="create_nifi_connections",
+            arguments={"connections": [disabled_connect_args]},
             headers=mcp_headers,
             custom_logger=global_logger
         )
@@ -664,8 +664,8 @@ async def test_feature_configuration_defaults(
         create_result_list = await call_tool(
             client=async_client,
             base_url=base_url,
-            tool_name="create_nifi_processor",
-            arguments=processor_args,
+            tool_name="create_nifi_processors",
+            arguments={"processors": [processor_args]},
             headers=mcp_headers,
             custom_logger=global_logger
         )

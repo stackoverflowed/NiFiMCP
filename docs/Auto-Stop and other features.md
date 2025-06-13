@@ -99,7 +99,7 @@ The core of these features will reside in the MCP server's logic that handles Ni
 ### 2.3. Affected MCP Server Components
 
 *   **NiFi API Client Service:** This service within the MCP server will house the core logic for error parsing, remediation, and retries.
-*   **Tool Implementations:** Existing tools like `delete_nifi_object`, `update_nifi_processor_properties`, `create_nifi_connection` (if it can be updated to replace an existing one) might need to be modified to use the enhanced API client service.
+*   **Tool Implementations:** Existing tools like `delete_nifi_object`, `update_nifi_processor_properties`, `create_nifi_connections` (if it can be updated to replace an existing one) might need to be modified to use the enhanced API client service.
 *   **Configuration Management:** Handled by `config.yaml` and `config/settings.py`, with HTTP header overrides.
 *   **New Centralized Error Handler Module:** A new module (e.g., `nifi_mcp_server/core/nifi_error_handler.py`) will be created for the retry and remediation logic.
 

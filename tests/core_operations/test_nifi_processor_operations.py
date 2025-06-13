@@ -164,8 +164,8 @@ async def test_update_processor_properties_and_verify(
         "relationships": ["success"]  # Changed from relationships_to_connect
     }
     connection_result_list = await call_tool(
-        client=async_client, base_url=base_url, tool_name="create_nifi_connection",
-        arguments=create_connection_args, headers=mcp_headers, custom_logger=global_logger
+        client=async_client, base_url=base_url, tool_name="create_nifi_connections",
+        arguments={"connections": [create_connection_args]}, headers=mcp_headers, custom_logger=global_logger
     )
     assert isinstance(connection_result_list, list) and connection_result_list and isinstance(connection_result_list[0], dict), \
         "Unexpected response format for create_nifi_connection"
