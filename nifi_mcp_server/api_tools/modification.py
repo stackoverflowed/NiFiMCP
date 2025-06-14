@@ -394,6 +394,11 @@ async def update_nifi_processor_relationships(
     
     Automatically stops running processors if Auto-Stop feature is enabled, then performs the update.
     If Auto-Stop is disabled, running processors will cause an error.
+    
+    Intelligently handles connections that would become invalid:
+    - If Auto-Delete feature is enabled, automatically deletes connections using relationships being auto-terminated
+    - If Auto-Delete is disabled, warns about connections that will become invalid
+    - Validates post-update to ensure no invalid connections remain
 
     Args:
         processor_id: The UUID of the processor to update.
@@ -402,6 +407,7 @@ async def update_nifi_processor_relationships(
 
     Returns:
         A dictionary representing the updated processor entity or an error status.
+        Status may be "warning" if connections remain invalid after the update.
     """
     # Get client and logger from context
     nifi_client: Optional[NiFiClient] = current_nifi_client.get()
@@ -429,18 +435,18 @@ async def update_nifi_processor_relationships(
         current_state = component_precheck.get("state")
         local_logger.bind(interface="nifi", direction="response", data=current_entity).debug("Received from NiFi API (pre-check)")
 
+        # Get headers from request context for feature flags
+        from config.logging_setup import request_context
+        context_data = request_context.get()
+        request_headers = context_data.get('headers', {}) if context_data else {}
+        
+        # Convert header keys to lowercase for case-insensitive comparison
+        if request_headers:
+            request_headers = {k.lower(): v for k, v in request_headers.items()}
+
         # --- AUTO-STOP LOGIC ---
         if current_state == "RUNNING":
             local_logger.info(f"Processor '{component_precheck.get('name', processor_id)}' is RUNNING. Checking Auto-Stop feature.")
-            
-            # Get headers from request context
-            from config.logging_setup import request_context
-            context_data = request_context.get()
-            request_headers = context_data.get('headers', {}) if context_data else {}
-            
-            # Convert header keys to lowercase for case-insensitive comparison
-            if request_headers:
-                request_headers = {k.lower(): v for k, v in request_headers.items()}
             
             is_auto_stop_feature_enabled = mcp_settings.get_feature_auto_stop_enabled(headers=request_headers)
             local_logger.info(f"[Auto-Stop] Feature flag check - headers: {request_headers}")
@@ -482,6 +488,105 @@ async def update_nifi_processor_relationships(
                 error_msg = f"Processor '{component_precheck.get('name', processor_id)}' is RUNNING. Stop it before updating relationships or enable Auto-Stop."
                 local_logger.warning(error_msg)
                 return {"status": "error", "message": error_msg, "entity": None}
+
+        # --- AUTO-DELETE CONNECTIONS LOGIC ---
+        # Check if any relationships being auto-terminated have existing connections that would become invalid
+        if auto_terminated_relationships:
+            local_logger.info(f"Checking for connections using relationships that will be auto-terminated: {auto_terminated_relationships}")
+            
+            # Get the processor's parent process group to list connections
+            parent_pg_id = component_precheck.get("parentGroupId")
+            if not parent_pg_id:
+                local_logger.error(f"Could not determine parent process group for processor {processor_id}")
+                return {"status": "error", "message": f"Failed to determine parent process group for processor {processor_id}", "entity": None}
+            
+            try:
+                # List all connections in the parent process group
+                connections_list = await nifi_client.list_connections(parent_pg_id)
+                
+                # Find connections that originate from this processor and use relationships being auto-terminated
+                connections_to_delete = []
+                for connection_data in connections_list:
+                    if not isinstance(connection_data, dict):
+                        continue
+                    
+                    component = connection_data.get('component', {})
+                    source = component.get('source', {})
+                    selected_relationships = component.get('selectedRelationships', [])
+                    
+                    # Check if this connection originates from our processor
+                    if source.get('id') == processor_id:
+                        # Check if any of the selected relationships will be auto-terminated
+                        conflicting_relationships = [rel for rel in selected_relationships if rel in auto_terminated_relationships]
+                        if conflicting_relationships:
+                            connection_id = connection_data.get('id')
+                            if not connection_id:
+                                connection_id = component.get('id')
+                            
+                            if connection_id:
+                                connection_name = component.get('name', connection_id)
+                                destination = component.get('destination', {})
+                                dest_name = destination.get('name', destination.get('id', 'unknown'))
+                                
+                                connections_to_delete.append({
+                                    'id': connection_id,
+                                    'name': connection_name,
+                                    'conflicting_relationships': conflicting_relationships,
+                                    'destination_name': dest_name
+                                })
+                                
+                                local_logger.info(f"Found connection '{connection_name}' ({connection_id}) to '{dest_name}' using relationships {conflicting_relationships} that will be auto-terminated")
+                
+                # Check if Auto-Delete feature is enabled for handling these connections
+                if connections_to_delete:
+                    is_auto_delete_feature_enabled = mcp_settings.get_feature_auto_delete_enabled(headers=request_headers)
+                    local_logger.info(f"[Auto-Delete] Found {len(connections_to_delete)} connections that would become invalid")
+                    local_logger.info(f"[Auto-Delete] Feature enabled: {is_auto_delete_feature_enabled}")
+                    
+                    if is_auto_delete_feature_enabled:
+                        # Delete the conflicting connections
+                        local_logger.info(f"[Auto-Delete] Automatically deleting {len(connections_to_delete)} connections that would become invalid")
+                        
+                        connection_ids = [conn['id'] for conn in connections_to_delete]
+                        try:
+                            batch_results = await nifi_client.delete_connections_batch(connection_ids)
+                            
+                            # Check for any failures
+                            failures = []
+                            successes = []
+                            for conn_id, result in batch_results.items():
+                                conn_info = next((c for c in connections_to_delete if c['id'] == conn_id), {'name': conn_id})
+                                if result.get("success"):
+                                    successes.append(conn_info['name'])
+                                    local_logger.info(f"[Auto-Delete] Successfully deleted connection '{conn_info['name']}' ({conn_id})")
+                                else:
+                                    error_msg = result.get('message', 'Unknown error')
+                                    failures.append(f"{conn_info['name']}: {error_msg}")
+                                    local_logger.error(f"[Auto-Delete] Failed to delete connection '{conn_info['name']}' ({conn_id}): {error_msg}")
+                            
+                            if failures:
+                                error_message = f"Auto-Delete encountered {len(failures)} errors: {', '.join(failures)}"
+                                local_logger.warning(f"[Auto-Delete] {error_message}")
+                                return {"status": "error", "message": error_message, "entity": None}
+                            
+                            local_logger.info(f"[Auto-Delete] Successfully deleted {len(successes)} connections: {', '.join(successes)}")
+                            
+                        except Exception as conn_delete_error:
+                            error_msg = f"Error in batch connection deletion: {conn_delete_error}"
+                            local_logger.error(f"[Auto-Delete] {error_msg}")
+                            return {"status": "error", "message": error_msg, "entity": None}
+                    else:
+                        # Auto-Delete is disabled, warn about the potential validation issues
+                        connection_names = [f"'{conn['name']}' (using {conn['conflicting_relationships']})" for conn in connections_to_delete]
+                        warning_msg = f"Warning: {len(connections_to_delete)} connections will become invalid after auto-terminating relationships: {', '.join(connection_names)}. Enable Auto-Delete to automatically remove them."
+                        local_logger.warning(f"[Auto-Delete] Feature disabled. {warning_msg}")
+                        # Continue with the relationship update but include warning in response
+                else:
+                    local_logger.info("No existing connections found that would conflict with the auto-terminated relationships")
+                    
+            except Exception as e:
+                local_logger.error(f"Error checking for conflicting connections: {str(e)}")
+                return {"status": "error", "message": f"Error checking for conflicting connections: {str(e)}", "entity": None}
             
         nifi_update_req = {
             "operation": "update_processor_config",
@@ -500,9 +605,48 @@ async def update_nifi_processor_relationships(
 
         local_logger.info(f"Successfully updated auto-terminated relationships for processor {processor_id}")
         name = updated_entity.get("component", {}).get("name", processor_id)
+        
+        # Check if we have any warnings about connections that would become invalid
+        success_message = f"Processor '{name}' auto-terminated relationships updated successfully."
+        
+        # Add information about deleted connections if any
+        if auto_terminated_relationships:
+            try:
+                # Re-check for any remaining invalid connections to warn about
+                parent_pg_id = component_precheck.get("parentGroupId")
+                if parent_pg_id:
+                    connections_list = await nifi_client.list_connections(parent_pg_id)
+                    remaining_invalid_connections = []
+                    
+                    for connection_data in connections_list:
+                        if not isinstance(connection_data, dict):
+                            continue
+                        
+                        component = connection_data.get('component', {})
+                        source = component.get('source', {})
+                        selected_relationships = component.get('selectedRelationships', [])
+                        
+                        if source.get('id') == processor_id:
+                            conflicting_relationships = [rel for rel in selected_relationships if rel in auto_terminated_relationships]
+                            if conflicting_relationships:
+                                connection_name = component.get('name', component.get('id', 'unknown'))
+                                remaining_invalid_connections.append(f"'{connection_name}' (using {conflicting_relationships})")
+                    
+                    if remaining_invalid_connections:
+                        warning_msg = f" Warning: {len(remaining_invalid_connections)} connections may now be invalid: {', '.join(remaining_invalid_connections)}."
+                        success_message += warning_msg
+                        local_logger.warning(f"Post-update validation warning: {warning_msg}")
+                        return {
+                            "status": "warning",
+                            "message": success_message,
+                            "entity": filtered_updated_entity
+                        }
+            except Exception as e:
+                local_logger.warning(f"Could not verify connection status after relationship update: {e}")
+        
         return {
             "status": "success",
-            "message": f"Processor '{name}' auto-terminated relationships updated successfully.",
+            "message": success_message,
             "entity": filtered_updated_entity
         }
 
@@ -621,23 +765,38 @@ async def update_nifi_connection(
 @mcp.tool()
 @tool_phases(["Modify"])
 @handle_nifi_errors
-async def delete_nifi_object(
-    object_type: Literal["processor", "connection", "port", "process_group"],
-    object_id: str,
-    **kwargs # To potentially catch headers if passed by MCP
-) -> Dict:
+async def delete_nifi_objects(
+    deletion_requests: List[Dict[str, Any]]
+) -> List[Dict]:
     """
-    Deletes a specific NiFi object (processor, connection, port, or process group).
+    Deletes multiple NiFi objects (processors, connections, ports, or process groups) in batch.
     Attempts Auto-Stop for running processors if enabled.
     Attempts Auto-Delete for processors with connections if enabled.
+    Attempts Auto-Purge for connections with queued data if enabled.
 
     Args:
-        object_type: The type of the object to delete ('processor', 'connection', 'port', 'process_group').
-        object_id: The UUID of the object to delete.
-        **kwargs: May contain 'request_headers' for feature flag overrides.
+        deletion_requests: A list of deletion request dictionaries, each containing:
+            - object_type: The type of the object to delete ('processor', 'connection', 'port', 'process_group')
+            - object_id: The UUID of the object to delete
+            - name (optional): A descriptive name for the object (used in logging/results)
+
+    Example:
+    ```python
+    [
+        {
+            "object_type": "processor",
+            "object_id": "123e4567-e89b-12d3-a456-426614174000",
+            "name": "MyProcessor"
+        },
+        {
+            "object_type": "connection", 
+            "object_id": "456e7890-e89b-12d3-a456-426614174001"
+        }
+    ]
+    ```
 
     Returns:
-        A dictionary indicating success or failure.
+        A list of dictionaries, each indicating success or failure for the corresponding deletion request.
     """
     nifi_client: Optional[NiFiClient] = current_nifi_client.get()
     local_logger = current_request_logger.get() or logger
@@ -646,12 +805,88 @@ async def delete_nifi_object(
     if not local_logger:
          raise ToolError("Request logger context is not set.")
     
-    local_logger = local_logger.bind(object_id=object_id, object_type=object_type)
-    local_logger.info(f"Executing delete_nifi_object for {object_type} ID: {object_id}")
+    if not deletion_requests:
+        raise ToolError("The 'deletion_requests' list cannot be empty.")
+    if not isinstance(deletion_requests, list):
+        raise ToolError("Invalid 'deletion_requests' type. Expected a list of dictionaries.")
+    
+    # Validate each deletion request
+    for i, req in enumerate(deletion_requests):
+        if not isinstance(req, dict):
+            raise ToolError(f"Deletion request {i} is not a dictionary.")
+        if "object_type" not in req or "object_id" not in req:
+            raise ToolError(f"Deletion request {i} missing required fields 'object_type' and/or 'object_id'.")
+        if req["object_type"] not in ["processor", "connection", "port", "process_group"]:
+            raise ToolError(f"Deletion request {i} has invalid object_type '{req['object_type']}'. Must be one of: processor, connection, port, process_group.")
+
+    local_logger.info(f"Executing delete_nifi_objects for {len(deletion_requests)} objects")
+    
+    results = []
+    
+    for i, deletion_request in enumerate(deletion_requests):
+        object_type = deletion_request["object_type"]
+        object_id = deletion_request["object_id"]
+        object_name = deletion_request.get("name", object_id)
+        
+        request_logger = local_logger.bind(object_id=object_id, object_type=object_type, request_index=i)
+        request_logger.info(f"Processing deletion request {i+1}/{len(deletion_requests)} for {object_type} '{object_name}' ({object_id})")
+        
+        try:
+            # Call the original deletion logic for a single object
+            result = await _delete_single_nifi_object(
+                object_type=object_type,
+                object_id=object_id,
+                object_name=object_name,
+                nifi_client=nifi_client,
+                logger=request_logger
+            )
+            
+            # Add metadata to the result
+            result["object_type"] = object_type
+            result["object_id"] = object_id
+            result["object_name"] = object_name
+            result["request_index"] = i
+            
+            results.append(result)
+            
+        except Exception as e:
+            error_result = {
+                "status": "error",
+                "message": f"Unexpected error deleting {object_type} '{object_name}' ({object_id}): {e}",
+                "object_type": object_type,
+                "object_id": object_id,
+                "object_name": object_name,
+                "request_index": i
+            }
+            results.append(error_result)
+            request_logger.error(f"Unexpected error in deletion request {i}: {e}", exc_info=True)
+    
+    # Summary logging
+    successful_deletions = [r for r in results if r.get("status") == "success"]
+    failed_deletions = [r for r in results if r.get("status") == "error"]
+    warning_deletions = [r for r in results if r.get("status") == "warning"]
+    
+    local_logger.info(f"Batch deletion completed: {len(successful_deletions)} successful, {len(failed_deletions)} failed, {len(warning_deletions)} warnings")
+    
+    return results
+
+
+async def _delete_single_nifi_object(
+    object_type: str,
+    object_id: str,
+    object_name: str,
+    nifi_client: NiFiClient,
+    logger
+) -> Dict:
+    """
+    Internal function to delete a single NiFi object.
+    Contains the core deletion logic extracted from the original delete_nifi_object function.
+    """
+    logger.info(f"Executing deletion for {object_type} '{object_name}' ({object_id})")
 
     try:
         # 1. Get current details using get_nifi_object_details
-        local_logger.info(f"Fetching details for {object_type} {object_id}")
+        logger.info(f"Fetching details for {object_type} {object_id}")
         current_entity = await get_nifi_object_details(object_type=object_type, object_id=object_id)
         if not current_entity:
             raise ToolError(f"Could not retrieve details for {object_type} {object_id}")
@@ -674,7 +909,7 @@ async def delete_nifi_object(
 
         component = current_entity.get("component", {})
         state = component.get("state")
-        name = component.get("name", object_id)
+        name = component.get("name", object_name)
 
         # --- AUTO-DELETE PRE-EMPTIVE LOGIC ---
         if original_object_type == "processor":
@@ -688,8 +923,8 @@ async def delete_nifi_object(
                 request_headers = {k.lower(): v for k, v in request_headers.items()}
             
             is_auto_delete_feature_enabled = mcp_settings.get_feature_auto_delete_enabled(headers=request_headers)
-            local_logger.info(f"[Auto-Delete] Feature flag check - headers: {request_headers}")
-            local_logger.info(f"[Auto-Delete] Feature enabled: {is_auto_delete_feature_enabled}")
+            logger.info(f"[Auto-Delete] Feature flag check - headers: {request_headers}")
+            logger.info(f"[Auto-Delete] Feature enabled: {is_auto_delete_feature_enabled}")
             
             # Auto-Stop should have already run by this point and verified processor stopped
             # Now check for connections
@@ -699,11 +934,11 @@ async def delete_nifi_object(
             parent_pg_id = processor_component.get("parentGroupId")
             
             if not parent_pg_id:
-                local_logger.error(f"[Auto-Delete] Could not determine parent process group for processor {processor_name} ({object_id})")
-                return {"status": "error", "message": f"Failed to determine parent process group for processor {processor_name}", "entity": None}
+                logger.error(f"[Auto-Delete] Could not determine parent process group for processor {processor_name} ({object_id})")
+                return {"status": "error", "message": f"Failed to determine parent process group for processor {processor_name}"}
             
             # Check if the processor is part of any connections
-            local_logger.info(f"[Auto-Delete] Checking for connections to processor {processor_name} ({object_id}) in process group {parent_pg_id}")
+            logger.info(f"[Auto-Delete] Checking for connections to processor {processor_name} ({object_id}) in process group {parent_pg_id}")
             try:
                 connections_list = await nifi_client.list_connections(parent_pg_id)
                 
@@ -724,22 +959,22 @@ async def delete_nifi_object(
                             connection_id = component.get('id')
                         if connection_id:
                             connection_ids.append(connection_id)
-                            local_logger.info(f"[Auto-Delete] Found connection: {connection_id} with source={source.get('id')} and destination={destination.get('id')}")
+                            logger.info(f"[Auto-Delete] Found connection: {connection_id} with source={source.get('id')} and destination={destination.get('id')}")
                 
                 if connections:
-                    local_logger.info(f"[Auto-Delete] Found {len(connections)} connections for processor {processor_name}")
+                    logger.info(f"[Auto-Delete] Found {len(connections)} connections for processor {processor_name}")
                     
                     if not is_auto_delete_feature_enabled:
                         # Auto-Delete is disabled, we should fail the deletion
-                        local_logger.warning(f"[Auto-Delete] Feature disabled. Cannot delete processor with connections.")
-                        return {"status": "error", "message": f"Processor {processor_name} has {len(connections)} connections. Auto-Delete is disabled. Please delete connections first or enable Auto-Delete.", "entity": None}
+                        logger.warning(f"[Auto-Delete] Feature disabled. Cannot delete processor with connections.")
+                        return {"status": "error", "message": f"Processor {processor_name} has {len(connections)} connections. Auto-Delete is disabled. Please delete connections first or enable Auto-Delete."}
                     
                     # Auto-Delete is enabled, delete the connections first
-                    local_logger.info(f"[Auto-Delete] Feature enabled. Automatically deleting {len(connections)} connections.")
+                    logger.info(f"[Auto-Delete] Feature enabled. Automatically deleting {len(connections)} connections.")
                     
                     # Use the batch delete method to delete all connections at once
                     if connection_ids:
-                        local_logger.info(f"[Auto-Delete] Attempting batch deletion of {len(connection_ids)} connections: {connection_ids}")
+                        logger.info(f"[Auto-Delete] Attempting batch deletion of {len(connection_ids)} connections: {connection_ids}")
                         try:
                             # Make sure we have a valid client
                             if not nifi_client._client:
@@ -761,23 +996,23 @@ async def delete_nifi_object(
                                         proc_state = proc_details.get('component', {}).get('state', '')
                                         if proc_state == 'RUNNING':
                                             processors_to_stop.add(source_id)
-                                            local_logger.info(f"[Auto-Delete] Found running source processor {source_id} that needs to be stopped")
+                                            logger.info(f"[Auto-Delete] Found running source processor {source_id} that needs to be stopped")
                                     except Exception as e:
-                                        local_logger.warning(f"[Auto-Delete] Could not check processor {source_id} state: {e}")
+                                        logger.warning(f"[Auto-Delete] Could not check processor {source_id} state: {e}")
                             
                             # Stop any running processors
                             for proc_id in processors_to_stop:
                                 try:
-                                    local_logger.info(f"[Auto-Delete] Stopping processor {proc_id} to allow connection deletion")
+                                    logger.info(f"[Auto-Delete] Stopping processor {proc_id} to allow connection deletion")
                                     await nifi_client.stop_processor(proc_id)
                                     # Wait a moment for the processor to fully stop
                                     await asyncio.sleep(1)
                                 except Exception as e:
-                                    local_logger.warning(f"[Auto-Delete] Failed to stop processor {proc_id}: {e}")
+                                    logger.warning(f"[Auto-Delete] Failed to stop processor {proc_id}: {e}")
 
                             # Verify processors are fully stopped before proceeding with connection deletion
                             if processors_to_stop:
-                                local_logger.info(f"[Auto-Delete] Verifying {len(processors_to_stop)} processors are fully stopped")
+                                logger.info(f"[Auto-Delete] Verifying {len(processors_to_stop)} processors are fully stopped")
                                 max_wait_seconds = 5
                                 for attempt in range(max_wait_seconds):
                                     all_stopped = True
@@ -786,24 +1021,24 @@ async def delete_nifi_object(
                                             proc_details = await nifi_client.get_processor_details(proc_id)
                                             proc_state = proc_details.get('component', {}).get('state')
                                             if proc_state != 'STOPPED':
-                                                local_logger.info(f"[Auto-Delete] Processor {proc_id} still in state {proc_state} on attempt {attempt+1}")
+                                                logger.info(f"[Auto-Delete] Processor {proc_id} still in state {proc_state} on attempt {attempt+1}")
                                                 all_stopped = False
                                                 break
                                         except Exception as e:
-                                            local_logger.warning(f"[Auto-Delete] Error checking processor state: {e}")
+                                            logger.warning(f"[Auto-Delete] Error checking processor state: {e}")
                                             all_stopped = False
                                             break
                                     
                                     if all_stopped:
-                                        local_logger.info(f"[Auto-Delete] All source processors verified as stopped")
+                                        logger.info(f"[Auto-Delete] All source processors verified as stopped")
                                         break
                                     
                                     if attempt < max_wait_seconds - 1:  # Don't sleep on last iteration
-                                        local_logger.info(f"[Auto-Delete] Waiting for processors to stop (attempt {attempt+1}/{max_wait_seconds})")
+                                        logger.info(f"[Auto-Delete] Waiting for processors to stop (attempt {attempt+1}/{max_wait_seconds})")
                                         await asyncio.sleep(1)
                                 
                                 if not all_stopped:
-                                    local_logger.warning(f"[Auto-Delete] Some processors may not be fully stopped yet. Proceeding with caution.")
+                                    logger.warning(f"[Auto-Delete] Some processors may not be fully stopped yet. Proceeding with caution.")
                             
                             # Now try to delete the connections
                             auto_delete_errors = []  # Initialize the errors collection
@@ -812,21 +1047,21 @@ async def delete_nifi_object(
                             # Debug output
                             for conn_id, result in batch_results.items():
                                 if result.get("success"):
-                                    local_logger.info(f"[Auto-Delete] Successfully deleted connection {conn_id}")
+                                    logger.info(f"[Auto-Delete] Successfully deleted connection {conn_id}")
                                 else:
                                     error_msg = result.get('message', 'Unknown error')
                                     # Check if this is an expected error (processor still running)
                                     if "running" in error_msg.lower() or "active" in error_msg.lower():
-                                        local_logger.warning(f"[Auto-Delete] Could not delete connection {conn_id}: {error_msg}")
+                                        logger.warning(f"[Auto-Delete] Could not delete connection {conn_id}: {error_msg}")
                                     else:
-                                        local_logger.error(f"[Auto-Delete] Failed to delete connection {conn_id}: {error_msg}")
+                                        logger.error(f"[Auto-Delete] Failed to delete connection {conn_id}: {error_msg}")
                                     auto_delete_errors.append(f"{conn_id}: {error_msg}")
                                     if result.get("error"):
                                         # Log the actual error at debug level to reduce console noise
-                                        local_logger.debug(f"[Auto-Delete] Error details: {str(result.get('error'))}")
+                                        logger.debug(f"[Auto-Delete] Error details: {str(result.get('error'))}")
                         except Exception as conn_delete_error:
                             error_msg = f"Error in batch deletion: {conn_delete_error}"
-                            local_logger.error(f"[Auto-Delete] {error_msg}")
+                            logger.error(f"[Auto-Delete] {error_msg}")
                             auto_delete_errors.append(error_msg)
                         
                         # Check for any failures
@@ -838,15 +1073,15 @@ async def delete_nifi_object(
                         if failures:
                             error_message = f"Auto-Delete encountered {len(failures)} errors: {', '.join(failures)}"
                             # Log as warning if we're proceeding with processor deletion anyway
-                            local_logger.warning(f"[Auto-Delete] {error_message}")
-                            return {"status": "error", "message": error_message, "entity": None}
+                            logger.warning(f"[Auto-Delete] {error_message}")
+                            return {"status": "error", "message": error_message}
                         
-                        local_logger.info(f"[Auto-Delete] Successfully deleted {len(connection_ids)} connections in batch.")
+                        logger.info(f"[Auto-Delete] Successfully deleted {len(connection_ids)} connections in batch.")
                 else:
-                    local_logger.info(f"[Auto-Delete] No connections found for processor {processor_name}")
+                    logger.info(f"[Auto-Delete] No connections found for processor {processor_name}")
             except Exception as e:
-                local_logger.error(f"[Auto-Delete] Error checking for connections: {str(e)}")
-                return {"status": "error", "message": f"Error checking for connections: {str(e)}", "entity": None}
+                logger.error(f"[Auto-Delete] Error checking for connections: {str(e)}")
+                return {"status": "error", "message": f"Error checking for connections: {str(e)}"}
 
         # --- AUTO-PURGE PRE-EMPTIVE LOGIC ---
         if object_type == "connection":
@@ -860,8 +1095,8 @@ async def delete_nifi_object(
                 request_headers = {k.lower(): v for k, v in request_headers.items()}
             
             is_auto_purge_feature_enabled = mcp_settings.get_feature_auto_purge_enabled(headers=request_headers)
-            local_logger.info(f"[Auto-Purge] Feature flag check - headers: {request_headers}")
-            local_logger.info(f"[Auto-Purge] Feature enabled: {is_auto_purge_feature_enabled}")
+            logger.info(f"[Auto-Purge] Feature flag check - headers: {request_headers}")
+            logger.info(f"[Auto-Purge] Feature enabled: {is_auto_purge_feature_enabled}")
 
             # Check if connection has queued data
             connection_status = current_entity.get("status", {}).get("aggregateSnapshot", {})
@@ -870,7 +1105,7 @@ async def delete_nifi_object(
             if queued_count > 0:
                 if is_auto_purge_feature_enabled:
                     # Attempt to purge the queue
-                    local_logger.info(f"[Auto-Purge] Connection has {queued_count} queued items. Attempting to purge.")
+                    logger.info(f"[Auto-Purge] Connection has {queued_count} queued items. Attempting to purge.")
                     try:
                         # Create a drop request
                         drop_request = await nifi_client.create_drop_request(object_id)
@@ -880,18 +1115,18 @@ async def delete_nifi_object(
                         
                         # Wait for the drop request to complete
                         await nifi_client.handle_drop_request(object_id, timeout_seconds=30)
-                        local_logger.info(f"[Auto-Purge] Successfully purged queue for connection {object_id}")
+                        logger.info(f"[Auto-Purge] Successfully purged queue for connection {object_id}")
                     except Exception as e:
-                        local_logger.error(f"[Auto-Purge] Failed to purge connection queue: {e}", exc_info=True)
+                        logger.error(f"[Auto-Purge] Failed to purge connection queue: {e}", exc_info=True)
                         raise ToolError(f"Failed to auto-purge connection queue: {e}")
                 else:
                     error_msg = f"Cannot delete connection {object_id} with {queued_count} queued items when Auto-Purge is disabled"
-                    local_logger.warning(error_msg)
+                    logger.warning(error_msg)
                     return {"status": "error", "message": error_msg}
 
         # --- AUTO-STOP PRE-EMPTIVE LOGIC --- 
         if original_object_type == "processor" and state == "RUNNING":
-            local_logger.info(f"Processor '{name}' is RUNNING. Checking Auto-Stop feature.")
+            logger.info(f"Processor '{name}' is RUNNING. Checking Auto-Stop feature.")
             
             # Get headers from request context
             from config.logging_setup import request_context
@@ -903,12 +1138,12 @@ async def delete_nifi_object(
                 request_headers = {k.lower(): v for k, v in request_headers.items()}
             
             is_auto_stop_feature_enabled = mcp_settings.get_feature_auto_stop_enabled(headers=request_headers)
-            local_logger.info(f"[Auto-Stop] Feature flag check - headers: {request_headers}")
-            local_logger.info(f"[Auto-Stop] Feature enabled: {is_auto_stop_feature_enabled}")
+            logger.info(f"[Auto-Stop] Feature flag check - headers: {request_headers}")
+            logger.info(f"[Auto-Stop] Feature enabled: {is_auto_stop_feature_enabled}")
 
             if is_auto_stop_feature_enabled:
                 # Stop the component first
-                local_logger.info(f"[Auto-Stop] Stopping {original_object_type} {object_id}")
+                logger.info(f"[Auto-Stop] Stopping {original_object_type} {object_id}")
                 try:
                     async def verify_stopped(obj_type: str, obj_id: str, max_wait_seconds: int = 15) -> bool:
                         """Verify that a component (processor or process group) has stopped."""
@@ -917,7 +1152,7 @@ async def delete_nifi_object(
                                 details = await nifi_client.get_processor_details(obj_id)
                                 current_state = details.get("component", {}).get("state")
                                 if current_state == "STOPPED":
-                                    local_logger.info(f"[Auto-Stop] Confirmed processor {obj_id} is stopped")
+                                    logger.info(f"[Auto-Stop] Confirmed processor {obj_id} is stopped")
                                     return True, details  # Return both status and details
                             elif obj_type == "process_group":
                                 # For PGs, we need to check all processors within
@@ -934,22 +1169,22 @@ async def delete_nifi_object(
                                             all_stopped = False
                                             break
                                 if all_stopped:
-                                    local_logger.info(f"[Auto-Stop] Confirmed all processors in PG {obj_id} are stopped")
+                                    logger.info(f"[Auto-Stop] Confirmed all processors in PG {obj_id} are stopped")
                                     return True, None  # No specific details for PG
                             
                             if attempt == max_wait_seconds - 1:
-                                local_logger.warning(f"[Auto-Stop] Maximum wait time reached without confirming stopped state for {obj_type} {obj_id}")
+                                logger.warning(f"[Auto-Stop] Maximum wait time reached without confirming stopped state for {obj_type} {obj_id}")
                                 return False, None
                             
-                            local_logger.info(f"[Auto-Stop] Waiting for {obj_type} to stop (attempt {attempt + 1}/{max_wait_seconds})")
+                            logger.info(f"[Auto-Stop] Waiting for {obj_type} to stop (attempt {attempt + 1}/{max_wait_seconds})")
                             await asyncio.sleep(1)
                         return False, None
 
                     if original_object_type == "processor":
                         nifi_request_data = {"operation": "stop_processor", "processor_id": object_id}
-                        local_logger.bind(interface="nifi", direction="request", data=nifi_request_data).debug("Calling NiFi API")
+                        logger.bind(interface="nifi", direction="request", data=nifi_request_data).debug("Calling NiFi API")
                         await nifi_client.stop_processor(object_id)
-                        local_logger.bind(interface="nifi", direction="response", data={"status": "success"}).debug("Received from NiFi API")
+                        logger.bind(interface="nifi", direction="response", data={"status": "success"}).debug("Received from NiFi API")
                         
                         is_stopped, updated_details = await verify_stopped("processor", object_id)
                         if not is_stopped:
@@ -958,23 +1193,23 @@ async def delete_nifi_object(
                         if updated_details:
                             state = updated_details.get("component", {}).get("state")
                             component = updated_details.get("component", {})
-                            name = component.get("name", object_id)
+                            name = component.get("name", object_name)
                             current_revision_dict = updated_details.get("revision")
                             current_version = current_revision_dict.get("version") if current_revision_dict else None
                             
                     elif original_object_type == "process_group":
                         nifi_request_data = {"operation": "stop_process_group", "process_group_id": object_id}
-                        local_logger.bind(interface="nifi", direction="request", data=nifi_request_data).debug("Calling NiFi API")
+                        logger.bind(interface="nifi", direction="request", data=nifi_request_data).debug("Calling NiFi API")
                         await nifi_client.stop_process_group(object_id)
-                        local_logger.bind(interface="nifi", direction="response", data={"status": "success"}).debug("Received from NiFi API")
+                        logger.bind(interface="nifi", direction="response", data={"status": "success"}).debug("Received from NiFi API")
                         
                         is_stopped, _ = await verify_stopped("process_group", object_id)
                         if not is_stopped:
                             raise ToolError(f"Process Group {object_id} did not fully stop after 15 seconds")
 
                 except Exception as e:
-                    local_logger.error(f"[Auto-Stop] Failed to stop {original_object_type}: {e}", exc_info=True)
-                    local_logger.bind(interface="nifi", direction="response", data={"error": str(e)}).debug("Received error from NiFi API")
+                    logger.error(f"[Auto-Stop] Failed to stop {original_object_type}: {e}", exc_info=True)
+                    logger.bind(interface="nifi", direction="response", data={"error": str(e)}).debug("Received error from NiFi API")
                     raise ToolError(f"Failed to auto-stop {original_object_type}: {e}")
             else:
                 raise ToolError(f"Cannot delete running {original_object_type} {object_id} when Auto-Stop is disabled")
@@ -982,13 +1217,13 @@ async def delete_nifi_object(
         # Final check on state before attempting deletion
         if object_type != "connection" and state == "RUNNING":
              error_msg = f"{object_type.capitalize()} '{name}' ({object_id}) is still RUNNING. It must be stopped before deletion. Auto-Stop may have failed or not fully stopped the component."
-             local_logger.warning(error_msg)
+             logger.warning(error_msg)
              return {"status": "error", "message": error_msg} 
 
         # 2. Attempt deletion using the obtained version
         delete_op = f"delete_{object_type}" # Use potentially refined object_type for ports
         nifi_delete_req = {"operation": delete_op, "id": object_id, "version": current_version}
-        local_logger.bind(interface="nifi", direction="request", data=nifi_delete_req).debug("Calling NiFi API (delete)")
+        logger.bind(interface="nifi", direction="request", data=nifi_delete_req).debug("Calling NiFi API (delete)")
         
         deleted = False
         try:
@@ -1005,27 +1240,27 @@ async def delete_nifi_object(
         except ValueError as e:
             if "not empty" in str(e).lower():
                 error_msg = f"Cannot delete {object_type} '{name}' ({object_id}) because it is not empty."
-                local_logger.warning(error_msg)
+                logger.warning(error_msg)
                 return {"status": "error", "message": error_msg}
             elif "has data" in str(e).lower() or "active queue" in str(e).lower():
                 error_msg = f"Cannot delete {object_type} '{name}' ({object_id}) because it has queued data."
-                local_logger.warning(error_msg)
+                logger.warning(error_msg)
                 return {"status": "error", "message": error_msg}
             else:
                 raise  # Re-raise other ValueError types
 
         if deleted:
             success_msg = f"Successfully deleted {object_type} '{name}' ({object_id})"
-            local_logger.info(success_msg)
+            logger.info(success_msg)
             return {"status": "success", "message": success_msg}
         else:
             error_msg = f"Failed to delete {object_type} '{name}' ({object_id}). NiFi API returned false."
-            local_logger.warning(error_msg)
+            logger.warning(error_msg)
             return {"status": "error", "message": error_msg}
 
     except ValueError as e:
-        local_logger.warning(f"Error deleting {object_type} {object_id} (ValueError caught in main try-except): {e}")
-        local_logger.bind(interface="nifi", direction="response", data={"error": str(e)}).debug("Received error from NiFi API (delete)")
+        logger.warning(f"Error deleting {object_type} {object_id} (ValueError caught in main try-except): {e}")
+        logger.bind(interface="nifi", direction="response", data={"error": str(e)}).debug("Received error from NiFi API (delete)")
         
         error_message = str(e)
         error_message_lower = error_message.lower()
@@ -1038,10 +1273,10 @@ async def delete_nifi_object(
             return {"status": "error", "message": f"Error deleting {object_type} '{name}' ({object_id}): {e}"}
             
     except (NiFiAuthenticationError, ConnectionError, ToolError) as e:
-        local_logger.error(f"API/Tool error deleting {object_type} {object_id}: {e}", exc_info=False)
-        local_logger.bind(interface="nifi", direction="response", data={"error": str(e)}).debug("Received error from NiFi API (delete)")
+        logger.error(f"API/Tool error deleting {object_type} {object_id}: {e}", exc_info=False)
+        logger.bind(interface="nifi", direction="response", data={"error": str(e)}).debug("Received error from NiFi API (delete)")
         return {"status": "error", "message": f"Failed to delete {object_type} {object_id}: {e}"}
     except Exception as e:
-        local_logger.error(f"Unexpected error deleting {object_type} {object_id}: {e}", exc_info=True)
-        local_logger.bind(interface="nifi", direction="response", data={"error": str(e)}).debug("Received error from NiFi API (delete)")
+        logger.error(f"Unexpected error deleting {object_type} {object_id}: {e}", exc_info=True)
+        logger.bind(interface="nifi", direction="response", data={"error": str(e)}).debug("Received error from NiFi API (delete)")
         return {"status": "error", "message": f"An unexpected error occurred during deletion: {e}"}

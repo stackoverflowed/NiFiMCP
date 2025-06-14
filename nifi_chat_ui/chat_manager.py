@@ -1475,7 +1475,6 @@ def get_perplexity_response(
                     user_friendly_message = body['message']
                 elif isinstance(body, str):
                     try:
-                        import json
                         body_dict = json.loads(body)
                         if 'error' in body_dict and isinstance(body_dict['error'], dict):
                             user_friendly_message = body_dict['error'].get('message', user_friendly_message)
@@ -1491,7 +1490,6 @@ def get_perplexity_response(
                 error_details = f"{str(e)} - Response: {response_content[:500]}"
                 # Try to parse response for better error message
                 try:
-                    import json
                     response_json = json.loads(response_content)
                     if isinstance(response_json, dict) and 'error' in response_json:
                         error_info = response_json['error']

@@ -55,7 +55,8 @@ async def _create_nifi_processor_single(
         properties: A dictionary containing the processor's configuration properties. Provide the properties directly as key-value pairs. Do NOT include the 'properties' key itself within this dictionary, as it will be added automatically by the underlying client. Example: {'Replacement Strategy': 'Always Replace', 'Replacement Value': 'Hello'}.
 
     Returns:
-        A dictionary reporting the success, warning, or error status of the operation, potentially including the created processor entity details.
+        A dictionary reporting the success, warning, or error status of the operation, including the created processor entity details.
+        The entity includes properties and relationships as configured at creation time (before any connections are added).
     """
     # Get client and logger from context
     nifi_client: Optional[NiFiClient] = current_nifi_client.get()
@@ -614,6 +615,8 @@ async def create_nifi_flow(
 
     Returns:
         A list of results, one for each object creation attempt (success or error).
+        Processor entities include properties and relationships as configured at creation time.
+        Note: Relationship states may change after connections are created in the same flow.
     """
     # Get client and logger from context
     nifi_client: Optional[NiFiClient] = current_nifi_client.get()

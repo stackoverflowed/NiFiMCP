@@ -107,14 +107,16 @@ async def test_auto_stop_feature(
         # Test with Auto-Stop enabled
         headers_enabled = {**mcp_headers, "X-Mcp-Auto-Stop-Enabled": "true"}
         delete_args = {
-            "object_type": "processor",
-            "object_id": test_proc_id,
-            "kwargs": {}
+            "deletion_requests": [{
+                "object_type": "processor",
+                "object_id": test_proc_id,
+                "name": "mcp-test-generate-auto-stop-enabled"
+            }]
         }
         delete_result_list = await call_tool(
             client=async_client,
             base_url=base_url,
-            tool_name="delete_nifi_object",
+            tool_name="delete_nifi_objects",
             arguments=delete_args,
             headers=headers_enabled,
             custom_logger=global_logger
@@ -182,11 +184,17 @@ async def test_auto_stop_feature(
 
         # Test with Auto-Stop disabled
         headers_disabled = {**mcp_headers, "X-Mcp-Auto-Stop-Enabled": "false"}
-        delete_args["object_id"] = test_proc_id
+        delete_args = {
+            "deletion_requests": [{
+                "object_type": "processor",
+                "object_id": test_proc_id,
+                "name": "mcp-test-generate-auto-stop-disabled"
+            }]
+        }
         delete_result_list = await call_tool(
             client=async_client,
             base_url=base_url,
-            tool_name="delete_nifi_object",
+            tool_name="delete_nifi_objects",
             arguments=delete_args,
             headers=headers_disabled,
             custom_logger=global_logger
@@ -217,14 +225,16 @@ async def test_auto_stop_feature(
 
             # Then delete the process group
             delete_pg_args = {
-                "object_type": "process_group",
-                "object_id": pg_id,
-                "kwargs": {}
+                "deletion_requests": [{
+                    "object_type": "process_group",
+                    "object_id": pg_id,
+                    "name": "mcp-test-pg-auto-stop"
+                }]
             }
             await call_tool(
                 client=async_client,
                 base_url=base_url,
-                tool_name="delete_nifi_object",
+                tool_name="delete_nifi_objects",
                 arguments=delete_pg_args,
                 headers=mcp_headers,
                 custom_logger=global_logger
@@ -400,14 +410,16 @@ async def test_auto_delete_feature(
         # Test deletion with Auto-Delete enabled
         headers_enabled = {**mcp_headers, "X-Mcp-Auto-Delete-Enabled": "true"}
         delete_args = {
-            "object_type": "processor",
-            "object_id": source_proc_id,
-            "kwargs": {}
+            "deletion_requests": [{
+                "object_type": "processor",
+                "object_id": source_proc_id,
+                "name": "mcp-test-generate-auto-delete-enabled"
+            }]
         }
         delete_result_list = await call_tool(
             client=async_client,
             base_url=base_url,
-            tool_name="delete_nifi_object",
+            tool_name="delete_nifi_objects",
             arguments=delete_args,
             headers=headers_enabled,
             custom_logger=global_logger
@@ -556,14 +568,16 @@ async def test_auto_delete_feature(
         # Test deletion with Auto-Delete disabled
         headers_disabled = {**mcp_headers, "X-Mcp-Auto-Delete-Enabled": "false"}
         delete_args = {
-            "object_type": "processor",
-            "object_id": disabled_source_id,
-            "kwargs": {}
+            "deletion_requests": [{
+                "object_type": "processor",
+                "object_id": disabled_source_id,
+                "name": "mcp-test-generate-auto-delete-disabled"
+            }]
         }
         delete_result_list = await call_tool(
             client=async_client,
             base_url=base_url,
-            tool_name="delete_nifi_object",
+            tool_name="delete_nifi_objects",
             arguments=delete_args,
             headers=headers_disabled,
             custom_logger=global_logger
@@ -597,14 +611,16 @@ async def test_auto_delete_feature(
 
                 # Then delete the process group
                 delete_pg_args = {
-                    "object_type": "process_group",
-                    "object_id": cur_pg_id,
-                    "kwargs": {}
+                    "deletion_requests": [{
+                        "object_type": "process_group",
+                        "object_id": cur_pg_id,
+                        "name": f"mcp-test-pg-auto-delete-{cur_pg_id}"
+                    }]
                 }
                 await call_tool(
                     client=async_client,
                     base_url=base_url,
-                    tool_name="delete_nifi_object",
+                    tool_name="delete_nifi_objects",
                     arguments=delete_pg_args,
                     headers=mcp_headers,
                     custom_logger=global_logger
@@ -726,14 +742,16 @@ async def test_feature_configuration_defaults(
 
         # Test without any feature headers (should use config defaults)
         delete_args = {
-            "object_type": "processor",
-            "object_id": test_proc_id,
-            "kwargs": {}
+            "deletion_requests": [{
+                "object_type": "processor",
+                "object_id": test_proc_id,
+                "name": "mcp-test-generate-defaults"
+            }]
         }
         delete_result_list = await call_tool(
             client=async_client,
             base_url=base_url,
-            tool_name="delete_nifi_object",
+            tool_name="delete_nifi_objects",
             arguments=delete_args,
             headers=mcp_headers,
             custom_logger=global_logger
@@ -767,18 +785,283 @@ async def test_feature_configuration_defaults(
 
             # Then delete the process group
             delete_pg_args = {
-                "object_type": "process_group",
-                "object_id": pg_id,
-                "kwargs": {}
+                "deletion_requests": [{
+                    "object_type": "process_group",
+                    "object_id": pg_id,
+                    "name": "mcp-test-pg-defaults"
+                }]
             }
             await call_tool(
                 client=async_client,
                 base_url=base_url,
-                tool_name="delete_nifi_object",
+                tool_name="delete_nifi_objects",
                 arguments=delete_pg_args,
                 headers=mcp_headers,
                 custom_logger=global_logger
             )
             global_logger.info(f"Default Test: Cleaned up process group {pg_id}")
         except Exception as e:
-            global_logger.error(f"Default Test: Failed to clean up process group {pg_id}: {str(e)}") 
+            global_logger.error(f"Default Test: Failed to clean up process group {pg_id}: {str(e)}")
+
+@pytest.mark.anyio
+async def test_intelligent_relationship_update_with_auto_delete(
+    async_client: httpx.AsyncClient,
+    base_url: str,
+    mcp_headers: dict,
+    global_logger: Any
+):
+    """Test intelligent relationship update that automatically deletes conflicting connections."""
+    # Create a fresh PG for this test
+    pg_name = "mcp-test-pg-intelligent-relationships"
+    create_pg_args = {"name": pg_name, "position_x": 0, "position_y": 0}
+    pg_result_list = await call_tool(
+        client=async_client,
+        base_url=base_url,
+        tool_name="create_nifi_process_group",
+        arguments=create_pg_args,
+        headers=mcp_headers,
+        custom_logger=global_logger
+    )
+    assert pg_result_list[0].get("status") == "success", "Failed to create test process group"
+    pg_id = pg_result_list[0].get("entity", {}).get("id")
+    assert pg_id, "No process group ID returned from creation"
+    global_logger.info(f"Intelligent Relationships Test: Created process group {pg_id}")
+
+    try:
+        # Create source processor (GenerateFlowFile)
+        source_processor_args = {
+            "process_group_id": pg_id,
+            "processor_type": "org.apache.nifi.processors.standard.GenerateFlowFile",
+            "name": "mcp-test-source-processor",
+            "position_x": 200.0,
+            "position_y": 200.0
+        }
+        create_result_list = await call_tool(
+            client=async_client,
+            base_url=base_url,
+            tool_name="create_nifi_processors",
+            arguments={"processors": [source_processor_args]},
+            headers=mcp_headers,
+            custom_logger=global_logger
+        )
+        assert create_result_list[0].get("status") in ["success", "warning"], "Failed to create source processor"
+        source_proc_id = create_result_list[0].get("entity", {}).get("id")
+        assert source_proc_id, "No source processor ID returned from creation"
+        global_logger.info(f"Intelligent Relationships Test: Created source processor {source_proc_id}")
+
+        # Create target processor (LogMessage)
+        target_processor_args = {
+            "process_group_id": pg_id,
+            "processor_type": "org.apache.nifi.processors.standard.LogMessage",
+            "name": "mcp-test-target-processor",
+            "position_x": 600.0,
+            "position_y": 200.0
+        }
+        create_result_list = await call_tool(
+            client=async_client,
+            base_url=base_url,
+            tool_name="create_nifi_processors",
+            arguments={"processors": [target_processor_args]},
+            headers=mcp_headers,
+            custom_logger=global_logger
+        )
+        assert create_result_list[0].get("status") in ["success", "warning"], "Failed to create target processor"
+        target_proc_id = create_result_list[0].get("entity", {}).get("id")
+        assert target_proc_id, "No target processor ID returned from creation"
+        global_logger.info(f"Intelligent Relationships Test: Created target processor {target_proc_id}")
+
+        # Initially clear auto-terminated relationships on source processor
+        clear_rels_args = {
+            "processor_id": source_proc_id,
+            "auto_terminated_relationships": []
+        }
+        rels_result_list = await call_tool(
+            client=async_client,
+            base_url=base_url,
+            tool_name="update_nifi_processor_relationships",
+            arguments=clear_rels_args,
+            headers=mcp_headers,
+            custom_logger=global_logger
+        )
+        assert rels_result_list[0].get("status") in ["success", "warning"], "Failed to clear relationships"
+        global_logger.info(f"Intelligent Relationships Test: Cleared auto-terminated relationships for source processor")
+
+        # Create a connection using the "success" relationship
+        connect_args = {
+            "source_id": source_proc_id,
+            "relationships": ["success"],
+            "target_id": target_proc_id
+        }
+        conn_result_list = await call_tool(
+            client=async_client,
+            base_url=base_url,
+            tool_name="create_nifi_connections",
+            arguments={"connections": [connect_args]},
+            headers=mcp_headers,
+            custom_logger=global_logger
+        )
+        assert conn_result_list[0].get("status") == "success", "Failed to create connection"
+        connection_id = conn_result_list[0].get("entity", {}).get("id")
+        assert connection_id, "Connection ID not found in response"
+        global_logger.info(f"Intelligent Relationships Test: Created connection {connection_id} using 'success' relationship")
+
+        # Verify connection exists
+        verify_conn_args = {
+            "object_type": "connection",
+            "object_id": connection_id
+        }
+        verify_conn_list = await call_tool(
+            client=async_client,
+            base_url=base_url,
+            tool_name="get_nifi_object_details",
+            arguments=verify_conn_args,
+            headers=mcp_headers,
+            custom_logger=global_logger
+        )
+        assert verify_conn_list[0].get("component", {}).get("selectedRelationships") == ["success"], \
+            "Connection not using expected relationship"
+        global_logger.info(f"Intelligent Relationships Test: Verified connection uses 'success' relationship")
+
+        # ========================== AUTO-DELETE ENABLED CASE ==========================
+        # Test with Auto-Delete enabled - should automatically delete the conflicting connection
+        headers_auto_delete_enabled = {**mcp_headers, "X-Mcp-Auto-Delete-Enabled": "true"}
+        
+        # Auto-terminate the "success" relationship (which is used by our connection)
+        auto_terminate_args = {
+            "processor_id": source_proc_id,
+            "auto_terminated_relationships": ["success"]
+        }
+        rels_result_list = await call_tool(
+            client=async_client,
+            base_url=base_url,
+            tool_name="update_nifi_processor_relationships",
+            arguments=auto_terminate_args,
+            headers=headers_auto_delete_enabled,
+            custom_logger=global_logger
+        )
+        assert rels_result_list[0].get("status") == "success", \
+            "Expected success when auto-terminating relationships with Auto-Delete enabled"
+        global_logger.info(f"Intelligent Relationships Test: Successfully auto-terminated 'success' relationship with Auto-Delete enabled")
+
+        # Verify the connection was automatically deleted
+        try:
+            verify_conn_list = await call_tool(
+                client=async_client,
+                base_url=base_url,
+                tool_name="get_nifi_object_details",
+                arguments=verify_conn_args,
+                headers=mcp_headers,
+                custom_logger=global_logger
+            )
+            assert False, f"Connection {connection_id} still exists after auto-terminating its relationship with Auto-Delete enabled"
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code in [400, 404]:
+                # This is expected - the connection should have been automatically deleted
+                global_logger.info(f"Intelligent Relationships Test: Confirmed connection {connection_id} was automatically deleted (got expected {e.response.status_code} error)")
+            else:
+                raise  # Re-raise if it's not a 400/404 error
+
+        # ========================== AUTO-DELETE DISABLED CASE ==========================
+        # Create a new connection for the disabled test
+        new_conn_result_list = await call_tool(
+            client=async_client,
+            base_url=base_url,
+            tool_name="create_nifi_connections",
+            arguments={"connections": [connect_args]},
+            headers=mcp_headers,
+            custom_logger=global_logger
+        )
+        assert new_conn_result_list[0].get("status") == "success", "Failed to create new connection for disabled test"
+        new_connection_id = new_conn_result_list[0].get("entity", {}).get("id")
+        assert new_connection_id, "New connection ID not found in response"
+        global_logger.info(f"Intelligent Relationships Test: Created new connection {new_connection_id} for disabled test")
+
+        # First clear the auto-terminated relationships to allow the connection
+        clear_rels_result_list = await call_tool(
+            client=async_client,
+            base_url=base_url,
+            tool_name="update_nifi_processor_relationships",
+            arguments=clear_rels_args,
+            headers=mcp_headers,
+            custom_logger=global_logger
+        )
+        assert clear_rels_result_list[0].get("status") in ["success", "warning"], "Failed to clear relationships for disabled test"
+
+        # Test with Auto-Delete disabled - should get error from NiFi about existing connections
+        headers_auto_delete_disabled = {**mcp_headers, "X-Mcp-Auto-Delete-Enabled": "false"}
+        
+        # Auto-terminate the "success" relationship again
+        rels_result_list = await call_tool(
+            client=async_client,
+            base_url=base_url,
+            tool_name="update_nifi_processor_relationships",
+            arguments=auto_terminate_args,
+            headers=headers_auto_delete_disabled,
+            custom_logger=global_logger
+        )
+        # Should get error because NiFi won't allow auto-terminating relationships with active connections
+        assert rels_result_list[0].get("status") == "error", \
+            "Expected error when auto-terminating relationships with existing connections and Auto-Delete disabled"
+        
+        # Check that the error message mentions the connection conflict
+        response_message = rels_result_list[0].get("message", "")
+        assert "connection" in response_message.lower() and "relationship" in response_message.lower(), \
+            f"Expected error message about connection/relationship conflict, got: {response_message}"
+        global_logger.info(f"Intelligent Relationships Test: Got expected error about connection conflict: {response_message}")
+
+        # Verify the connection still exists (wasn't deleted)
+        verify_new_conn_args = {
+            "object_type": "connection",
+            "object_id": new_connection_id
+        }
+        verify_new_conn_list = await call_tool(
+            client=async_client,
+            base_url=base_url,
+            tool_name="get_nifi_object_details",
+            arguments=verify_new_conn_args,
+            headers=mcp_headers,
+            custom_logger=global_logger
+        )
+        assert verify_new_conn_list[0].get("component", {}).get("selectedRelationships") == ["success"], \
+            "Connection should still exist with Auto-Delete disabled"
+        global_logger.info(f"Intelligent Relationships Test: Confirmed connection {new_connection_id} still exists with Auto-Delete disabled")
+
+    finally:
+        # Clean up the process group
+        try:
+            # Try to stop the process group first
+            stop_pg_args = {
+                "object_type": "process_group",
+                "object_id": pg_id,
+                "operation_type": "stop"
+            }
+            await call_tool(
+                client=async_client,
+                base_url=base_url,
+                tool_name="operate_nifi_object",
+                arguments=stop_pg_args,
+                headers=mcp_headers,
+                custom_logger=global_logger
+            )
+            global_logger.info(f"Intelligent Relationships Test: Stopped process group {pg_id}")
+            await asyncio.sleep(1)  # Give it time to stop
+
+            # Then delete the process group
+            delete_pg_args = {
+                "deletion_requests": [{
+                    "object_type": "process_group",
+                    "object_id": pg_id,
+                    "name": "mcp-test-pg-intelligent-relationships"
+                }]
+            }
+            await call_tool(
+                client=async_client,
+                base_url=base_url,
+                tool_name="delete_nifi_objects",
+                arguments=delete_pg_args,
+                headers=mcp_headers,
+                custom_logger=global_logger
+            )
+            global_logger.info(f"Intelligent Relationships Test: Cleaned up process group {pg_id}")
+        except Exception as e:
+            global_logger.error(f"Intelligent Relationships Test: Failed to clean up process group {pg_id}: {str(e)}") 

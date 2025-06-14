@@ -215,16 +215,13 @@ async def get_expert_help(question: str) -> str:
         raise ToolError("Question is too long. Please summarize your question to under 2000 characters.")
     
     try:
-        # Import and use the chat manager's LLM functionality
-        from nifi_chat_ui.chat_manager import get_llm_response
-        
         provider, model = mcp_settings.get_expert_help_config()
         local_logger.info(f"Calling expert help: {provider}:{model}")
         
         # Simple message format - just the question as a user message
         messages = [{"role": "user", "content": question.strip()}]
         
-        # Call the expert model (no tools, no system prompt, no history)
+        # Call the expert model directly using the appropriate provider
         expert_request_data = {
             "provider": provider,
             "model": model,
@@ -233,12 +230,102 @@ async def get_expert_help(question: str) -> str:
         }
         local_logger.bind(interface="llm", direction="request", data=expert_request_data).debug("Calling Expert LLM")
         
-        response = await get_llm_response(
-            provider=provider,
-            model=model,
-            messages=messages,
-            tools=None
-        )
+        # Initialize the appropriate client and make the call directly
+        if provider.lower() == "perplexity":
+            from openai import OpenAI
+            import config.settings as config
+            
+            if not config.PERPLEXITY_API_KEY:
+                return "Expert help unavailable: Perplexity API key not configured."
+            
+            client = OpenAI(
+                api_key=config.PERPLEXITY_API_KEY,
+                base_url="https://api.perplexity.ai",
+                timeout=60.0,
+                max_retries=2
+            )
+            
+            response = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=0.7,
+                max_tokens=1000
+            )
+            
+            content = response.choices[0].message.content if response.choices else ""
+            
+        elif provider.lower() == "openai":
+            from openai import OpenAI
+            import config.settings as config
+            
+            if not config.OPENAI_API_KEY:
+                return "Expert help unavailable: OpenAI API key not configured."
+            
+            client = OpenAI(
+                api_key=config.OPENAI_API_KEY,
+                timeout=60.0,
+                max_retries=2
+            )
+            
+            response = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=0.7,
+                max_tokens=1000
+            )
+            
+            content = response.choices[0].message.content if response.choices else ""
+            
+        elif provider.lower() == "anthropic":
+            try:
+                import anthropic
+                import config.settings as config
+                
+                if not config.ANTHROPIC_API_KEY:
+                    return "Expert help unavailable: Anthropic API key not configured."
+                
+                client = anthropic.Anthropic(
+                    api_key=config.ANTHROPIC_API_KEY,
+                    timeout=60.0,
+                    max_retries=2
+                )
+                
+                response = client.messages.create(
+                    model=model,
+                    max_tokens=1000,
+                    temperature=0.7,
+                    messages=messages
+                )
+                
+                content = response.content[0].text if response.content else ""
+                
+            except ImportError:
+                return "Expert help unavailable: Anthropic library not installed."
+            
+        elif provider.lower() == "gemini":
+            try:
+                import google.generativeai as genai
+                import config.settings as config
+                
+                if not config.GOOGLE_API_KEY:
+                    return "Expert help unavailable: Google API key not configured."
+                
+                genai.configure(api_key=config.GOOGLE_API_KEY)
+                model_instance = genai.GenerativeModel(model)
+                
+                # Convert messages to Gemini format
+                prompt = messages[0]["content"] if messages else question
+                response = model_instance.generate_content(prompt)
+                
+                content = response.text if response.text else ""
+                
+            except ImportError:
+                return "Expert help unavailable: Google Generative AI library not installed."
+            
+        else:
+            return f"Expert help unavailable: Unsupported provider '{provider}'."
+        
+        response = content
         
         expert_response_data = {"content_length": len(response) if response else 0}
         local_logger.bind(interface="llm", direction="response", data=expert_response_data).debug("Received from Expert LLM")

@@ -174,17 +174,23 @@ async def test_pg(
             global_logger.warning(f"Fixture: Error purging flowfiles (continuing with cleanup): {e_purge}")
 
         # Then delete the process group
-        delete_pg_args = {"object_type": "process_group", "object_id": pg_id, "kwargs": {}}
+        delete_pg_args = {
+            "deletion_requests": [{
+                "object_type": "process_group", 
+                "object_id": pg_id,
+                "name": f"Test Process Group {pg_id}"
+            }]
+        }
         delete_pg_result_list = await call_tool(
             client=async_client, 
             base_url=base_url,
-            tool_name="delete_nifi_object", 
+            tool_name="delete_nifi_objects", 
             arguments=delete_pg_args, 
             headers=mcp_headers,
             custom_logger=global_logger
         )
         assert isinstance(delete_pg_result_list, list) and len(delete_pg_result_list) > 0 and isinstance(delete_pg_result_list[0], dict), \
-            "Unexpected response format for delete_nifi_object (process group) in fixture teardown"
+            "Unexpected response format for delete_nifi_objects (process group) in fixture teardown"
         delete_pg_result = delete_pg_result_list[0]
         if delete_pg_result.get("status") == "success":
             global_logger.info(f"Fixture: Successfully deleted Test Process Group {pg_id}")
@@ -376,11 +382,17 @@ async def test_connection(
     # Teardown: Delete the connection
     global_logger.info(f"Fixture: Cleaning up test connection: {connection_id}")
     try:
-        delete_conn_args = {"object_type": "connection", "object_id": connection_id, "kwargs": {}}
+        delete_conn_args = {
+            "deletion_requests": [{
+                "object_type": "connection",
+                "object_id": connection_id,
+                "name": f"test-connection-{connection_id}"
+            }]
+        }
         delete_conn_result_list = await call_tool(
             client=async_client,
             base_url=base_url,
-            tool_name="delete_nifi_object",
+            tool_name="delete_nifi_objects",
             arguments=delete_conn_args,
             headers=mcp_headers,
             custom_logger=global_logger
@@ -735,17 +747,23 @@ async def test_complex_flow(
                 global_logger.warning(f"Fixture: Error purging flowfiles (continuing with cleanup): {e_purge}")
 
             # 3. Delete the process group
-            delete_pg_args = {"object_type": "process_group", "object_id": pg_id, "kwargs": {}}
+            delete_pg_args = {
+                "deletion_requests": [{
+                    "object_type": "process_group", 
+                    "object_id": pg_id,
+                    "name": f"Test Process Group {pg_id}"
+                }]
+            }
             delete_pg_result_list = await call_tool(
                 client=async_client,
                 base_url=base_url,
-                tool_name="delete_nifi_object",
+                tool_name="delete_nifi_objects",
                 arguments=delete_pg_args,
                 headers=mcp_headers,
                 custom_logger=global_logger
             )
             assert isinstance(delete_pg_result_list, list) and len(delete_pg_result_list) > 0 and isinstance(delete_pg_result_list[0], dict), \
-                "Unexpected response format for delete_nifi_object (process group) in fixture teardown"
+                "Unexpected response format for delete_nifi_objects (process group) in fixture teardown"
             delete_pg_result = delete_pg_result_list[0]
             if delete_pg_result.get("status") == "success":
                 global_logger.info(f"Fixture: Successfully deleted Test Process Group {pg_id}")
@@ -1032,11 +1050,17 @@ async def test_merge_flow(
                 global_logger.warning(f"Fixture: Error purging flowfiles (continuing with cleanup): {e_purge}")
 
             # Delete the process group
-            delete_pg_args = {"object_type": "process_group", "object_id": pg_id, "kwargs": {}}
+            delete_pg_args = {
+                "deletion_requests": [{
+                    "object_type": "process_group", 
+                    "object_id": pg_id,
+                    "name": f"Test Process Group {pg_id}"
+                }]
+            }
             delete_pg_result_list = await call_tool(
                 client=async_client,
                 base_url=base_url,
-                tool_name="delete_nifi_object",
+                tool_name="delete_nifi_objects",
                 arguments=delete_pg_args,
                 headers=mcp_headers,
                 custom_logger=global_logger

@@ -1,6 +1,7 @@
 import streamlit as st
 import json # Import json for formatting tool results
 import uuid # Added for context IDs
+import time # Added for timing tracking
 from loguru import logger # Import logger directly
 from st_copy_to_clipboard import st_copy_to_clipboard # Import the new component
 
@@ -108,6 +109,20 @@ if "hide_status_reports" not in st.session_state:
 # Initialize input counter for clearing input field
 if "input_counter" not in st.session_state:
     st.session_state.input_counter = 0
+
+# Initialize token and timing tracking
+if "conversation_total_tokens_in" not in st.session_state:
+    st.session_state.conversation_total_tokens_in = 0
+if "conversation_total_tokens_out" not in st.session_state:
+    st.session_state.conversation_total_tokens_out = 0
+if "conversation_total_duration" not in st.session_state:
+    st.session_state.conversation_total_duration = 0.0
+if "last_request_tokens_in" not in st.session_state:
+    st.session_state.last_request_tokens_in = 0
+if "last_request_tokens_out" not in st.session_state:
+    st.session_state.last_request_tokens_out = 0
+if "last_request_duration" not in st.session_state:
+    st.session_state.last_request_duration = 0.0
 
 # --- Fetch NiFi Servers (once per session) ---
 if "nifi_servers" not in st.session_state:
@@ -347,7 +362,14 @@ with st.sidebar:
         # st.session_state.history_cleared_for_next_llm_call = False # Removed
         # Reset phase to default
         st.session_state.selected_phase = "All" # Reset phase on clear
-        logger.info("Chat history, objective, and phase cleared by user.")
+        # Reset token and timing tracking
+        st.session_state.conversation_total_tokens_in = 0
+        st.session_state.conversation_total_tokens_out = 0
+        st.session_state.conversation_total_duration = 0.0
+        st.session_state.last_request_tokens_in = 0
+        st.session_state.last_request_tokens_out = 0
+        st.session_state.last_request_duration = 0.0
+        logger.info("Chat history, objective, phase, and usage tracking cleared by user.")
         # No st.rerun() needed here, Streamlit handles it after callback
 
     if st.sidebar.button("Clear Chat History", on_click=clear_chat_callback):
@@ -488,16 +510,23 @@ Keep this concise but informative.
                 st.markdown(status_response["content"])
             
             # Add to history (mark as status report for potential removal)
+            status_tokens_in = status_response.get("token_count_in", 0)
+            status_tokens_out = status_response.get("token_count_out", 0)
             status_message = {
                 "role": "assistant",
                 "content": f"### 📋 Status Report\n\n{status_response['content']}",
                 "is_status_report": True,
-                "token_count_in": status_response.get("token_count_in", 0),
-                "token_count_out": status_response.get("token_count_out", 0),
+                "token_count_in": status_tokens_in,
+                "token_count_out": status_tokens_out,
                 "action_id": str(uuid.uuid4())
             }
             
             st.session_state.messages.append(status_message)
+            
+            # Update session totals with status report tokens
+            st.session_state.conversation_total_tokens_in += status_tokens_in
+            st.session_state.conversation_total_tokens_out += status_tokens_out
+            
             bound_logger.info("Status report generated and displayed successfully")
             
             # Optional: Remove from history if configured to do so
@@ -519,6 +548,11 @@ def run_execution_loop(provider: str, model_name: str, base_sys_prompt: str, use
     
     # Use configurable max iterations from session state
     max_iterations = st.session_state.get("max_loop_iterations", MAX_LOOP_ITERATIONS)
+    
+    # Initialize request-level tracking
+    request_start_time = time.time()
+    request_tokens_in = 0
+    request_tokens_out = 0
     
     try:
         while loop_count < max_iterations:
@@ -672,6 +706,10 @@ def run_execution_loop(provider: str, model_name: str, base_sys_prompt: str, use
             token_count_in = response_data.get("token_count_in", 0)
             token_count_out = response_data.get("token_count_out", 0)
             
+            # Accumulate tokens for this request
+            request_tokens_in += token_count_in
+            request_tokens_out += token_count_out
+            
             if error_message:
                 current_loop_logger.error(f"LLM returned an error: {error_message}")
                 with st.chat_message("assistant"):
@@ -822,6 +860,29 @@ def run_execution_loop(provider: str, model_name: str, base_sys_prompt: str, use
         bound_logger.error(f"Unexpected error in execution loop: {e}", exc_info=True)
         st.error(f"An unexpected error occurred: {e}")
     finally:
+        # Calculate final timing and update session totals
+        request_end_time = time.time()
+        request_duration = request_end_time - request_start_time
+        
+        # Update session state with request totals
+        st.session_state.last_request_tokens_in = request_tokens_in
+        st.session_state.last_request_tokens_out = request_tokens_out
+        st.session_state.last_request_duration = request_duration
+        
+        # Update conversation totals
+        st.session_state.conversation_total_tokens_in += request_tokens_in
+        st.session_state.conversation_total_tokens_out += request_tokens_out
+        st.session_state.conversation_total_duration += request_duration
+        
+        # Display request summary
+        if request_tokens_in > 0 or request_tokens_out > 0:
+            total_request_tokens = request_tokens_in + request_tokens_out
+            with st.chat_message("assistant"):
+                st.markdown(f"📊 **Request Summary:** {total_request_tokens:,} tokens ({request_tokens_in:,} in, {request_tokens_out:,} out) • {request_duration:.1f}s")
+            
+            # Log the summary
+            bound_logger.info(f"Request completed: {total_request_tokens} tokens ({request_tokens_in} in, {request_tokens_out} out) in {request_duration:.1f}s")
+        
         # Always reset execution state
         st.session_state.llm_executing = False
         st.session_state.stop_requested = False
@@ -876,6 +937,20 @@ else:
         )
     with col2:
         send_button = st.button("▶️ Send", key="send_btn", help="Send message", use_container_width=True)
+    
+    # Display session statistics under the input box
+    total_session_tokens = st.session_state.conversation_total_tokens_in + st.session_state.conversation_total_tokens_out
+    last_total_tokens = st.session_state.last_request_tokens_in + st.session_state.last_request_tokens_out
+    
+    if total_session_tokens > 0 or last_total_tokens > 0:
+        stats_parts = []
+        if total_session_tokens > 0:
+            stats_parts.append(f"Session: {total_session_tokens:,} tokens ({st.session_state.conversation_total_duration:.1f}s)")
+        if last_total_tokens > 0:
+            stats_parts.append(f"Last: {last_total_tokens:,} tokens ({st.session_state.last_request_duration:.1f}s)")
+        
+        if stats_parts:
+            st.caption(" | ".join(stats_parts))
     
     # Process input when send button is clicked
     if send_button and user_input.strip():
