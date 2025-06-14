@@ -5,8 +5,16 @@ from __future__ import annotations # Add this import for forward references
 import google.generativeai as genai
 from openai import OpenAI # Import OpenAI
 import uuid # Added missing import
+import sys # Add missing sys import
+import os
 # Import config from new location
 try:
+    # Add parent directory to Python path so we can import config
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    parent_dir = os.path.dirname(current_dir)
+    if parent_dir not in sys.path:
+        sys.path.insert(0, parent_dir)
+    
     from config import settings as config 
 except ImportError:
     # Need logger here, but setup might not have run. Use basic print.
@@ -25,6 +33,14 @@ except ImportError:
     from mcp_handler import get_available_tools, execute_mcp_tool 
 import sys
 from loguru import logger # Import Loguru logger
+
+# Import Anthropic SDK
+try:
+    import anthropic
+    anthropic_available = True
+except ImportError:
+    anthropic_available = False
+    logger.warning("anthropic package not available, Anthropic models will not be available.")
 
 # Import tiktoken for accurate OpenAI token counting
 try:
@@ -63,12 +79,14 @@ except Exception as e:
 # --- Client Initialization --- #
 # gemini_model = None # Store the initialized model - Removed, will instantiate per request
 openai_client = None
+perplexity_client = None
+anthropic_client = None
 is_initialized = False # Flag to track whether LLM clients have been initialized 
 
 def configure_llms():
     """Configures LLM clients based on available keys and models."""
     # global gemini_model, openai_client, is_initialized # Removed gemini_model
-    global openai_client, is_initialized # Keep openai_client global for now
+    global openai_client, perplexity_client, anthropic_client, is_initialized
     
     # Configure Gemini (only API key setup here)
     if config.GOOGLE_API_KEY:
@@ -117,17 +135,74 @@ def configure_llms():
             openai_client = None
             # is_initialized = False # Mark as not initialized if setup fails - Handled below
 
+    # Configure Perplexity client (OpenAI-compatible)
+    if config.PERPLEXITY_API_KEY:
+        try:
+            # First set to None to force a clean initialization
+            perplexity_client = None
+            
+            # Ensure we have a fresh API key value
+            api_key = str(config.PERPLEXITY_API_KEY).strip()
+            if not api_key:
+                logger.error("Perplexity API key is empty or whitespace")
+                perplexity_client = None
+                return # Don't proceed if key is bad
+            
+            # Create a new client with Perplexity's base URL
+            logger.debug(f"Creating new Perplexity client with API key (length: {len(api_key)})")
+            perplexity_client = OpenAI(
+                api_key=api_key,
+                base_url="https://api.perplexity.ai",
+                timeout=60.0,  # Explicit timeout
+                max_retries=2  # Limit retries to avoid hanging
+            )
+            
+            logger.info(f"Perplexity client configured. Available models: {config.PERPLEXITY_MODELS}")
+        except Exception as e:
+            # Log internal error, avoid UI warning during import
+            logger.error(f"Failed to initialize Perplexity client: {e}", exc_info=True)
+            perplexity_client = None
+
+    # Configure Anthropic client
+    if config.ANTHROPIC_API_KEY and anthropic_available:
+        try:
+            # First set to None to force a clean initialization
+            anthropic_client = None
+            
+            # Ensure we have a fresh API key value
+            api_key = str(config.ANTHROPIC_API_KEY).strip()
+            if not api_key:
+                logger.error("Anthropic API key is empty or whitespace")
+                anthropic_client = None
+                return # Don't proceed if key is bad
+            
+            # Create a new Anthropic client
+            logger.debug(f"Creating new Anthropic client with API key (length: {len(api_key)})")
+            anthropic_client = anthropic.Anthropic(
+                api_key=api_key,
+                timeout=60.0,  # Explicit timeout
+                max_retries=2  # Limit retries to avoid hanging
+            )
+            
+            logger.info(f"Anthropic client configured. Available models: {config.ANTHROPIC_MODELS}")
+        except Exception as e:
+            # Log internal error, avoid UI warning during import
+            logger.error(f"Failed to initialize Anthropic client: {e}", exc_info=True)
+            anthropic_client = None
+
     # Update initialization status based on whether *at least one* client/key is ready
     # And if *at least one* model list is non-empty for the configured keys
     gemini_ready = bool(config.GOOGLE_API_KEY and config.GEMINI_MODELS)
     openai_ready = bool(openai_client and config.OPENAI_MODELS) # Check client and models
+    perplexity_ready = bool(perplexity_client and config.PERPLEXITY_MODELS) # Check client and models
+    anthropic_ready = bool(anthropic_client and config.ANTHROPIC_MODELS) # Check client and models
     
-    is_initialized = gemini_ready or openai_ready
+    is_initialized = gemini_ready or openai_ready or perplexity_ready or anthropic_ready
     
     if not is_initialized:
          logger.warning("LLM configuration incomplete: No valid API key and corresponding model list found.")
     else:
-         logger.info(f"LLM configuration status: Gemini Ready={gemini_ready}, OpenAI Ready={openai_ready}")
+         logger.info(f"LLM configuration status: Gemini Ready={gemini_ready}, OpenAI Ready={openai_ready}, Perplexity Ready={perplexity_ready}, Anthropic Ready={anthropic_ready}")
 
 
 # Do NOT call configure_llms() during module import as it can cause
@@ -159,7 +234,8 @@ def get_formatted_tool_definitions(
         # st.warning("Failed to retrieve tools from MCP handler.") # Don't show UI warning here
         return None # Return None if fetching failed
 
-    if provider == "openai":
+    if provider in ["openai", "perplexity"]:
+        # Both OpenAI and Perplexity use the same format (OpenAI-compatible)
         # OpenAI format matches our API format directly, but let's clean up the schema
         cleaned_tools = []
         for tool in tools:
@@ -205,8 +281,43 @@ def get_formatted_tool_definitions(
                 
                 cleaned_tools.append(tool)
         
-        bound_logger.debug(f"Formatted {len(cleaned_tools)} tools for OpenAI.")
+        bound_logger.debug(f"Formatted {len(cleaned_tools)} tools for {provider.title()}.")
         return cleaned_tools
+    elif provider == "anthropic":
+        if not anthropic_available:
+            bound_logger.error("anthropic package not available, cannot format tools for Anthropic.")
+            st.error("anthropic package not available. Please install with: pip install anthropic")
+            return None
+        
+        # Convert OpenAI format to Anthropic format
+        anthropic_tools = []
+        
+        for tool_data in tools:
+            func_details = tool_data.get("function", {})
+            name = func_details.get("name")
+            description = func_details.get("description")
+            parameters_schema = func_details.get("parameters") 
+            
+            if not name or not description:
+                continue
+                
+            # Convert OpenAI parameters format to Anthropic input_schema format
+            # Anthropic uses the same JSON Schema structure but expects it under "input_schema"
+            anthropic_tool = {
+                "name": name,
+                "description": description,
+                "input_schema": parameters_schema or {"type": "object", "properties": {}}
+            }
+            
+            anthropic_tools.append(anthropic_tool)
+            
+        if not anthropic_tools:
+            bound_logger.warning("No valid tool definitions found after formatting for Anthropic.")
+            st.warning("No valid tool definitions could be formatted for Anthropic.") # Keep UI warning
+            return None
+        
+        bound_logger.debug(f"Formatted {len(anthropic_tools)} tools for Anthropic.")
+        return anthropic_tools
     elif provider == "gemini":
         if not gemini_types_imported:
             bound_logger.error("Required google-generativeai types could not be imported. Cannot format tools for Gemini.")
@@ -360,6 +471,17 @@ def count_tokens_gemini(text: str) -> int:
     # Roughly 4 characters per token is a common approximation
     return len(text) // 4
 
+def count_tokens_perplexity(text: str, model: str) -> int:
+    """Count tokens for Perplexity models using OpenAI's tiktoken (since it's OpenAI-compatible)"""
+    # Perplexity uses OpenAI-compatible API, so we can use the same tokenizer approach
+    return count_tokens_openai(text, model)
+
+def count_tokens_anthropic(text: str) -> int:
+    """Approximate token count for Anthropic models (character-based estimate)"""
+    # For Anthropic, we'll use a character-based estimate since there's no official tokenizer
+    # Roughly 4 characters per token is a common approximation
+    return len(text) // 4
+
 def calculate_input_tokens(
     messages: List[Dict],
     provider: str,
@@ -368,14 +490,19 @@ def calculate_input_tokens(
 ) -> int:
     """Calculate total input tokens based on message history, provider, and tools."""
     total_tokens = 0
+    provider_lower = provider.lower()
 
     # Calculate tokens for messages
     for message in messages:
         content = message.get("content", "")
         if isinstance(content, str):
-            if provider.lower() == "openai":
+            if provider_lower == "openai":
                 total_tokens += count_tokens_openai(content, model_name)
-            else:
+            elif provider_lower == "perplexity":
+                total_tokens += count_tokens_perplexity(content, model_name)
+            elif provider_lower == "anthropic":
+                total_tokens += count_tokens_anthropic(content)
+            else: # gemini or others
                 total_tokens += count_tokens_gemini(content)
         elif message.get("role") == "tool":
             # Simple approximation for tool results
@@ -388,10 +515,13 @@ def calculate_input_tokens(
     if tools:
         tools_str = ""
         try:
-            if provider.lower() == "openai":
-                # OpenAI tools are already JSON-serializable dicts
+            if provider_lower in ["openai", "perplexity"]:
+                # OpenAI and Perplexity tools are already JSON-serializable dicts
                 tools_str = json.dumps(tools)
-            elif provider.lower() == "gemini":
+            elif provider_lower == "anthropic":
+                # Anthropic tools are dicts with input_schema, should be JSON-serializable
+                tools_str = json.dumps(tools)
+            elif provider_lower == "gemini":
                 # Gemini tools are FunctionDeclaration objects, need safe serialization
                 # Convert each declaration to a dict representation for token counting
                 tool_dicts = []
@@ -413,8 +543,12 @@ def calculate_input_tokens(
             # Count tokens for the serialized tool string
             if tools_str:
                 tool_tokens = 0
-                if provider.lower() == "openai":
+                if provider_lower == "openai":
                     tool_tokens = count_tokens_openai(tools_str, model_name)
+                elif provider_lower == "perplexity":
+                    tool_tokens = count_tokens_perplexity(tools_str, model_name)
+                elif provider_lower == "anthropic":
+                    tool_tokens = count_tokens_anthropic(tools_str)
                 else: # Assume Gemini or other
                     tool_tokens = count_tokens_gemini(tools_str)
                 
@@ -1149,5 +1283,588 @@ def rating_to_dict(rating):
         "probability": str(rating.probability) if hasattr(rating, 'probability') else None,
         "blocked": rating.blocked if hasattr(rating, 'blocked') else None,
     }
+
+def get_perplexity_response(
+    messages: List[Dict[str, Any]], 
+    system_prompt: str, 
+    tools: List[Dict[str, Any]] | None, # Perplexity uses OpenAI-compatible dict format
+    model_name: str, # Added: Specific model to use
+    user_request_id: str | None = None, # Added context ID
+    action_id: str | None = None # Added: Specific action ID for this LLM call
+) -> Dict[str, Any]:
+    """Gets a response from the Perplexity model, handling potential tool calls."""
+    # Bind both user_request_id and action_id to the logger
+    bound_logger = logger.bind(user_request_id=user_request_id, action_id=action_id)
+
+    if not perplexity_client: # Check if client was configured
+        bound_logger.error("Perplexity client is not configured. Cannot get response.")
+        # UI error handled by calling function
+        return {"error": "Perplexity not configured or configuration failed."}
+        
+    if not model_name or model_name not in config.PERPLEXITY_MODELS:
+        bound_logger.error(f"Invalid or missing Perplexity model specified: {model_name}. Available: {config.PERPLEXITY_MODELS}")
+        return {"error": f"Invalid Perplexity model specified: {model_name}"}
+
+    # Prepend system prompt as the first message if not already present
+    perplexity_messages = messages.copy()
+    if not perplexity_messages or perplexity_messages[0]["role"] != "system":
+        perplexity_messages.insert(0, {"role": "system", "content": system_prompt})
+    
+    bound_logger.debug(f"Prepared Perplexity messages with {len(perplexity_messages)} entries.")
+
+    try:
+        bound_logger.info(f"Sending request to Perplexity model: {model_name}")
+        
+        # Double-check that client is properly initialized before making API call
+        if perplexity_client is None:
+            bound_logger.error("Perplexity client is not initialized or was incorrectly initialized.")
+            st.error("Perplexity client not initialized. Please check your API key and try again.")
+            return {"error": "Perplexity client not initialized. Please check your API key and try again."}
+        
+        # --- Log LLM Request ---
+        request_payload = {
+            "model": model_name,
+            "messages": perplexity_messages,
+            "tools": tools,
+            "tool_choice": "auto" if tools else None,
+            #"temperature": 0.7,
+        }
+        bound_logger.bind(
+            interface="llm", 
+            direction="request", 
+            data=request_payload
+        ).debug("Sending request to Perplexity API")
+        # -----------------------
+        
+        # Now attempt the actual completions API call
+        bound_logger.debug(f"Sending messages to Perplexity: {json.dumps(perplexity_messages, indent=2)}") # Log the exact payload
+        response = perplexity_client.chat.completions.create(
+            model=model_name,
+            messages=perplexity_messages,
+            tools=tools if tools else None,
+            tool_choice="auto" if tools else None,
+            #temperature=0.7,
+        )
+        bound_logger.info("Received response from Perplexity model.")
+        
+        # --- Log LLM Response --- 
+        try:
+            # Safely convert response object to dict for logging
+            # Use a safer approach than model_dump() which might raise errors
+            response_dict = {}
+            
+            # Extract only the fields we need
+            if hasattr(response, 'id'):
+                response_dict['id'] = response.id
+                
+            if hasattr(response, 'choices') and response.choices:
+                # Safe extraction of choices
+                choices = []
+                for choice in response.choices:
+                    choice_dict = {'index': getattr(choice, 'index', 0)}
+                    
+                    # Extract message safely
+                    if hasattr(choice, 'message'):
+                        message = choice.message
+                        message_dict = {
+                            'role': getattr(message, 'role', None),
+                            'content': getattr(message, 'content', None)
+                        }
+                        
+                        # Handle tool calls safely
+                        if hasattr(message, 'tool_calls') and message.tool_calls:
+                            tool_calls = []
+                            for tc in message.tool_calls:
+                                tc_dict = {
+                                    'id': getattr(tc, 'id', None),
+                                    'type': getattr(tc, 'type', None),
+                                }
+                                
+                                # Extract function data safely
+                                if hasattr(tc, 'function'):
+                                    tc_dict['function'] = {
+                                        'name': getattr(tc.function, 'name', None),
+                                        # Arguments might be JSON string - keep as is
+                                        'arguments': getattr(tc.function, 'arguments', None)
+                                    }
+                                
+                                tool_calls.append(tc_dict)
+                            
+                            message_dict['tool_calls'] = tool_calls
+                        
+                        choice_dict['message'] = message_dict
+                    
+                    # Add finish reason
+                    if hasattr(choice, 'finish_reason'):
+                        choice_dict['finish_reason'] = choice.finish_reason
+                        
+                    choices.append(choice_dict)
+                
+                response_dict['choices'] = choices
+            
+            # Add model and usage info if available
+            if hasattr(response, 'model'):
+                response_dict['model'] = response.model
+                
+            if hasattr(response, 'usage'):
+                usage = response.usage
+                response_dict['usage'] = {
+                    'prompt_tokens': getattr(usage, 'prompt_tokens', 0),
+                    'completion_tokens': getattr(usage, 'completion_tokens', 0),
+                    'total_tokens': getattr(usage, 'total_tokens', 0)
+                }
+                
+            response_data_for_log = response_dict
+        except Exception as log_e:
+            response_data_for_log = {"error": f"Failed to serialize Perplexity response for logging: {log_e}"}
+            bound_logger.warning(f"Could not serialize Perplexity response for logging: {log_e}")
+            
+        bound_logger.bind(
+            interface="llm", 
+            direction="response", 
+            data=response_data_for_log
+        ).debug("Received response from Perplexity API")
+        # ------------------------
+
+        response_message = response.choices[0].message
+
+        # Extract content and tool calls
+        response_content = response_message.content
+        response_tool_calls = response_message.tool_calls
+        
+        # Convert ToolCall objects to dictionaries if needed by app.py
+        if response_tool_calls:
+            response_tool_calls = [
+                {
+                    "id": tc.id,
+                    "type": tc.type,
+                    "function": {"name": tc.function.name, "arguments": tc.function.arguments}
+                } for tc in response_tool_calls
+            ]
+        
+        # Calculate token counts - use Perplexity's reported usage when available
+        token_count_in = getattr(response.usage, 'prompt_tokens', 0) if hasattr(response, 'usage') else calculate_input_tokens(messages, "Perplexity", model_name, tools)
+        token_count_out = getattr(response.usage, 'completion_tokens', 0) if hasattr(response, 'usage') else 0
+
+        bound_logger.debug(f"Token counts - In: {token_count_in}, Out: {token_count_out}")
+        bound_logger.debug(f"Perplexity Response: Content={response_content is not None}, ToolCalls={len(response_tool_calls) if response_tool_calls else 0}")
+
+        return {
+            "content": response_content, 
+            "tool_calls": response_tool_calls,
+            "token_count_in": token_count_in,
+            "token_count_out": token_count_out
+        }
+
+    except Exception as e:
+        # Log the type of the exception for better debugging
+        bound_logger.error(f"Caught exception of type: {type(e).__name__}, message: {str(e)}")
+        
+        # Enhanced error message extraction for Perplexity API (OpenAI-compatible)
+        error_details = str(e)
+        user_friendly_message = error_details
+        
+        # Try to extract meaningful error message
+        if hasattr(e, 'message') and e.message:
+            user_friendly_message = e.message
+        elif hasattr(e, 'body') and e.body:
+            try:
+                # Try to parse error body for meaningful message
+                body = e.body
+                if isinstance(body, dict) and 'message' in body:
+                    user_friendly_message = body['message']
+                elif isinstance(body, str):
+                    try:
+                        body_dict = json.loads(body)
+                        if 'error' in body_dict and isinstance(body_dict['error'], dict):
+                            user_friendly_message = body_dict['error'].get('message', user_friendly_message)
+                        elif 'message' in body_dict:
+                            user_friendly_message = body_dict['message']
+                    except:
+                        pass
+            except Exception as body_parse_e:
+                bound_logger.warning(f"Could not parse Perplexity error body: {body_parse_e}")
+        elif hasattr(e, 'response'):
+            try:
+                response_content = e.response.text
+                error_details = f"{str(e)} - Response: {response_content[:500]}"
+                # Try to parse response for better error message
+                try:
+                    response_json = json.loads(response_content)
+                    if isinstance(response_json, dict) and 'error' in response_json:
+                        error_info = response_json['error']
+                        if isinstance(error_info, dict) and 'message' in error_info:
+                            user_friendly_message = error_info['message']
+                        elif isinstance(error_info, str):
+                            user_friendly_message = error_info
+                except:
+                    pass
+            except Exception as inner_e:
+                bound_logger.warning(f"Could not extract response details from exception: {inner_e}")
+        
+        # Log the full technical error details for debugging
+        bound_logger.error(f"Error during Perplexity API call: {error_details}", exc_info=True)
+        
+        # Show user-friendly message in UI
+        st.error(f"Perplexity API Error: {user_friendly_message}")
+        
+        # Return the user-friendly error message
+        return {"error": user_friendly_message}
+
+def get_anthropic_response(
+    messages: List[Dict[str, Any]], 
+    system_prompt: str, 
+    tools: List[Dict[str, Any]] | None, # Anthropic tools have different format
+    model_name: str, # Added: Specific model to use
+    user_request_id: str | None = None, # Added context ID
+    action_id: str | None = None # Added: Specific action ID for this LLM call
+) -> Dict[str, Any]:
+    """Gets a response from the Anthropic model, handling format conversion and tool calls."""
+    # Bind both user_request_id and action_id to the logger
+    bound_logger = logger.bind(user_request_id=user_request_id, action_id=action_id)
+
+    if not anthropic_client: # Check if client was configured
+        bound_logger.error("Anthropic client is not configured. Cannot get response.")
+        # UI error handled by calling function
+        return {"error": "Anthropic not configured or configuration failed."}
+        
+    if not model_name or model_name not in config.ANTHROPIC_MODELS:
+        bound_logger.error(f"Invalid or missing Anthropic model specified: {model_name}. Available: {config.ANTHROPIC_MODELS}")
+        return {"error": f"Invalid Anthropic model specified: {model_name}"}
+
+    # Convert messages from OpenAI format to Anthropic format
+    # Anthropic expects different structure:
+    # - System message is passed separately
+    # - Messages should alternate user/assistant
+    # - Tool calls and tool results are handled differently
+    
+    anthropic_messages = []
+    
+    for msg in messages:
+        role = msg.get("role")
+        content = msg.get("content")
+        
+        if role == "system":
+            # Skip system messages here - we'll use the system_prompt parameter
+            continue
+        elif role == "user":
+            anthropic_messages.append({
+                "role": "user",
+                "content": content or ""
+            })
+        elif role == "assistant":
+            # Assistant messages may have content and/or tool_calls
+            assistant_content = []
+            
+            # Add text content if present
+            if content:
+                assistant_content.append({
+                    "type": "text",
+                    "text": content
+                })
+            
+            # Convert tool calls to Anthropic format
+            tool_calls = msg.get("tool_calls")
+            if tool_calls:
+                for tc in tool_calls:
+                    function = tc.get("function", {})
+                    # Parse arguments string to dict if needed
+                    arguments = function.get("arguments", "{}")
+                    if isinstance(arguments, str):
+                        try:
+                            arguments = json.loads(arguments)
+                        except json.JSONDecodeError:
+                            bound_logger.warning(f"Failed to parse tool call arguments: {arguments}")
+                            arguments = {}
+                    
+                    assistant_content.append({
+                        "type": "tool_use",
+                        "id": tc.get("id", str(uuid.uuid4())),
+                        "name": function.get("name", ""),
+                        "input": arguments
+                    })
+            
+            if assistant_content:
+                anthropic_messages.append({
+                    "role": "assistant",
+                    "content": assistant_content
+                })
+        elif role == "tool":
+            # Tool results become user messages in Anthropic format
+            tool_call_id = msg.get("tool_call_id")
+            anthropic_messages.append({
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": tool_call_id,
+                        "content": content or ""
+                    }
+                ]
+            })
+    
+    bound_logger.debug(f"Converted {len(messages)} messages to {len(anthropic_messages)} Anthropic format messages.")
+
+    try:
+        bound_logger.info(f"Sending request to Anthropic model: {model_name}")
+        
+        # Double-check that client is properly initialized before making API call
+        if anthropic_client is None:
+            bound_logger.error("Anthropic client is not initialized or was incorrectly initialized.")
+            st.error("Anthropic client not initialized. Please check your API key and try again.")
+            return {"error": "Anthropic client not initialized. Please check your API key and try again."}
+        
+        # --- Log LLM Request ---
+        request_payload = {
+            "model": model_name,
+            "max_tokens": 4096,  # Anthropic requires max_tokens
+            "system": system_prompt,
+            "messages": anthropic_messages,
+            "tools": tools,
+        }
+        bound_logger.bind(
+            interface="llm", 
+            direction="request", 
+            data=request_payload
+        ).debug("Sending request to Anthropic API")
+        # -----------------------
+        
+        # Now attempt the actual messages API call
+        bound_logger.debug(f"Sending messages to Anthropic: {json.dumps(anthropic_messages, indent=2)}") # Log the exact payload
+        response = anthropic_client.messages.create(
+            model=model_name,
+            max_tokens=4096,  # Anthropic requires max_tokens
+            system=system_prompt,
+            messages=anthropic_messages,
+            tools=tools if tools else None,
+        )
+        bound_logger.info("Received response from Anthropic model.")
+        
+        # --- Log LLM Response --- 
+        try:
+            # Safely convert response object to dict for logging
+            response_dict = {}
+            
+            # Extract basic fields
+            for field in ['id', 'model', 'role', 'type']:
+                if hasattr(response, field):
+                    response_dict[field] = getattr(response, field)
+            
+            # Extract content
+            if hasattr(response, 'content') and response.content:
+                content_list = []
+                for content_block in response.content:
+                    content_dict = {'type': getattr(content_block, 'type', 'unknown')}
+                    
+                    if hasattr(content_block, 'text'):
+                        content_dict['text'] = content_block.text
+                    if hasattr(content_block, 'name'):
+                        content_dict['name'] = content_block.name
+                    if hasattr(content_block, 'id'):
+                        content_dict['id'] = content_block.id
+                    if hasattr(content_block, 'input'):
+                        content_dict['input'] = content_block.input
+                    
+                    content_list.append(content_dict)
+                
+                response_dict['content'] = content_list
+            
+            # Extract usage info if available
+            if hasattr(response, 'usage'):
+                usage = response.usage
+                response_dict['usage'] = {
+                    'input_tokens': getattr(usage, 'input_tokens', 0),
+                    'output_tokens': getattr(usage, 'output_tokens', 0)
+                }
+                
+            response_data_for_log = response_dict
+        except Exception as log_e:
+            response_data_for_log = {"error": f"Failed to serialize Anthropic response for logging: {log_e}"}
+            bound_logger.warning(f"Could not serialize Anthropic response for logging: {log_e}")
+            
+        bound_logger.bind(
+            interface="llm", 
+            direction="response", 
+            data=response_data_for_log
+        ).debug("Received response from Anthropic API")
+        # ------------------------
+
+        # Convert Anthropic response back to OpenAI-compatible format
+        response_content = ""
+        response_tool_calls = []
+        
+        for content_block in response.content:
+            if hasattr(content_block, 'type'):
+                if content_block.type == "text":
+                    response_content += getattr(content_block, 'text', '')
+                elif content_block.type == "tool_use":
+                    # Convert to OpenAI format
+                    tool_call = {
+                        "id": getattr(content_block, 'id', str(uuid.uuid4())),
+                        "type": "function",
+                        "function": {
+                            "name": getattr(content_block, 'name', ''),
+                            "arguments": json.dumps(getattr(content_block, 'input', {}))
+                        }
+                    }
+                    response_tool_calls.append(tool_call)
+        
+        # Calculate token counts - use Anthropic's reported usage when available
+        token_count_in = getattr(response.usage, 'input_tokens', 0) if hasattr(response, 'usage') else calculate_input_tokens(messages, "Anthropic", model_name, tools)
+        token_count_out = getattr(response.usage, 'output_tokens', 0) if hasattr(response, 'usage') else 0
+
+        bound_logger.debug(f"Token counts - In: {token_count_in}, Out: {token_count_out}")
+        bound_logger.debug(f"Anthropic Response: Content length={len(response_content)}, ToolCalls={len(response_tool_calls)}")
+
+        return {
+            "content": response_content or None, 
+            "tool_calls": response_tool_calls if response_tool_calls else None,
+            "token_count_in": token_count_in,
+            "token_count_out": token_count_out
+        }
+
+    except Exception as e:
+        # Log the type of the exception for better debugging
+        bound_logger.error(f"Caught exception of type: {type(e).__name__}, message: {str(e)}")
+        
+        # Enhanced error message extraction for Anthropic API
+        error_details = str(e)
+        user_friendly_message = error_details
+        
+        # Try to extract Anthropic-specific error details
+        if hasattr(e, '__class__') and e.__class__.__name__ == 'RateLimitError':
+            # For rate limit errors, extract the actual message
+            if hasattr(e, 'message') and e.message:
+                user_friendly_message = e.message
+            # Also try to parse if the error contains JSON-like structure
+            try:
+                import re
+                # Look for rate limit specific information in the error string
+                if 'rate limit' in error_details.lower():
+                    # Extract the full rate limit message
+                    match = re.search(r"'message': '([^']*)'", error_details)
+                    if match:
+                        user_friendly_message = match.group(1)
+                    else:
+                        # Fallback to extracting from the general error structure
+                        match = re.search(r"Error code: \d+ - (.+)", error_details)
+                        if match:
+                            try:
+                                import ast
+                                error_dict = ast.literal_eval(match.group(1))
+                                if isinstance(error_dict, dict) and 'error' in error_dict:
+                                    inner_error = error_dict['error']
+                                    if isinstance(inner_error, dict) and 'message' in inner_error:
+                                        user_friendly_message = inner_error['message']
+                            except:
+                                pass
+            except Exception as parse_e:
+                bound_logger.warning(f"Could not parse Anthropic error structure: {parse_e}")
+        
+        # Try other common Anthropic error attributes
+        elif hasattr(e, 'message') and e.message:
+            user_friendly_message = e.message
+        elif hasattr(e, 'body') and e.body:
+            try:
+                # If body is a dict or JSON-like, extract the message
+                body = e.body
+                if isinstance(body, dict):
+                    error_info = body.get('error', {})
+                    if isinstance(error_info, dict) and 'message' in error_info:
+                        user_friendly_message = error_info['message']
+                    elif 'message' in body:
+                        user_friendly_message = body['message']
+                else:
+                    # Try to parse as JSON string
+                    try:
+                        import json
+                        body_dict = json.loads(body)
+                        error_info = body_dict.get('error', {})
+                        if isinstance(error_info, dict) and 'message' in error_info:
+                            user_friendly_message = error_info['message']
+                        elif 'message' in body_dict:
+                            user_friendly_message = body_dict['message']
+                    except:
+                        pass
+            except Exception as body_parse_e:
+                bound_logger.warning(f"Could not parse Anthropic error body: {body_parse_e}")
+        
+        # If we still have a generic error, try to extract from response object
+        if user_friendly_message == error_details and hasattr(e, 'response'):
+            try:
+                response_content = e.response.text
+                error_details = f"{str(e)} - Response: {response_content[:500]}"
+                # Try to parse the response as JSON for better error extraction
+                try:
+                    import json
+                    response_json = json.loads(response_content)
+                    if isinstance(response_json, dict) and 'error' in response_json:
+                        error_info = response_json['error']
+                        if isinstance(error_info, dict) and 'message' in error_info:
+                            user_friendly_message = error_info['message']
+                except:
+                    pass
+            except Exception as inner_e:
+                bound_logger.warning(f"Could not extract response details from exception: {inner_e}")
+        
+        # Log the full technical error details for debugging
+        bound_logger.error(f"Error during Anthropic API call: {error_details}", exc_info=True)
+        
+        # Show user-friendly message in UI
+        st.error(f"Anthropic API Error: {user_friendly_message}")
+        
+        # Return the user-friendly error message
+        return {"error": user_friendly_message}
+
+def get_llm_response(
+    messages: List[Dict[str, Any]], 
+    system_prompt: str, 
+    tools: List[Dict[str, Any]] | None, 
+    provider: str, 
+    model_name: str,
+    user_request_id: str | None = None
+) -> Dict[str, Any]:
+    """Generic LLM response dispatcher that routes to the appropriate provider."""
+    # Generate action ID for this specific LLM call
+    action_id = str(uuid.uuid4())
+    bound_logger = logger.bind(user_request_id=user_request_id, action_id=action_id)
+    
+    # Normalize provider name
+    provider_normalized = provider.lower().strip()
+    
+    bound_logger.info(f"Routing LLM request to provider: {provider_normalized}, model: {model_name}")
+    
+    # Validate provider/model combination
+    if provider_normalized == "openai":
+        if not openai_client:
+            return {"error": "OpenAI not configured. Please check your API key."}
+        if model_name not in config.OPENAI_MODELS:
+            return {"error": f"Invalid OpenAI model: {model_name}. Available: {config.OPENAI_MODELS}"}
+        return get_openai_response(messages, system_prompt, tools, model_name, user_request_id, action_id)
+    
+    elif provider_normalized == "perplexity":
+        if not perplexity_client:
+            return {"error": "Perplexity not configured. Please check your API key."}
+        if model_name not in config.PERPLEXITY_MODELS:
+            return {"error": f"Invalid Perplexity model: {model_name}. Available: {config.PERPLEXITY_MODELS}"}
+        return get_perplexity_response(messages, system_prompt, tools, model_name, user_request_id, action_id)
+    
+    elif provider_normalized == "anthropic":
+        if not anthropic_client:
+            return {"error": "Anthropic not configured. Please check your API key."}
+        if model_name not in config.ANTHROPIC_MODELS:
+            return {"error": f"Invalid Anthropic model: {model_name}. Available: {config.ANTHROPIC_MODELS}"}
+        return get_anthropic_response(messages, system_prompt, tools, model_name, user_request_id, action_id)
+    
+    elif provider_normalized == "gemini":
+        if not config.GOOGLE_API_KEY:
+            return {"error": "Gemini not configured. Please check your API key."}
+        if model_name not in config.GEMINI_MODELS:
+            return {"error": f"Invalid Gemini model: {model_name}. Available: {config.GEMINI_MODELS}"}
+        return get_gemini_response(messages, system_prompt, tools, model_name, user_request_id, action_id)
+    
+    else:
+        bound_logger.error(f"Unsupported LLM provider: {provider}")
+        return {"error": f"Unsupported LLM provider: {provider}. Supported: OpenAI, Perplexity, Anthropic, Gemini"}
 
 # --- (Potentially other helper functions) --- 

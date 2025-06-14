@@ -133,9 +133,12 @@ def filter_processor_data(processor):
     }
 
 def filter_created_processor_data(processor_entity):
-    """Extract only the essential fields from a newly created processor entity"""
+    """Extract essential fields from a newly created processor entity, including properties and relationships"""
     component = processor_entity.get("component", {})
     revision = processor_entity.get("revision", {})
+    config = component.get("config", {})
+    properties = config.get("properties", {})
+    
     return {
         "id": processor_entity.get("id"),
         "name": component.get("name"),
@@ -143,6 +146,8 @@ def filter_created_processor_data(processor_entity):
         "position": processor_entity.get("position"), # Position is top-level in creation response
         "validationStatus": component.get("validationStatus"),
         "validationErrors": component.get("validationErrors"),
+        "properties": properties, # Include properties for LLM context
+        "relationships": component.get("relationships", []), # Include relationships for LLM context
         "version": revision.get("version"), # Get version from revision dict
     }
 

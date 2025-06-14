@@ -164,8 +164,8 @@ async def test_update_processor_properties_and_verify(
         "relationships": ["success"]  # Changed from relationships_to_connect
     }
     connection_result_list = await call_tool(
-        client=async_client, base_url=base_url, tool_name="create_nifi_connection",
-        arguments=create_connection_args, headers=mcp_headers, custom_logger=global_logger
+        client=async_client, base_url=base_url, tool_name="create_nifi_connections",
+        arguments={"connections": [create_connection_args]}, headers=mcp_headers, custom_logger=global_logger
     )
     assert isinstance(connection_result_list, list) and connection_result_list and isinstance(connection_result_list[0], dict), \
         "Unexpected response format for create_nifi_connection"
@@ -299,17 +299,21 @@ async def test_auto_stop_update_running_processor(
     assert verify_result_list[0].get("component", {}).get("state") == "RUNNING", \
         "Processor not running before update test"
     
-    # Get current scheduling strategy
-    current_scheduling_strategy = verify_result_list[0].get("component", {}).get("config", {}).get("schedulingStrategy", "TIMER_DRIVEN")
-    target_scheduling_strategy = "CRON_DRIVEN" if current_scheduling_strategy == "TIMER_DRIVEN" else "TIMER_DRIVEN"
-    global_logger.info(f"Test: Current scheduling strategy: {current_scheduling_strategy}, target: {target_scheduling_strategy}")
+    # Get current properties - use a simple property that we know exists
+    current_config = verify_result_list[0].get("component", {}).get("config", {})
+    current_properties = current_config.get("properties", {})
+    
+    # Use "File Size" property which should exist on GenerateFlowFile processor
+    current_file_size = current_properties.get("File Size", "1 kB")
+    target_file_size = "2 kB" if current_file_size == "1 kB" else "1 kB"
+    global_logger.info(f"Test: Current File Size: {current_file_size}, target: {target_file_size}")
 
     # Attempt update with Auto-Stop enabled
     headers_auto_stop_true = {**mcp_headers, "X-Mcp-Auto-Stop-Enabled": "true"}
     update_args = {
         "processor_id": generate_proc_id,
         "processor_config_properties": {
-            "Scheduling Strategy": target_scheduling_strategy
+            "File Size": target_file_size
         }
     }
     update_result_list = await call_tool(
@@ -320,12 +324,67 @@ async def test_auto_stop_update_running_processor(
         headers=headers_auto_stop_true,
         custom_logger=global_logger
     )
-    # For now, expect error since feature isn't implemented
-    assert update_result_list[0].get("status") == "error", \
-        "Expected error with Auto-Stop enabled (not implemented yet)"
-    global_logger.info("Test: Got expected error with Auto-Stop enabled")
+    # Now that Auto-Stop is implemented, expect success
+    assert update_result_list[0].get("status") == "success", \
+        "Expected success with Auto-Stop enabled (feature is now implemented)"
+    global_logger.info("Test: Got expected success with Auto-Stop enabled")
 
-    # Verify processor still exists and is running with original properties
+    # Verify processor was stopped and restarted, and properties were updated
+    verify_result_list = await call_tool(
+        client=async_client,
+        base_url=base_url,
+        tool_name="get_nifi_object_details",
+        arguments=verify_args,
+        headers=mcp_headers,
+        custom_logger=global_logger
+    )
+    # Processor should be stopped after the update (Auto-Stop stops it but doesn't restart)
+    assert verify_result_list[0].get("component", {}).get("state") == "STOPPED", \
+        "Processor should be stopped after Auto-Stop update"
+    
+    # Verify the property was updated
+    updated_properties = verify_result_list[0].get("component", {}).get("config", {}).get("properties", {})
+    updated_file_size = updated_properties.get("File Size")
+    assert updated_file_size == target_file_size, \
+        f"File Size property should have been updated. Expected '{target_file_size}', got '{updated_file_size}'"
+    global_logger.info(f"Test: Confirmed processor {generate_proc_id} was stopped and File Size updated to {target_file_size}")
+
+    # Restart the processor for the Auto-Stop disabled test
+    start_result_list = await call_tool(
+        client=async_client,
+        base_url=base_url,
+        tool_name="operate_nifi_object",
+        arguments=start_args,
+        headers=mcp_headers,
+        custom_logger=global_logger
+    )
+    assert start_result_list[0].get("status") == "success", "Failed to restart processor for disabled test"
+    global_logger.info(f"Test: Restarted processor {generate_proc_id} for Auto-Stop disabled test")
+    await asyncio.sleep(1)  # Brief pause after starting
+
+    # Attempt update with Auto-Stop disabled - should fail because processor is running
+    headers_auto_stop_false = {**mcp_headers, "X-Mcp-Auto-Stop-Enabled": "false"}
+    # Use a different target value for the disabled test
+    disabled_test_file_size = "3 kB" if target_file_size != "3 kB" else "4 kB"
+    disabled_update_args = {
+        "processor_id": generate_proc_id,
+        "processor_config_properties": {
+            "File Size": disabled_test_file_size
+        }
+    }
+    update_result_list = await call_tool(
+        client=async_client,
+        base_url=base_url,
+        tool_name="update_nifi_processor_properties",
+        arguments=disabled_update_args,
+        headers=headers_auto_stop_false,
+        custom_logger=global_logger
+    )
+    assert update_result_list[0].get("status") == "error", \
+        "Expected error when updating running processor with Auto-Stop disabled"
+    global_logger.info("Test: Got expected error with Auto-Stop disabled")
+
+    # Verify processor is still running and properties unchanged
     verify_result_list = await call_tool(
         client=async_client,
         base_url=base_url,
@@ -336,20 +395,10 @@ async def test_auto_stop_update_running_processor(
     )
     assert verify_result_list[0].get("component", {}).get("state") == "RUNNING", \
         "Processor should still be running after failed update attempt"
-    assert verify_result_list[0].get("component", {}).get("config", {}).get("schedulingStrategy") == current_scheduling_strategy, \
-        "Scheduling strategy should not have changed"
-    global_logger.info(f"Test: Confirmed processor {generate_proc_id} is still running with original scheduling strategy")
-
-    # Attempt update with Auto-Stop disabled
-    headers_auto_stop_false = {**mcp_headers, "X-Mcp-Auto-Stop-Enabled": "false"}
-    update_result_list = await call_tool(
-        client=async_client,
-        base_url=base_url,
-        tool_name="update_nifi_processor_properties",
-        arguments=update_args,
-        headers=headers_auto_stop_false,
-        custom_logger=global_logger
-    )
-    assert update_result_list[0].get("status") == "error", \
-        "Expected error when updating running processor with Auto-Stop disabled"
-    global_logger.info("Test: Got expected error with Auto-Stop disabled") 
+    
+    # Verify the property was not changed from the successful update
+    unchanged_properties = verify_result_list[0].get("component", {}).get("config", {}).get("properties", {})
+    unchanged_file_size = unchanged_properties.get("File Size")
+    assert unchanged_file_size == target_file_size, \
+        f"File Size property should not have changed from successful update. Expected '{target_file_size}', got '{unchanged_file_size}'"
+    global_logger.info(f"Test: Confirmed processor {generate_proc_id} is still running with File Size: {target_file_size}") 

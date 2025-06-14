@@ -51,8 +51,8 @@ async def test_start_and_stop_process_group(
     conn_result_list = await call_tool(
         client=async_client,
         base_url=base_url,
-        tool_name="create_nifi_connection",
-        arguments=connect_args,
+        tool_name="create_nifi_connections",
+        arguments={"connections": [connect_args]},
         headers=mcp_headers,
         custom_logger=global_logger
     )
@@ -185,8 +185,8 @@ async def test_process_group_status_after_operations(
     conn_result_list = await call_tool(
         client=async_client,
         base_url=base_url,
-        tool_name="create_nifi_connection",
-        arguments=connect_args,
+        tool_name="create_nifi_connections",
+        arguments={"connections": [connect_args]},
         headers=mcp_headers,
         custom_logger=global_logger
     )

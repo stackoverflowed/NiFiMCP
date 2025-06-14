@@ -21,6 +21,15 @@ llm:
   openai:
     api_key: "" # Your OpenAI API Key (e.g., sk-...)
     models: ["gpt-4-turbo-preview", "gpt-3.5-turbo"] # Comma-separated list of allowed models
+  perplexity:
+    api_key: "" # Your Perplexity API Key (e.g., pplx-...)
+    models: ["sonar-pro", "sonar", "sonar-reasoning-pro", "sonar-reasoning"] # Comma-separated list of allowed models
+  anthropic:
+    api_key: "" # Your Anthropic API Key (e.g., sk-ant-...)
+    models: ["claude-opus-4-20250514", "claude-sonnet-4-20250109", "claude-haiku-3-5-20241022"] # Comma-separated list of allowed models
+  expert_help_model:
+    provider: "openai" # Choose from: openai, google, perplexity, anthropic
+    model: "gpt-4-turbo-preview" # Must be one of the models listed above for the chosen provider
 
 mcp_features:
   auto_stop_enabled: true

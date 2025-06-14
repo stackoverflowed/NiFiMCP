@@ -59,7 +59,7 @@ Let `BASE_URL` be the server's base URL and `NIFI_SERVER_ID` be the target NiFi 
     *   **Store:** Extract `entity.id` into `test_pg_id`.
 
 *   **Action:** Create GenerateFlowFile Processor within the Test PG.
-    *   **API Call:** `POST {BASE_URL}/tools/create_nifi_processor`
+    *   **API Call:** `POST {BASE_URL}/tools/create_nifi_processors`
     *   **Headers:** `{"X-Nifi-Server-Id": NIFI_SERVER_ID, "Content-Type": "application/json"}`
     *   **Body:**
         ```json
@@ -77,7 +77,7 @@ Let `BASE_URL` be the server's base URL and `NIFI_SERVER_ID` be the target NiFi 
     *   **Store:** Extract `entity.id` into `generate_proc_id`.
 
 *   **Action:** Create LogAttribute Processor within the Test PG.
-    *   **API Call:** `POST {BASE_URL}/tools/create_nifi_processor`
+    *   **API Call:** `POST {BASE_URL}/tools/create_nifi_processors`
     *   **Headers:** `{"X-Nifi-Server-Id": NIFI_SERVER_ID, "Content-Type": "application/json"}`
     *   **Body:**
         ```json
@@ -95,7 +95,7 @@ Let `BASE_URL` be the server's base URL and `NIFI_SERVER_ID` be the target NiFi 
     *   **Store:** Extract `entity.id` into `log_proc_id`.
 
 *   **Action:** Connect GenerateFlowFile to LogAttribute.
-    *   **API Call:** `POST {BASE_URL}/tools/create_nifi_connection`
+    *   **API Call:** `POST {BASE_URL}/tools/create_nifi_connections`
     *   **Headers:** `{"X-Nifi-Server-Id": NIFI_SERVER_ID, "Content-Type": "application/json"}`
     *   **Body:**
         ```json

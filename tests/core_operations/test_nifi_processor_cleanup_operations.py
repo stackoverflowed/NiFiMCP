@@ -76,14 +76,16 @@ async def test_auto_stop_delete_running_processor(
     # Attempt delete with Auto-Stop enabled
     headers_auto_stop_true = {**mcp_headers, "X-Mcp-Auto-Stop-Enabled": "true"}
     delete_args = {
-        "object_type": "processor",
-        "object_id": generate_proc_id,
-        "kwargs": {}
+        "deletion_requests": [{
+            "object_type": "processor",
+            "object_id": generate_proc_id,
+            "name": "mcp-test-auto-stop"
+        }]
     }
     delete_result_list = await call_tool(
         client=async_client,
         base_url=base_url,
-        tool_name="delete_nifi_object",
+        tool_name="delete_nifi_objects",
         arguments=delete_args,
         headers=headers_auto_stop_true,
         custom_logger=global_logger
@@ -123,8 +125,8 @@ async def test_auto_stop_delete_running_processor(
     create_result_list = await call_tool(
         client=async_client,
         base_url=base_url,
-        tool_name="create_nifi_processor",
-        arguments=create_args,
+        tool_name="create_nifi_processors",
+        arguments={"processors": [create_args]},
         headers=mcp_headers,
         custom_logger=global_logger
     )
@@ -150,14 +152,16 @@ async def test_auto_stop_delete_running_processor(
     # Attempt delete with Auto-Stop disabled (should still work since processor is already stopped)
     headers_auto_stop_false = {**mcp_headers, "X-Mcp-Auto-Stop-Enabled": "false"}
     delete_args = {
-        "object_type": "processor",
-        "object_id": extra_proc_id,
-        "kwargs": {}
+        "deletion_requests": [{
+            "object_type": "processor",
+            "object_id": extra_proc_id,
+            "name": "mcp-test-auto-stop-extra"
+        }]
     }
     delete_result_list = await call_tool(
         client=async_client,
         base_url=base_url,
-        tool_name="delete_nifi_object",
+        tool_name="delete_nifi_objects",
         arguments=delete_args,
         headers=headers_auto_stop_false,
         custom_logger=global_logger
@@ -189,8 +193,8 @@ async def test_auto_delete_processor_with_connections(
     conn_result_list = await call_tool(
         client=async_client,
         base_url=base_url,
-        tool_name="create_nifi_connection",
-        arguments=connect_args,
+        tool_name="create_nifi_connections",
+        arguments={"connections": [connect_args]},
         headers=mcp_headers,
         custom_logger=global_logger
     )
@@ -202,14 +206,16 @@ async def test_auto_delete_processor_with_connections(
     # First try to delete the LogAttribute processor (which has an incoming connection) with Auto-Delete disabled
     headers_auto_delete_false = {**mcp_headers, "X-Mcp-Auto-Delete-Enabled": "false"}
     delete_args = {
-        "object_type": "processor",
-        "object_id": log_proc_id,  # Try to delete LogAttribute processor
-        "kwargs": {}
+        "deletion_requests": [{
+            "object_type": "processor",
+            "object_id": log_proc_id,
+            "name": "mcp-test-auto-delete-false"
+        }]
     }
     delete_result_list = await call_tool(
         client=async_client,
         base_url=base_url,
-        tool_name="delete_nifi_object",
+        tool_name="delete_nifi_objects",
         arguments=delete_args,
         headers=headers_auto_delete_false,
         custom_logger=global_logger
@@ -254,14 +260,16 @@ async def test_auto_delete_processor_with_connections(
     # Now try to delete the LogAttribute processor with Auto-Delete enabled
     headers_auto_delete_true = {**mcp_headers, "X-Mcp-Auto-Delete-Enabled": "true"}
     delete_args = {
-        "object_type": "processor",
-        "object_id": log_proc_id,  # Try to delete LogAttribute processor
-        "kwargs": {}
+        "deletion_requests": [{
+            "object_type": "processor",
+            "object_id": log_proc_id,
+            "name": "mcp-test-auto-delete-true"
+        }]
     }
     delete_result_list = await call_tool(
         client=async_client,
         base_url=base_url,
-        tool_name="delete_nifi_object",
+        tool_name="delete_nifi_objects",
         arguments=delete_args,
         headers=headers_auto_delete_true,
         custom_logger=global_logger

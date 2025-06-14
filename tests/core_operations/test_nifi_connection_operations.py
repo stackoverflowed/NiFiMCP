@@ -35,8 +35,8 @@ async def test_create_and_verify_connection(
     conn_result_list = await call_tool(
         client=async_client,
         base_url=base_url,
-        tool_name="create_nifi_connection",
-        arguments=connect_args,
+        tool_name="create_nifi_connections",
+        arguments={"connections": [connect_args]},
         headers=mcp_headers,
         custom_logger=global_logger
     )
@@ -94,8 +94,8 @@ async def test_delete_connection(
     conn_result_list = await call_tool(
         client=async_client,
         base_url=base_url,
-        tool_name="create_nifi_connection",
-        arguments=connect_args,
+        tool_name="create_nifi_connections",
+        arguments={"connections": [connect_args]},
         headers=mcp_headers,
         custom_logger=global_logger
     )
@@ -105,14 +105,16 @@ async def test_delete_connection(
 
     # Now delete the connection
     delete_args = {
-        "object_type": "connection",
-        "object_id": connection_id,
-        "kwargs": {}
+        "deletion_requests": [{
+            "object_type": "connection",
+            "object_id": connection_id,
+            "name": f"test-connection-{connection_id}"
+        }]
     }
     delete_result_list = await call_tool(
         client=async_client,
         base_url=base_url,
-        tool_name="delete_nifi_object",
+        tool_name="delete_nifi_objects",
         arguments=delete_args,
         headers=mcp_headers,
         custom_logger=global_logger
@@ -184,8 +186,8 @@ async def test_auto_purge_connection_with_queued_data(
     conn_result_list = await call_tool(
         client=async_client,
         base_url=base_url,
-        tool_name="create_nifi_connection",
-        arguments=connect_args,
+        tool_name="create_nifi_connections",
+        arguments={"connections": [connect_args]},
         headers=mcp_headers,
         custom_logger=global_logger
     )
@@ -250,14 +252,16 @@ async def test_auto_purge_connection_with_queued_data(
     # Attempt delete with Auto-Purge enabled
     headers_auto_purge_true = {**mcp_headers, "X-Mcp-Auto-Purge-Enabled": "true"}
     delete_args = {
-        "object_type": "connection",
-        "object_id": connection_id,
-        "kwargs": {}
+        "deletion_requests": [{
+            "object_type": "connection",
+            "object_id": connection_id,
+            "name": f"test-connection-auto-purge-{connection_id}"
+        }]
     }
     delete_result_list = await call_tool(
         client=async_client,
         base_url=base_url,
-        tool_name="delete_nifi_object",
+        tool_name="delete_nifi_objects",
         arguments=delete_args,
         headers=headers_auto_purge_true,
         custom_logger=global_logger
@@ -289,8 +293,8 @@ async def test_auto_purge_connection_with_queued_data(
     new_conn_result_list = await call_tool(
         client=async_client,
         base_url=base_url,
-        tool_name="create_nifi_connection",
-        arguments=connect_args,
+        tool_name="create_nifi_connections",
+        arguments={"connections": [connect_args]},
         headers=mcp_headers,
         custom_logger=global_logger
     )
@@ -339,14 +343,16 @@ async def test_auto_purge_connection_with_queued_data(
     # Attempt delete with Auto-Purge disabled
     headers_auto_purge_false = {**mcp_headers, "X-Mcp-Auto-Purge-Enabled": "false"}
     delete_args = {
-        "object_type": "connection",
-        "object_id": new_connection_id,
-        "kwargs": {}
+        "deletion_requests": [{
+            "object_type": "connection",
+            "object_id": new_connection_id,
+            "name": f"test-connection-auto-purge-disabled-{new_connection_id}"
+        }]
     }
     delete_result_list = await call_tool(
         client=async_client,
         base_url=base_url,
-        tool_name="delete_nifi_object",
+        tool_name="delete_nifi_objects",
         arguments=delete_args,
         headers=headers_auto_purge_false,
         custom_logger=global_logger
@@ -395,8 +401,8 @@ async def test_purge_single_connection(
     conn_result_list = await call_tool(
         client=async_client,
         base_url=base_url,
-        tool_name="create_nifi_connection",
-        arguments=connect_args,
+        tool_name="create_nifi_connections",
+        arguments={"connections": [connect_args]},
         headers=mcp_headers,
         custom_logger=global_logger
     )
@@ -517,8 +523,8 @@ async def test_purge_process_group(
         proc_result_list = await call_tool(
             client=async_client,
             base_url=base_url,
-            tool_name="create_nifi_processor",
-            arguments=create_proc_args,
+            tool_name="create_nifi_processors",
+            arguments={"processors": [create_proc_args]},
             headers=mcp_headers,
             custom_logger=global_logger
         )
@@ -580,8 +586,8 @@ async def test_purge_process_group(
         conn_result_list = await call_tool(
             client=async_client,
             base_url=base_url,
-            tool_name="create_nifi_connection",
-            arguments=connect_args,
+            tool_name="create_nifi_connections",
+            arguments={"connections": [connect_args]},
             headers=mcp_headers,
             custom_logger=global_logger
         )
@@ -710,16 +716,20 @@ async def test_purge_process_group(
         for conn_id in connections:
             try:
                 delete_args = {
-                    "object_type": "connection",
-                    "object_id": conn_id,
-                    "kwargs": {"auto_purge_enabled": "true"}  # Enable auto-purge for cleanup
+                    "deletion_requests": [{
+                        "object_type": "connection",
+                        "object_id": conn_id,
+                        "name": f"cleanup-connection-{conn_id}"
+                    }]
                 }
+                # Use auto-purge enabled headers for cleanup
+                cleanup_headers = {**mcp_headers, "X-Mcp-Auto-Purge-Enabled": "true"}
                 await call_tool(
                     client=async_client,
                     base_url=base_url,
-                    tool_name="delete_nifi_object",
+                    tool_name="delete_nifi_objects",
                     arguments=delete_args,
-                    headers=mcp_headers,
+                    headers=cleanup_headers,
                     custom_logger=global_logger
                 )
             except Exception as e:
@@ -729,16 +739,20 @@ async def test_purge_process_group(
         for proc_id in processors:  # Only delete the ones we created
             try:
                 delete_args = {
-                    "object_type": "processor",
-                    "object_id": proc_id,
-                    "kwargs": {}
+                    "deletion_requests": [{
+                        "object_type": "processor",
+                        "object_id": proc_id,
+                        "name": f"cleanup-processor-{proc_id}"
+                    }]
                 }
+                # Use auto-stop enabled headers for cleanup
+                cleanup_headers = {**mcp_headers, "X-Mcp-Auto-Stop-Enabled": "true"}
                 await call_tool(
                     client=async_client,
                     base_url=base_url,
-                    tool_name="delete_nifi_object",
+                    tool_name="delete_nifi_objects",
                     arguments=delete_args,
-                    headers=mcp_headers,
+                    headers=cleanup_headers,
                     custom_logger=global_logger
                 )
             except Exception as e:

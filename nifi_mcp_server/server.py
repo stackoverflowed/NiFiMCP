@@ -68,9 +68,9 @@ from .api_tools import review # Imports list_*, get_*, document_*
 from .api_tools import creation
 from .api_tools import modification
 from .api_tools import operation
-from .api_tools import lookup
+from .api_tools import helpers
 # Add other tool module imports here as they are created
-# from .api_tools import lookup
+# from .api_tools import helpers
 # ---------------------------------------------------------------------
 
 # --- Import Config Settings --- #
