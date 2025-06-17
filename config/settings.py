@@ -37,6 +37,18 @@ DEFAULT_APP_CONFIG = {
     },
     'logging': {
         'llm_enqueue_enabled': True
+    },
+    'workflows': {
+        'execution_mode': 'unguided',  # unguided | guided
+        'default_action_limit': 10,
+        'retry_attempts': 3,
+        'enabled_workflows': [
+            'unguided_mimic',
+            'documentation',
+            'review_analysis',
+            'build_new',
+            'build_modify'
+        ]
     }
 }
 
@@ -204,6 +216,39 @@ print(f"  Auto-Purge Enabled: {get_feature_auto_purge_enabled()}")
 print("\nLogging Configuration:")
 print(f"  LLM Enqueue Enabled: {get_llm_enqueue_enabled()}")
 print(f"  Interface Debug Enabled: {get_interface_debug_enabled()}")
+
+# --- Workflow Configuration Accessors ---
+
+def get_workflow_config() -> dict:
+    """Returns the loaded workflow configuration."""
+    return _APP_CONFIG.get('workflows', {})
+
+def get_workflow_execution_mode() -> str:
+    """Returns the current workflow execution mode (unguided | guided)."""
+    return _APP_CONFIG.get('workflows', {}).get('execution_mode', DEFAULT_APP_CONFIG['workflows']['execution_mode'])
+
+def get_workflow_action_limit() -> int:
+    """Returns the default action limit for workflow steps."""
+    return _APP_CONFIG.get('workflows', {}).get('default_action_limit', DEFAULT_APP_CONFIG['workflows']['default_action_limit'])
+
+def get_workflow_retry_attempts() -> int:
+    """Returns the number of retry attempts for workflow steps."""
+    return _APP_CONFIG.get('workflows', {}).get('retry_attempts', DEFAULT_APP_CONFIG['workflows']['retry_attempts'])
+
+def get_enabled_workflows() -> list[str]:
+    """Returns the list of enabled workflows."""
+    return _APP_CONFIG.get('workflows', {}).get('enabled_workflows', DEFAULT_APP_CONFIG['workflows']['enabled_workflows'])
+
+def is_workflow_enabled(workflow_name: str) -> bool:
+    """Returns True if the specified workflow is enabled."""
+    return workflow_name in get_enabled_workflows()
+
+# Print Workflow Configuration status
+print("\nWorkflow Configuration:")
+print(f"  Execution Mode: {get_workflow_execution_mode()}")
+print(f"  Default Action Limit: {get_workflow_action_limit()}")
+print(f"  Retry Attempts: {get_workflow_retry_attempts()}")
+print(f"  Enabled Workflows: {get_enabled_workflows()}")
 
 # --- Deprecated Functions (Keep temporarily for reference/smooth transition if needed, but remove eventually) ---
 

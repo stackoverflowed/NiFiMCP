@@ -22,7 +22,8 @@ dependencies = [
     "docstring_parser>=0.16",
     "st-copy-to-clipboard>=0.1.6",
     "pytest>=8.0.0",
-    "anyio>=4.0.0"
+    "anyio>=4.0.0",
+    "pocketflow>=0.0.2"
 ]
 
 [tool.setuptools]

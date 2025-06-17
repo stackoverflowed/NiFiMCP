@@ -84,6 +84,24 @@ from config.settings import get_nifi_servers # Added
 async def lifespan(app: FastAPI):
     # Startup logic
     logger.info("FastAPI server starting up...")
+    
+    # Configure logging for server context
+    try:
+        from config.logging_setup import setup_logging
+        setup_logging('server')
+        logger.info("Server logging configured")
+    except Exception as e:
+        logger.error(f"Failed to configure server logging: {e}", exc_info=True)
+    
+    # Configure LLM clients for workflow execution
+    try:
+        from nifi_chat_ui.chat_manager import configure_llms
+        configure_llms()
+        logger.info("LLM clients configured for workflow execution")
+    except Exception as e:
+        logger.error(f"Failed to configure LLM clients: {e}", exc_info=True)
+        logger.warning("Workflows may not be able to call LLMs")
+    
     if not get_nifi_servers():
         logger.warning("*******************************************************")
         logger.warning("*** No NiFi servers configured in config.yaml!      ***")
@@ -494,13 +512,198 @@ async def execute_tool(
             await nifi_client.close() # Ensure connection is closed after request
         # -------------------------- #
 
-# --- Cleanup Function (REMOVED - Logic moved to lifespan) --- #
-# async def cleanup():
-#     logger.info("Running cleanup...")
-#     # No global client to close anymore
-#     # if nifi_api_client:
-#     #     await nifi_api_client.close()
-#     logger.info("Cleanup finished.")
+# --- Workflow Endpoints --- #
+
+from pydantic import BaseModel
+
+class WorkflowExecutionPayload(BaseModel):
+    workflow_name: str
+    initial_context: Optional[Dict[str, Any]] = None
+    context: Optional[ContextModel] = None
+
+@app.get("/workflows", response_model=List[Dict[str, Any]], tags=["Workflows"])
+async def list_workflows(
+    request: Request,
+    category: Optional[str] = Query(None),
+    phase: Optional[str] = Query(None),
+    enabled_only: bool = Query(True)
+):
+    """List available workflows with optional filtering."""
+    user_request_id = request.state.user_request_id
+    action_id = request.state.action_id
+    bound_logger = logger.bind(user_request_id=user_request_id, action_id=action_id)
+    
+    bound_logger.info(f"Request received for /workflows (category={category}, phase={phase}, enabled_only={enabled_only})")
+    
+    try:
+        # Import workflows to ensure registration
+        from nifi_mcp_server.workflows import get_workflow_registry
+        
+        registry = get_workflow_registry()
+        workflows = registry.list_workflows(category=category, phase=phase, enabled_only=enabled_only)
+        
+        result = [workflow.to_dict() for workflow in workflows]
+        bound_logger.info(f"Returning {len(result)} workflows")
+        return result
+        
+    except Exception as e:
+        bound_logger.error(f"Error retrieving workflows: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error retrieving workflows")
+
+@app.get("/workflows/{workflow_name}", response_model=Dict[str, Any], tags=["Workflows"])
+async def get_workflow_info(
+    workflow_name: str,
+    request: Request
+):
+    """Get detailed information about a specific workflow."""
+    user_request_id = request.state.user_request_id
+    action_id = request.state.action_id
+    bound_logger = logger.bind(user_request_id=user_request_id, action_id=action_id, workflow_name=workflow_name)
+    
+    bound_logger.info(f"Request received for workflow info: {workflow_name}")
+    
+    try:
+        from nifi_mcp_server.workflows import get_workflow_registry
+        
+        registry = get_workflow_registry()
+        workflow_info = registry.get_workflow_info(workflow_name)
+        
+        if not workflow_info:
+            bound_logger.warning(f"Workflow not found: {workflow_name}")
+            raise HTTPException(status_code=404, detail=f"Workflow '{workflow_name}' not found")
+            
+        bound_logger.info(f"Returning workflow info for: {workflow_name}")
+        return workflow_info
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        bound_logger.error(f"Error retrieving workflow info for {workflow_name}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error retrieving workflow info")
+
+@app.post("/workflows/execute", tags=["Workflows"])
+async def execute_workflow(
+    payload: WorkflowExecutionPayload,
+    request: Request,
+    nifi_server_id: Optional[str] = Header(None, alias="X-Nifi-Server-Id")
+):
+    """Execute a workflow with the specified context."""
+    user_request_id = request.state.user_request_id
+    action_id = request.state.action_id
+    workflow_name = payload.workflow_name
+    bound_logger = logger.bind(
+        user_request_id=user_request_id, 
+        action_id=action_id,
+        workflow_name=workflow_name,
+        nifi_server_id=nifi_server_id
+    )
+    
+    bound_logger.info(f"Request received to execute workflow: {workflow_name}")
+    
+    # --- NiFi Server ID Check --- #
+    if not get_nifi_servers():
+        bound_logger.error("Cannot execute workflow: No NiFi servers are configured in config.yaml.")
+        raise HTTPException(status_code=503, detail="No NiFi servers configured on the server.")
+
+    if not nifi_server_id:
+        bound_logger.warning("Missing X-Nifi-Server-Id header.")
+        raise HTTPException(status_code=400, detail="Missing required header: X-Nifi-Server-Id")
+    # -------------------------- #
+    
+    nifi_client = None
+    client_token = None
+    logger_token = None
+    
+    try:
+        # --- Get NiFi Client for this request --- #
+        bound_logger.debug(f"Attempting to get NiFi client for server ID: {nifi_server_id}")
+        nifi_client = await get_nifi_client(nifi_server_id, bound_logger=bound_logger)
+        bound_logger.debug(f"Successfully obtained authenticated NiFi client for {nifi_server_id}")
+        # -------------------------------------- #
+        
+        # --- Set ContextVars --- #
+        client_token = current_nifi_client.set(nifi_client)
+        logger_token = current_request_logger.set(bound_logger)
+        bound_logger.trace("Set NiFi client and logger in context variables.")
+        # ----------------------- #
+        
+        # --- Execute the workflow --- #
+        from nifi_mcp_server.workflows import get_workflow_registry
+        
+        registry = get_workflow_registry()
+        executor = registry.create_executor(workflow_name)
+        
+        if not executor:
+            bound_logger.warning(f"Could not create executor for workflow: {workflow_name}")
+            raise HTTPException(status_code=404, detail=f"Workflow '{workflow_name}' not found or disabled")
+            
+        # Prepare initial context
+        initial_context = payload.initial_context or {}
+        initial_context.update({
+            "user_request_id": user_request_id,
+            "action_id": action_id,
+            "nifi_server_id": nifi_server_id,
+            "workflow_name": workflow_name
+        })
+        
+        bound_logger.info(f"Executing workflow: {workflow_name}")
+        result = executor.execute(initial_context=initial_context)
+        
+        bound_logger.info(f"Workflow execution completed: {workflow_name} - {result.get('status', 'unknown')}")
+        return result
+        
+    except HTTPException:
+        raise
+    except ValueError as e:
+        bound_logger.error(f"Value error during workflow execution: {e}", exc_info=True)
+        raise HTTPException(status_code=400, detail=str(e))
+    except NiFiAuthenticationError as e:
+        bound_logger.error(f"NiFi authentication failed for server {nifi_server_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=503, detail=f"Failed to authenticate with NiFi server: {nifi_server_id}")
+    except Exception as e:
+        bound_logger.error(f"Unexpected error executing workflow '{workflow_name}': {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error during workflow execution")
+    finally:
+        # --- Reset ContextVars --- #
+        if client_token:
+            current_nifi_client.reset(client_token)
+            bound_logger.trace("Reset NiFi client context variable.")
+        if logger_token:
+            current_request_logger.reset(logger_token)
+            bound_logger.trace("Reset request logger context variable.")
+        # ------------------------ #
+        # --- Clean up NiFi Client --- #
+        if nifi_client:
+            bound_logger.debug(f"Closing NiFi client connection for server ID: {nifi_server_id}")
+            await nifi_client.close()
+        # -------------------------- #
+
+@app.get("/workflows/validate/{workflow_name}", response_model=Dict[str, Any], tags=["Workflows"])
+async def validate_workflow(
+    workflow_name: str,
+    request: Request
+):
+    """Validate a workflow definition."""
+    user_request_id = request.state.user_request_id
+    action_id = request.state.action_id
+    bound_logger = logger.bind(user_request_id=user_request_id, action_id=action_id, workflow_name=workflow_name)
+    
+    bound_logger.info(f"Request received for workflow validation: {workflow_name}")
+    
+    try:
+        from nifi_mcp_server.workflows import get_workflow_registry
+        
+        registry = get_workflow_registry()
+        validation_result = registry.validate_workflow(workflow_name)
+        
+        bound_logger.info(f"Workflow validation completed: {workflow_name} - {'valid' if validation_result['valid'] else 'invalid'}")
+        return validation_result
+        
+    except Exception as e:
+        bound_logger.error(f"Error validating workflow {workflow_name}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error during workflow validation")
+
+# --- End Workflow Endpoints --- #
 
 # Run with uvicorn if this module is run directly
 if __name__ == "__main__":

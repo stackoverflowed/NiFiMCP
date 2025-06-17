@@ -325,9 +325,18 @@ async def test_auto_stop_update_running_processor(
         custom_logger=global_logger
     )
     # Now that Auto-Stop is implemented, expect success
-    assert update_result_list[0].get("status") == "success", \
+    update_result = update_result_list[0]
+    assert update_result.get("status") == "success", \
         "Expected success with Auto-Stop enabled (feature is now implemented)"
     global_logger.info("Test: Got expected success with Auto-Stop enabled")
+    
+    # Verify the enhanced return structure includes restart information
+    assert "property_update" in update_result, "Expected property_update in response"
+    assert "restart_status" in update_result, "Expected restart_status in response"
+    assert update_result["property_update"]["status"] == "success", "Property update should be successful"
+    assert update_result["restart_status"]["status"] == "success", "Restart should be successful"
+    assert update_result["restart_status"]["final_state"] == "RUNNING", "Final state should be RUNNING"
+    global_logger.info("Test: Verified enhanced return structure with restart information")
 
     # Verify processor was stopped and restarted, and properties were updated
     verify_result_list = await call_tool(
@@ -338,29 +347,20 @@ async def test_auto_stop_update_running_processor(
         headers=mcp_headers,
         custom_logger=global_logger
     )
-    # Processor should be stopped after the update (Auto-Stop stops it but doesn't restart)
-    assert verify_result_list[0].get("component", {}).get("state") == "STOPPED", \
-        "Processor should be stopped after Auto-Stop update"
+    # With the new auto-restart feature, processor should be running again since it was originally running and config is valid
+    assert verify_result_list[0].get("component", {}).get("state") == "RUNNING", \
+        "Processor should be auto-restarted after Auto-Stop update (new auto-restart feature)"
     
     # Verify the property was updated
     updated_properties = verify_result_list[0].get("component", {}).get("config", {}).get("properties", {})
     updated_file_size = updated_properties.get("File Size")
     assert updated_file_size == target_file_size, \
         f"File Size property should have been updated. Expected '{target_file_size}', got '{updated_file_size}'"
-    global_logger.info(f"Test: Confirmed processor {generate_proc_id} was stopped and File Size updated to {target_file_size}")
+    global_logger.info(f"Test: Confirmed processor {generate_proc_id} was auto-restarted and File Size updated to {target_file_size}")
 
-    # Restart the processor for the Auto-Stop disabled test
-    start_result_list = await call_tool(
-        client=async_client,
-        base_url=base_url,
-        tool_name="operate_nifi_object",
-        arguments=start_args,
-        headers=mcp_headers,
-        custom_logger=global_logger
-    )
-    assert start_result_list[0].get("status") == "success", "Failed to restart processor for disabled test"
-    global_logger.info(f"Test: Restarted processor {generate_proc_id} for Auto-Stop disabled test")
-    await asyncio.sleep(1)  # Brief pause after starting
+    # Processor is already running due to auto-restart, so we can proceed directly to the Auto-Stop disabled test
+    # No need to manually restart since auto-restart feature already did it
+    global_logger.info(f"Test: Processor {generate_proc_id} is already running due to auto-restart feature")
 
     # Attempt update with Auto-Stop disabled - should fail because processor is running
     headers_auto_stop_false = {**mcp_headers, "X-Mcp-Auto-Stop-Enabled": "false"}

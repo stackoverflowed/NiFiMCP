@@ -72,6 +72,18 @@ def _format_processor_type_summary(processor_type_data: Dict) -> Dict:
         "tags": processor_type_data.get("tags", []), # Ensure tags is a list
     }
 
+def _format_controller_service_type_summary(service_type_data: Dict) -> Dict:
+    """Formats the controller service type data for the lookup tool response."""
+    bundle = service_type_data.get("bundle", {})
+    return {
+        "type": service_type_data.get("type"),
+        "bundle_group": bundle.get("group"),
+        "bundle_artifact": bundle.get("artifact"),
+        "bundle_version": bundle.get("version"),
+        "description": service_type_data.get("description"),
+        "tags": service_type_data.get("tags", []), # Ensure tags is a list
+    }
+
 @mcp.tool()
 @tool_phases(["Build", "Modify"])
 async def lookup_nifi_processor_type(
@@ -151,6 +163,127 @@ async def lookup_nifi_processor_type(
         raise ToolError(f"Failed to lookup NiFi processor types: {e}")
     except Exception as e:
         local_logger.error(f"Unexpected error looking up processor types: {e}", exc_info=True)
+        local_logger.bind(interface="nifi", direction="response", data={"error": str(e)}).debug("Received unexpected error from NiFi API")
+        raise ToolError(f"An unexpected error occurred: {e}")
+
+
+@mcp.tool()
+@tool_phases(["Build", "Modify"])
+async def get_controller_service_types(
+    service_name: str | None = None,
+    bundle_artifact_filter: str | None = None
+) -> Union[List[Dict], Dict]:
+    """
+    Retrieves available NiFi controller service types, optionally filtered by name or bundle.
+    
+    This tool provides type discovery capabilities for controller services and supports
+    enhanced error handling when invalid service types are provided to creation tools.
+
+    Args:
+        service_name: Optional. Filter by service display name (e.g., 'DBCPConnectionPool'). Case-insensitive.
+        bundle_artifact_filter: Optional. Filter by bundle artifact (e.g., 'nifi-dbcp-service-nar'). Case-insensitive.
+
+    Returns:
+        - If service_name provided and one match: A dictionary with service type details.
+        - If service_name provided and multiple matches: A list of matching dictionaries.
+        - If service_name provided and no matches: An empty list.
+        - If no service_name provided: A list of all available controller service types.
+        
+    Each service type dictionary includes:
+        - type: Full Java class name
+        - bundle_group: Bundle group identifier  
+        - bundle_artifact: Bundle artifact name
+        - bundle_version: Bundle version
+        - description: Service description
+        - tags: List of associated tags
+    """
+    # Get client and logger from context
+    nifi_client: Optional[NiFiClient] = current_nifi_client.get()
+    local_logger = current_request_logger.get() or logger
+    if not nifi_client:
+        raise ToolError("NiFi client context is not set. This tool requires the X-Nifi-Server-Id header.")
+    if not local_logger:
+         raise ToolError("Request logger context is not set.")
+         
+    # Authentication handled by factory
+    from ..request_context import current_user_request_id, current_action_id
+    user_request_id = current_user_request_id.get() or "-"
+    action_id = current_action_id.get() or "-"
+    
+    local_logger = local_logger.bind(service_name=service_name, bundle_artifact_filter=bundle_artifact_filter)
+    
+    if service_name:
+        local_logger.info(f"Looking up controller service type details for name: '{service_name}'")
+    else:
+        local_logger.info("Retrieving all available controller service types")
+        
+    try:
+        nifi_req = {"operation": "get_controller_service_types"}
+        local_logger.bind(interface="nifi", direction="request", data=nifi_req).debug("Calling NiFi API")
+        all_types = await nifi_client.get_controller_service_types(user_request_id=user_request_id, action_id=action_id)
+        nifi_resp = {"controller_service_type_count": len(all_types)}
+        local_logger.bind(interface="nifi", direction="response", data=nifi_resp).debug("Received from NiFi API")
+
+        if not service_name:
+            # Return all types, optionally filtered by bundle
+            results = []
+            filter_artifact_lower = bundle_artifact_filter.lower() if bundle_artifact_filter else None
+            
+            for service_type in all_types:
+                if filter_artifact_lower:
+                    bundle = service_type.get("bundle", {})
+                    artifact = bundle.get("artifact", "").lower()
+                    if artifact == filter_artifact_lower:
+                        results.append(_format_controller_service_type_summary(service_type))
+                else:
+                    results.append(_format_controller_service_type_summary(service_type))
+                    
+            local_logger.info(f"Returning {len(results)} controller service type(s)")
+            return results
+
+        # Search for specific service name
+        matches = []
+        search_name_lower = service_name.lower()
+        filter_artifact_lower = bundle_artifact_filter.lower() if bundle_artifact_filter else None
+
+        for service_type in all_types:
+            # Extract relevant fields, ensuring they are strings and lowercased
+            title = service_type.get("title", "").lower()
+            type_str = service_type.get("type", "").lower()
+            description = service_type.get("description", "").lower()
+            tags = [tag.lower() for tag in service_type.get("tags", [])] # Lowercase all tags
+
+            # Check if the search term is present in any relevant field
+            name_match_found = (
+                search_name_lower in title or
+                search_name_lower in type_str or
+                search_name_lower in description or
+                any(search_name_lower in tag for tag in tags)
+            )
+
+            if name_match_found:
+                # Apply bundle artifact filter if specified
+                if filter_artifact_lower:
+                    bundle = service_type.get("bundle", {})
+                    artifact = bundle.get("artifact", "").lower()
+                    if artifact == filter_artifact_lower: # Check lowercase artifact
+                        matches.append(_format_controller_service_type_summary(service_type))
+                else:
+                    matches.append(_format_controller_service_type_summary(service_type))
+
+        local_logger.info(f"Found {len(matches)} match(es) for '{service_name}'")
+        
+        if len(matches) == 1:
+            return matches[0]
+        else:
+            return matches
+        
+    except (NiFiAuthenticationError, ConnectionError, ToolError) as e:
+        local_logger.error(f"API/Tool error looking up controller service types: {e}", exc_info=False)
+        local_logger.bind(interface="nifi", direction="response", data={"error": str(e)}).debug("Received error from NiFi API")
+        raise ToolError(f"Failed to lookup NiFi controller service types: {e}")
+    except Exception as e:
+        local_logger.error(f"Unexpected error looking up controller service types: {e}", exc_info=True)
         local_logger.bind(interface="nifi", direction="response", data={"error": str(e)}).debug("Received unexpected error from NiFi API")
         raise ToolError(f"An unexpected error occurred: {e}")
 

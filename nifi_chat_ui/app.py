@@ -255,6 +255,105 @@ with st.sidebar:
         st.warning("No NiFi servers configured or reachable on the backend.")
     # ----------------------------- #
 
+    # --- Workflow Configuration --- 
+    st.markdown("---") # Add separator
+    
+    # Initialize workflow session state
+    if "workflow_execution_mode" not in st.session_state:
+        st.session_state.workflow_execution_mode = config.get_workflow_execution_mode()
+    if "selected_workflow" not in st.session_state:
+        st.session_state.selected_workflow = None
+    if "available_workflows" not in st.session_state:
+        st.session_state.available_workflows = []
+    
+    # Execution Mode Selection
+    execution_modes = ["unguided", "guided"]
+    current_mode_index = execution_modes.index(st.session_state.workflow_execution_mode) if st.session_state.workflow_execution_mode in execution_modes else 0
+    
+    def on_execution_mode_change():
+        new_mode = st.session_state.execution_mode_selector
+        if st.session_state.workflow_execution_mode != new_mode:
+            st.session_state.workflow_execution_mode = new_mode
+            # Reset workflow selection when mode changes
+            st.session_state.selected_workflow = None
+            logger.info(f"Workflow execution mode changed to: {new_mode}")
+    
+    st.selectbox(
+        "Execution Mode:",
+        options=execution_modes,
+        index=current_mode_index,
+        key="execution_mode_selector",
+        on_change=on_execution_mode_change,
+        help="Select workflow execution mode: 'unguided' for free-form chat, 'guided' for structured workflows"
+    )
+    
+    # Workflow Selection (only shown in guided mode)
+    if st.session_state.workflow_execution_mode == "guided":
+        try:
+            # Fetch available workflows from the backend
+            from nifi_mcp_server.workflows.registry import get_workflow_registry
+            registry = get_workflow_registry()
+            workflows = registry.list_workflows(enabled_only=True)
+            
+            if workflows:
+                workflow_options = {w.name: w.display_name for w in workflows}
+                workflow_names = list(workflow_options.keys())
+                
+                # Function to update selected workflow
+                def on_workflow_change():
+                    selected_name = st.session_state.workflow_selector
+                    if st.session_state.selected_workflow != selected_name:
+                        st.session_state.selected_workflow = selected_name
+                        logger.info(f"Selected workflow: {selected_name}")
+                
+                # Determine default selection - initialize if not set
+                if not st.session_state.selected_workflow and workflow_names:
+                    st.session_state.selected_workflow = workflow_names[0]
+                    logger.info(f"Auto-selected first workflow: {workflow_names[0]}")
+                
+                current_workflow = st.session_state.selected_workflow
+                try:
+                    default_workflow_index = workflow_names.index(current_workflow) if current_workflow in workflow_names else 0
+                except (ValueError, IndexError):
+                    default_workflow_index = 0
+                
+                selected_workflow_name = st.selectbox(
+                    "Select Workflow:",
+                    options=workflow_names,
+                    format_func=lambda name: workflow_options.get(name, name),
+                    index=default_workflow_index,
+                    key="workflow_selector",
+                    on_change=on_workflow_change,
+                    help="Choose a guided workflow to execute"
+                )
+                
+                # Ensure session state is synchronized with current selection
+                if selected_workflow_name != st.session_state.selected_workflow:
+                    st.session_state.selected_workflow = selected_workflow_name
+                    logger.info(f"Synchronized workflow selection: {selected_workflow_name}")
+                
+                # Show workflow details if one is selected
+                if st.session_state.selected_workflow:
+                    workflow_info = registry.get_workflow_info(st.session_state.selected_workflow)
+                    if workflow_info:
+                        with st.expander("ℹ️ Workflow Details", expanded=False):
+                            st.markdown(f"**Category:** {workflow_info.get('category', 'N/A')}")
+                            st.markdown(f"**Description:** {workflow_info.get('description', 'No description')}")
+                            phases = workflow_info.get('phases', [])
+                            if phases:
+                                st.markdown(f"**Phases:** {', '.join(phases)}")
+                            nodes_count = workflow_info.get('nodes_count', 0)
+                            if nodes_count > 0:
+                                st.markdown(f"**Steps:** {nodes_count}")
+            else:
+                st.warning("No guided workflows available")
+                
+        except Exception as e:
+            logger.error(f"Error loading workflows: {e}", exc_info=True)
+            st.warning("Unable to load workflows. Check server connection.")
+    
+    # ----------------------------- #
+
     # --- Phase Selection --- 
     st.markdown("---") # Add separator
     phase_options = ["All", "Review", "Build", "Modify", "Operate"]
@@ -539,6 +638,215 @@ Keep this concise but informative.
         bound_logger.error(f"Failed to generate status report: {e}", exc_info=True)
         # Fail silently - status report is optional
         bound_logger.info("Status report failed, but continuing normally")
+
+# --- Workflow Execution Function ---
+def run_workflow_execution(workflow_name: str, provider: str, model_name: str, base_sys_prompt: str, user_req_id: str):
+    """Runs a guided workflow execution."""
+    bound_logger = logger.bind(user_request_id=user_req_id)
+    
+    # Track execution timing like unguided mode
+    execution_start_time = time.time()
+    
+    try:
+        # Get workflow registry
+        from nifi_mcp_server.workflows.registry import get_workflow_registry
+        registry = get_workflow_registry()
+        
+        # Create workflow executor
+        executor = registry.create_executor(workflow_name)
+        if not executor:
+            error_msg = f"Failed to create executor for workflow: {workflow_name}"
+            bound_logger.error(error_msg)
+            with st.chat_message("assistant"):
+                st.markdown(f"❌ **Error:** {error_msg}")
+            st.session_state.messages.append({
+                "role": "assistant",
+                "content": f"❌ **Error:** {error_msg}"
+            })
+            return
+        
+        bound_logger.info(f"Starting guided workflow execution: {workflow_name}")
+        
+        # Display workflow start message
+        with st.chat_message("assistant"):
+            st.markdown(f"🚀 **Starting guided workflow:** {workflow_name}")
+            st.markdown("*The workflow will execute multiple LLM iterations with tool calls. Please wait for completion...*")
+        
+        st.session_state.messages.append({
+            "role": "assistant",
+            "content": f"🚀 **Starting guided workflow:** {workflow_name}\n\n*The workflow will execute multiple LLM iterations with tool calls. Please wait for completion...*"
+        })
+        
+        # Prepare execution context - match the unguided mode context construction
+        current_objective = st.session_state.get("current_objective", "")
+        if current_objective and current_objective.strip():
+            effective_system_prompt = f"{base_sys_prompt}\n\n## Current Objective\n{current_objective.strip()}"
+            bound_logger.debug("Objective found, appending to base system prompt for workflow.")
+        else:
+            effective_system_prompt = base_sys_prompt
+            bound_logger.debug("No objective set, using base system prompt for workflow.")
+        
+        context = {
+            "provider": provider,
+            "model_name": model_name,
+            "system_prompt": effective_system_prompt,  # Use the effective system prompt with objective
+            "user_request_id": user_req_id,
+            "messages": st.session_state.messages.copy(),
+            "selected_nifi_server_id": st.session_state.get("selected_nifi_server_id"),
+            "selected_phase": st.session_state.get("selected_phase", "All"),
+            "current_objective": current_objective  # Also pass the objective separately for workflow use
+        }
+        
+        # Execute workflow
+        with st.spinner(f"🤔 Thinking... (Guided Workflow: {workflow_name})"):
+            result = executor.execute(context)
+        
+        # Calculate execution duration
+        execution_duration = time.time() - execution_start_time
+        
+        # Check for successful execution - executor returns {"status": "success"} not {"success": True}
+        if result and result.get("status") == "success":
+            bound_logger.info("Workflow execution completed successfully")
+            
+            # Extract the actual workflow results from shared state
+            shared_state = result.get("shared_state", {})
+            workflow_result = shared_state.get("unguided_mimic_result", {})
+            
+            # Get the messages from the workflow execution
+            workflow_messages = workflow_result.get("messages", [])
+            
+            # Get token counts
+            tokens_in = workflow_result.get("total_tokens_in", 0)
+            tokens_out = workflow_result.get("total_tokens_out", 0)
+            total_tokens = tokens_in + tokens_out
+            
+            # Get workflow execution details for summary
+            loop_count = workflow_result.get("loop_count", 0)
+            tool_calls_executed = workflow_result.get("tool_calls_executed", 0)
+            max_iterations_reached = workflow_result.get("max_iterations_reached", False)
+            tool_results = workflow_result.get("tool_results", [])
+            
+            # Extract unique tool names that were executed
+            executed_tools = []
+            if tool_results:
+                tool_names = [result.get("tool_name") for result in tool_results if result.get("tool_name")]
+                # Get unique tool names while preserving order
+                seen = set()
+                executed_tools = [name for name in tool_names if name not in seen and not seen.add(name)]
+            
+            # Extract and display the actual LLM responses from the workflow first
+            if workflow_messages:
+                # Find new messages that aren't already in session state
+                existing_message_count = len(st.session_state.messages) - 1  # Subtract the start message we just added
+                new_messages = workflow_messages[existing_message_count:]
+                
+                for msg in new_messages:
+                    if msg.get("role") == "assistant" and msg.get("content"):
+                        # Display the LLM response
+                        with st.chat_message("assistant"):
+                            st.markdown(msg["content"])
+                        
+                        # Add to session state
+                        st.session_state.messages.append({
+                            "role": "assistant",
+                            "content": msg["content"],
+                            "token_count_in": msg.get("token_count_in", 0),
+                            "token_count_out": msg.get("token_count_out", 0),
+                            "action_id": msg.get("action_id")
+                        })
+                        
+                        bound_logger.info(f"Displayed LLM response from workflow: {len(msg['content'])} characters")
+                    elif msg.get("role") == "tool":
+                        # Handle tool call results if needed
+                        bound_logger.debug(f"Workflow included tool result: {msg.get('tool_call_id', 'unknown')}")
+            
+            # Display workflow completion summary with tokens and duration (like unguided mode)
+            with st.chat_message("assistant"):
+                st.markdown("✅ **Workflow completed successfully**")
+                
+                # Display workflow execution details
+                execution_details = []
+                if loop_count > 0:
+                    execution_details.append(f"{loop_count} iteration{'s' if loop_count != 1 else ''}")
+                if tool_calls_executed > 0:
+                    execution_details.append(f"{tool_calls_executed} tool call{'s' if tool_calls_executed != 1 else ''}")
+                if max_iterations_reached:
+                    execution_details.append("⚠️ max iterations reached")
+                
+                if execution_details:
+                    st.markdown(f"*Executed {', '.join(execution_details)}*")
+                
+                # Display tools that were used
+                if executed_tools:
+                    tools_text = ", ".join(executed_tools)
+                    st.markdown(f"*Tools used: {tools_text}*")
+                
+                # Display workflow summary if available
+                if result.get("message"):
+                    st.markdown(f"*{result['message']}*")
+                
+                # Display token and duration summary like unguided mode
+                if total_tokens > 0:
+                    st.markdown(f"📊 **Workflow Summary:** {total_tokens:,} tokens ({tokens_in:,} in, {tokens_out:,} out) • {execution_duration:.1f}s")
+            
+            # Add the workflow completion message to session state
+            completion_message = "✅ **Workflow completed successfully**"
+            
+            # Add execution details to completion message
+            if execution_details:
+                completion_message += f"\n\n*Executed {', '.join(execution_details)}*"
+            
+            # Add tools used to completion message
+            if executed_tools:
+                tools_text = ", ".join(executed_tools)
+                completion_message += f"\n\n*Tools used: {tools_text}*"
+            
+            if result.get("message"):
+                completion_message += f"\n\n*{result['message']}*"
+            if total_tokens > 0:
+                completion_message += f"\n\n📊 **Workflow Summary:** {total_tokens:,} tokens ({tokens_in:,} in, {tokens_out:,} out) • {execution_duration:.1f}s"
+            
+            st.session_state.messages.append({
+                "role": "assistant",
+                "content": completion_message
+            })
+            
+            # Update session state tracking like unguided mode
+            st.session_state.last_request_duration = execution_duration
+            st.session_state.conversation_total_duration = st.session_state.get("conversation_total_duration", 0) + execution_duration
+            
+            bound_logger.info(f"Workflow completed: {total_tokens} tokens ({tokens_in} in, {tokens_out} out) in {execution_duration:.1f}s")
+        else:
+            # Handle error case - could be status="error" or no result
+            if result:
+                error_msg = result.get("message", f"Workflow failed with status: {result.get('status', 'unknown')}")
+            else:
+                error_msg = "Workflow execution failed - no result returned"
+            bound_logger.error(f"Workflow execution failed: {error_msg}")
+            with st.chat_message("assistant"):
+                st.markdown(f"❌ **Workflow failed:** {error_msg}")
+            
+            st.session_state.messages.append({
+                "role": "assistant",
+                "content": f"❌ **Workflow failed:** {error_msg}"
+            })
+        
+    except Exception as e:
+        bound_logger.error(f"Error in workflow execution: {e}", exc_info=True)
+        with st.chat_message("assistant"):
+            st.markdown(f"❌ **Workflow execution error:** {e}")
+        
+        st.session_state.messages.append({
+            "role": "assistant",
+            "content": f"❌ **Workflow execution error:** {e}"
+        })
+        
+    finally:
+        # Always reset execution state after workflow completion
+        st.session_state.llm_executing = False
+        st.session_state.stop_requested = False
+        # Force a rerun to update the UI back to input mode
+        st.rerun()
 
 # --- Refactored Execution Loop Function --- 
 def run_execution_loop(provider: str, model_name: str, base_sys_prompt: str, user_req_id: str):
@@ -922,8 +1230,40 @@ if is_executing or pending_execution:
         # Extract execution parameters
         provider, model_name, base_system_prompt, user_req_id = pending_execution
         
-        # Call the execution loop
-        run_execution_loop(provider=provider, model_name=model_name, base_sys_prompt=base_system_prompt, user_req_id=user_req_id)
+        # Choose execution mode based on workflow configuration
+        execution_mode = st.session_state.get("workflow_execution_mode", "unguided")
+        
+        if execution_mode == "guided":
+            # Check if a workflow is selected
+            selected_workflow = st.session_state.get("selected_workflow")
+            bound_logger = logger.bind(user_request_id=user_req_id)
+            bound_logger.info(f"Guided mode execution: selected_workflow='{selected_workflow}', execution_mode='{execution_mode}'")
+            
+            if selected_workflow:
+                # Run guided workflow
+                bound_logger.info(f"Starting guided workflow execution: {selected_workflow}")
+                run_workflow_execution(
+                    workflow_name=selected_workflow,
+                    provider=provider, 
+                    model_name=model_name, 
+                    base_sys_prompt=base_system_prompt, 
+                    user_req_id=user_req_id
+                )
+            else:
+                # No workflow selected, show error and fall back to unguided
+                bound_logger.warning(f"Guided mode selected but no workflow chosen (selected_workflow='{selected_workflow}'), falling back to unguided")
+                with st.chat_message("assistant"):
+                    st.markdown("⚠️ **No workflow selected.** Falling back to unguided mode.")
+                st.session_state.messages.append({
+                    "role": "assistant",
+                    "content": "⚠️ **No workflow selected.** Falling back to unguided mode."
+                })
+                
+                # Call the traditional execution loop
+                run_execution_loop(provider=provider, model_name=model_name, base_sys_prompt=base_system_prompt, user_req_id=user_req_id)
+        else:
+            # Call the traditional execution loop
+            run_execution_loop(provider=provider, model_name=model_name, base_sys_prompt=base_system_prompt, user_req_id=user_req_id)
 
 else:
     # Show normal input when not executing and no pending execution

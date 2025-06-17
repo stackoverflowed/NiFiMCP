@@ -765,6 +765,7 @@ dependencies = [
     { name = "loguru" },
     { name = "mcp" },
     { name = "openai" },
+    { name = "pocketflow" },
     { name = "pytest" },
     { name = "python-dotenv" },
     { name = "pyyaml" },
@@ -787,6 +788,7 @@ requires-dist = [
     { name = "loguru", specifier = ">=0.7.0" },
     { name = "mcp", specifier = ">=1.6.0" },
     { name = "openai", specifier = ">=1.0.0" },
+    { name = "pocketflow", specifier = ">=0.0.2" },
     { name = "pytest", specifier = ">=8.0.0" },
     { name = "python-dotenv", specifier = ">=1.1.0" },
     { name = "pyyaml", specifier = ">=6.0" },
@@ -1010,6 +1012,15 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/f9/e2/3e91f31a7d2b083fe6ef3fa267035b518369d9511ffab804f839851d2779/pluggy-1.6.0.tar.gz", hash = "sha256:7dcc130b76258d33b90f61b658791dede3486c3e6bfb003ee5c9bfb396dd22f3", size = 69412 }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/54/20/4d324d65cc6d9205fabedc306948156824eb9f0ee1633355a8f7ec5c66bf/pluggy-1.6.0-py3-none-any.whl", hash = "sha256:e920276dd6813095e9377c0bc5566d94c932c33b27a3e3945d8389c374dd4746", size = 20538 },
+]
+
+[[package]]
+name = "pocketflow"
+version = "0.0.2"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/56/7f/61e567a2dc1d6a8e9999e6b14d593247bc902dc8b0797e0c5ee9b531f50c/pocketflow-0.0.2.tar.gz", hash = "sha256:9249f05223f1b325a99fa4445d5ab69c89afa1e0e4acecdc1e6109936529e1b7", size = 17897 }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/97/a0/3898b9821e571d59aa248c841ed6b5a0197ea813fc0c09623c780d93eee6/pocketflow-0.0.2-py3-none-any.whl", hash = "sha256:16f9cc5cfd68b6e552c736e5b965209b1f464233c62061a2dc3080cb48a22e74", size = 3340 },
 ]
 
 [[package]]

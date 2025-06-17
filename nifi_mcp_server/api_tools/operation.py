@@ -26,17 +26,20 @@ from mcp.server.fastmcp.exceptions import ToolError
 @mcp.tool()
 @tool_phases(["Operate"])
 async def operate_nifi_object(
-    object_type: Literal["processor", "port", "process_group"], # Added "process_group"
+    object_type: Literal["processor", "port", "process_group", "controller_service"],
     object_id: str,
-    operation_type: Literal["start", "stop"]
+    operation_type: Literal["start", "stop", "enable", "disable"]
 ) -> Dict:
     """
-    Starts or stops a specific NiFi processor, port, or all components within a process group.
+    Starts, stops, enables, or disables a specific NiFi object.
 
     Args:
-        object_type: The type of object to operate on ('processor', 'port', or 'process_group').
-        object_id: The UUID of the object (processor, port, or process group).
-        operation_type: The operation to perform ('start' or 'stop'). For 'process_group', applies to all eligible components within.
+        object_type: The type of object to operate on ('processor', 'port', 'process_group', or 'controller_service').
+        object_id: The UUID of the object.
+        operation_type: The operation to perform:
+            - 'start'/'stop': For processors, ports, and process groups
+            - 'enable'/'disable': For controller services
+            - For 'process_group', start/stop applies to all eligible components within
 
     Returns:
         A dictionary indicating the status (success, warning, error) and potentially the updated entity.
@@ -55,8 +58,17 @@ async def operate_nifi_object(
     # Bind args
     local_logger = local_logger.bind(object_type=object_type, object_id=object_id, operation_type=operation_type)
 
+    # Validate operation types for object types
+    if object_type == "controller_service" and operation_type not in ["enable", "disable"]:
+        raise ToolError(f"Invalid operation '{operation_type}' for controller service. Use 'enable' or 'disable'.")
+    elif object_type != "controller_service" and operation_type not in ["start", "stop"]:
+        raise ToolError(f"Invalid operation '{operation_type}' for {object_type}. Use 'start' or 'stop'.")
+
     # Map operation type to NiFi state
-    target_state = "RUNNING" if operation_type == "start" else "STOPPED"
+    if object_type == "controller_service":
+        target_state = "ENABLED" if operation_type == "enable" else "DISABLED"
+    else:
+        target_state = "RUNNING" if operation_type == "start" else "STOPPED"
 
     local_logger.info(f"Executing {operation_type} operation on {object_type} {object_id} (Target State: {target_state})")
 
@@ -270,10 +282,84 @@ async def operate_nifi_object(
                 "entity_summary": filtered_entity # Include summary status counts from response
             }
 
+        # --- Controller Service Logic ---
+        elif object_type == "controller_service":
+            # --- Pre-check for enabling a controller service ---
+            if operation_type == "enable":
+                local_logger.info(f"Performing pre-checks...")
+                try:
+                    nifi_get_req = {"operation": "get_controller_service_details", "controller_service_id": object_id}
+                    local_logger.bind(interface="nifi", direction="request", data=nifi_get_req).debug("Calling NiFi API (pre-check)")
+                    cs_details = await nifi_client.get_controller_service_details(object_id)
+                    component_precheck = cs_details.get("component", {})
+                    precheck_resp = {
+                        "id": object_id,
+                        "validationStatus": component_precheck.get("validationStatus"),
+                        "state": component_precheck.get("state")
+                    }
+                    local_logger.bind(interface="nifi", direction="response", data=precheck_resp).debug("Received from NiFi API (pre-check)")
+
+                    component = cs_details.get("component", {})
+                    validation_status = component.get("validationStatus")
+                    current_state = component.get("state")
+                    validation_errors = component.get("validationErrors", [])
+                    name = component.get("name", object_id)
+
+                    if validation_status != "VALID":
+                        error_list_str = ", ".join(validation_errors) if validation_errors else "No specific errors listed."
+                        error_msg = f"Controller service '{name}' cannot be enabled. Validation status: {validation_status}. Errors: [{error_list_str}]"
+                        local_logger.warning(error_msg)
+                        return {"status": "error", "message": error_msg, "entity": None}
+
+                    local_logger.info(f"Controller service pre-checks passed (Validation: {validation_status}, State: {current_state}). Proceeding with enable.")
+
+                except ValueError as e:
+                    local_logger.warning(f"Controller service not found during enable pre-check: {e}")
+                    local_logger.bind(interface="nifi", direction="response", data={"error": str(e)}).debug("Received error from NiFi API (pre-check)")
+                    return {"status": "error", "message": f"Controller service {object_id} not found.", "entity": None}
+                except Exception as e:
+                    local_logger.error(f"Error during enable pre-check: {e}", exc_info=True)
+                    local_logger.bind(interface="nifi", direction="response", data={"error": str(e)}).debug("Received error from NiFi API (pre-check)")
+                    return {"status": "error", "message": f"Failed pre-enable check: {e}", "entity": None}
+            # --- End of Pre-check ---
+
+            operation_name_for_log = f"{operation_type}_controller_service"
+            nifi_update_req = {"operation": operation_name_for_log, "controller_service_id": object_id, "state": target_state}
+            local_logger.bind(interface="nifi", direction="request", data=nifi_update_req).debug("Calling NiFi API")
+            
+            if operation_type == "enable":
+                updated_entity = await nifi_client.enable_controller_service(object_id)
+            else:  # disable
+                updated_entity = await nifi_client.disable_controller_service(object_id)
+
+            # --- Format and return controller service result ---
+            from .utils import filter_controller_service_data
+            filtered_entity = filter_controller_service_data(updated_entity)
+            local_logger.bind(interface="nifi", direction="response", data=filtered_entity).debug(f"Received from NiFi API ({operation_name_for_log})")
+
+            component = updated_entity.get("component", {})
+            current_state = component.get("state")
+            name = component.get("name", object_id)
+            validation_status = component.get("validationStatus", "UNKNOWN")
+
+            if current_state == target_state:
+                 action = "enabled" if operation_type == "enable" else "disabled"
+                 local_logger.info(f"Successfully {action} controller service '{name}'.")
+                 return {"status": "success", "message": f"Controller service '{name}' {action} successfully.", "entity": filtered_entity}
+            else:
+                # Check for specific error cases if enable failed despite pre-check
+                if operation_type == "enable" and validation_status != "VALID":
+                    local_logger.warning(f"Controller service '{name}' could not be enabled. State: {current_state}, Validation: {validation_status}.")
+                    return {"status": "warning", "message": f"Controller service '{name}' could not be enabled (State: {current_state}, Validation: {validation_status}). Check config.", "entity": filtered_entity}
+                else:
+                     action = "enable" if operation_type == "enable" else "disable"
+                     local_logger.warning(f"Controller service '{name}' state is {current_state} after {action} request. Expected {target_state}.")
+                     return {"status": "warning", "message": f"Controller service '{name}' is {current_state} after {action} request. Check NiFi UI.", "entity": filtered_entity}
+
         # --- Invalid Object Type ---
         else:
             # This case should ideally not be reachable due to Literal typing, but defensive coding is good.
-            raise ToolError(f"Invalid object_type: {object_type}. Must be 'processor', 'port', or 'process_group'.")
+            raise ToolError(f"Invalid object_type: {object_type}. Must be 'processor', 'port', 'process_group', or 'controller_service'.")
 
     # --- General Exception Handling ---
     except ValueError as e: # Catches specific errors like 404s or 409 conflicts raised by client methods

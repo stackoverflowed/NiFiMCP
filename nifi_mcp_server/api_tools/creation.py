@@ -16,7 +16,8 @@ from .utils import (
     filter_connection_data,
     filter_port_data,
     filter_process_group_data,
-    filter_processor_data # Needed for create_nifi_flow
+    filter_processor_data, # Needed for create_nifi_flow
+    filter_controller_service_data  # Add controller service import
 )
 from nifi_mcp_server.nifi_client import NiFiClient, NiFiAuthenticationError
 from mcp.server.fastmcp.exceptions import ToolError
@@ -421,6 +422,91 @@ async def _create_nifi_port_single(
         local_logger.bind(interface="nifi", direction="response", data={"error": str(e)}).debug("Received error from NiFi API")
         return {"status": "error", "message": f"An unexpected error occurred during {port_type} port creation: {e}", "entity": None}
 
+async def _create_controller_service_single(
+    service_type: str,
+    name: str,
+    process_group_id: str,
+    properties: Optional[Dict[str, Any]] = None
+) -> Dict:
+    """
+    Creates a new controller service within a specified NiFi process group.
+
+    Args:
+        service_type: The fully qualified Java class name of the controller service type (e.g., 'org.apache.nifi.dbcp.DBCPConnectionPool').
+        name: The desired name for the new controller service instance.
+        process_group_id: The UUID of the target process group where the controller service should be created.
+        properties: A dictionary containing the controller service's configuration properties.
+
+    Returns:
+        A dictionary reporting the success, warning, or error status of the operation, including the created controller service entity details.
+    """
+    # Get client and logger from context
+    nifi_client: Optional[NiFiClient] = current_nifi_client.get()
+    local_logger = current_request_logger.get() or logger
+    if not nifi_client:
+        raise ToolError("NiFi client context is not set. This tool requires the X-Nifi-Server-Id header.")
+    if not local_logger:
+         raise ToolError("Request logger context is not set.")
+         
+    # Get IDs from context
+    user_request_id = current_user_request_id.get() or "-"
+    action_id = current_action_id.get() or "-"
+
+    local_logger = local_logger.bind(process_group_id=process_group_id)
+    local_logger.info(f"Executing create_controller_service: Type='{service_type}', Name='{name}'")
+
+    try:
+        nifi_request_data = {
+            "operation": "create_controller_service", 
+            "process_group_id": process_group_id,
+            "service_type": service_type,
+            "name": name,
+            "properties": properties
+        }
+        local_logger.bind(interface="nifi", direction="request", data=nifi_request_data).debug("Calling NiFi API")
+        
+        controller_service_entity = await nifi_client.create_controller_service(
+            process_group_id=process_group_id,
+            service_type=service_type,
+            name=name,
+            properties=properties,
+            user_request_id=user_request_id,
+            action_id=action_id
+        )
+        
+        nifi_response_data = filter_controller_service_data(controller_service_entity)
+        local_logger.bind(interface="nifi", direction="response", data=nifi_response_data).debug("Received from NiFi API")
+        
+        local_logger.info(f"Successfully created controller service '{name}' with ID: {controller_service_entity.get('id', 'N/A')}")
+        
+        component = controller_service_entity.get("component", {})
+        validation_status = component.get("validationStatus", "UNKNOWN")
+        validation_errors = component.get("validationErrors", [])
+        
+        if validation_status == "VALID":
+            return {
+                "status": "success",
+                "message": f"Controller service '{name}' created successfully.",
+                "entity": nifi_response_data
+            }
+        else:
+            error_msg_snippet = f" ({validation_errors[0]})" if validation_errors else ""
+            local_logger.warning(f"Controller service '{name}' created but is {validation_status}{error_msg_snippet}. Requires configuration.")
+            return {
+                "status": "warning",
+                "message": f"Controller service '{name}' created but is currently {validation_status}{error_msg_snippet}. Further configuration likely required.",
+                "entity": nifi_response_data
+            }
+            
+    except (NiFiAuthenticationError, ConnectionError, ValueError) as e:
+        local_logger.error(f"API error creating controller service: {e}", exc_info=False)
+        local_logger.bind(interface="nifi", direction="response", data={"error": str(e)}).debug("Received error from NiFi API")
+        return {"status": "error", "message": f"Failed to create controller service: {e}", "entity": None}
+    except Exception as e:
+        local_logger.error(f"Unexpected error creating controller service: {e}", exc_info=True)
+        local_logger.bind(interface="nifi", direction="response", data={"error": str(e)}).debug("Received error from NiFi API")
+        return {"status": "error", "message": f"An unexpected error occurred during controller service creation: {e}", "entity": None}
+
 # --- Plural batch tools ---
 
 @mcp.tool()
@@ -497,6 +583,72 @@ async def create_nifi_ports(
             process_group_id=port.get("process_group_id")
         )
         results.append(result)
+    return results
+
+@mcp.tool()
+@tool_phases(["Modify"])
+async def create_controller_services(
+    controller_services: List[Dict[str, Any]],
+    process_group_id: str
+) -> List[Dict]:
+    """
+    Creates one or more controller services in batch within a specified process group.
+    
+    Args:
+        controller_services: List of controller service definitions, each containing:
+            - service_type: The fully qualified Java class name (required)
+            - name: The desired name for the controller service (required)
+            - properties: Dict of configuration properties (optional)
+        process_group_id: The UUID of the process group where services should be created (required)
+    
+    Returns:
+        List of results, one per controller service creation attempt.
+        Includes enhanced error handling with available types when invalid types are provided.
+        
+    Example:
+        ```python
+        controller_services = [{
+            "service_type": "org.apache.nifi.dbcp.DBCPConnectionPool",
+            "name": "DatabaseConnectionPool",
+            "properties": {
+                "Database Connection URL": "jdbc:postgresql://localhost:5432/mydb",
+                "Database Driver Class Name": "org.postgresql.Driver"
+            }
+        }]
+        process_group_id = "process-group-uuid"
+        result = create_controller_services(controller_services, process_group_id)
+        ```
+    """
+    results = []
+    for cs in controller_services:
+        # Validate required fields
+        service_type = cs.get("service_type")
+        name = cs.get("name")
+        
+        if not service_type:
+            results.append({
+                "status": "error", 
+                "message": "Controller service definition missing required field 'service_type'.", 
+                "definition": cs
+            })
+            continue
+            
+        if not name:
+            results.append({
+                "status": "error", 
+                "message": "Controller service definition missing required field 'name'.", 
+                "definition": cs
+            })
+            continue
+        
+        result = await _create_controller_service_single(
+            service_type=service_type,
+            name=name,
+            process_group_id=process_group_id,
+            properties=cs.get("properties")
+        )
+        results.append(result)
+    
     return results
 
 @mcp.tool()

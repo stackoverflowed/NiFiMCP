@@ -272,3 +272,35 @@ def format_drop_request_summary(drop_results: Dict[str, Any]) -> Dict[str, Any]:
             "failed_connections": failed_connections if failed_connections else None
         }
     }
+
+def filter_controller_service_data(controller_service_entity: Dict) -> Dict:
+    """Extract essential fields from a controller service entity."""
+    component = controller_service_entity.get("component", {})
+    revision = controller_service_entity.get("revision", {})
+    config = component.get("config", {})
+    properties = config.get("properties", {})
+    
+    return {
+        "id": controller_service_entity.get("id"),
+        "name": component.get("name"),
+        "type": component.get("type"),
+        "state": component.get("state"),
+        "comments": component.get("comments"),
+        "validationStatus": component.get("validationStatus"),
+        "validationErrors": component.get("validationErrors", []),
+        "properties": properties,
+        "referencingComponents": component.get("referencingComponents", []),
+        "version": revision.get("version"),
+        "bundle": component.get("bundle", {}),
+        "controllerServiceApis": component.get("controllerServiceApis", []),
+    }
+
+def _format_controller_service_summary(controller_services_data):
+    """Formats basic controller service data from NiFi API list response."""
+    formatted = []
+    if controller_services_data:  # Should be a list from list_controller_services
+        for cs in controller_services_data:
+            # Use the existing filter function for consistency
+            basic_info = filter_controller_service_data(cs)
+            formatted.append(basic_info)
+    return formatted

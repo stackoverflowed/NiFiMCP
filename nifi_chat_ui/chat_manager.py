@@ -1834,6 +1834,15 @@ def get_llm_response(
     
     bound_logger.info(f"Routing LLM request to provider: {provider_normalized}, model: {model_name}")
     
+    # Ensure LLM clients are configured - this handles cases where the workflow
+    # runs in a different context where configure_llms() wasn't called
+    global openai_client, perplexity_client, anthropic_client, is_initialized
+    if not is_initialized or (provider_normalized == "openai" and not openai_client) or \
+       (provider_normalized == "perplexity" and not perplexity_client) or \
+       (provider_normalized == "anthropic" and not anthropic_client):
+        bound_logger.debug("LLM clients not initialized or missing, configuring now...")
+        configure_llms()
+    
     # Validate provider/model combination
     if provider_normalized == "openai":
         if not openai_client:
