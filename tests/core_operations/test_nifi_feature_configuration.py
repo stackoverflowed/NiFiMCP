@@ -79,8 +79,8 @@ async def test_auto_stop_feature(
         start_result_list = await call_tool(
             client=async_client,
             base_url=base_url,
-            tool_name="operate_nifi_object",
-            arguments=start_args,
+            tool_name="operate_nifi_objects",
+            arguments={"operations": [start_args]},
             headers=mcp_headers,
             custom_logger=global_logger
         )
@@ -107,7 +107,7 @@ async def test_auto_stop_feature(
         # Test with Auto-Stop enabled
         headers_enabled = {**mcp_headers, "X-Mcp-Auto-Stop-Enabled": "true"}
         delete_args = {
-            "deletion_requests": [{
+            "objects": [{
                 "object_type": "processor",
                 "object_id": test_proc_id,
                 "name": "mcp-test-generate-auto-stop-enabled"
@@ -160,8 +160,8 @@ async def test_auto_stop_feature(
         start_result_list = await call_tool(
             client=async_client,
             base_url=base_url,
-            tool_name="operate_nifi_object",
-            arguments=start_args,
+            tool_name="operate_nifi_objects",
+            arguments={"operations": [start_args]},
             headers=mcp_headers,
             custom_logger=global_logger
         )
@@ -185,7 +185,7 @@ async def test_auto_stop_feature(
         # Test with Auto-Stop disabled
         headers_disabled = {**mcp_headers, "X-Mcp-Auto-Stop-Enabled": "false"}
         delete_args = {
-            "deletion_requests": [{
+            "objects": [{
                 "object_type": "processor",
                 "object_id": test_proc_id,
                 "name": "mcp-test-generate-auto-stop-disabled"
@@ -215,8 +215,8 @@ async def test_auto_stop_feature(
             await call_tool(
                 client=async_client,
                 base_url=base_url,
-                tool_name="operate_nifi_object",
-                arguments=stop_pg_args,
+                tool_name="operate_nifi_objects",
+                arguments={"operations": [stop_pg_args]},
                 headers=mcp_headers,
                 custom_logger=global_logger
             )
@@ -225,7 +225,7 @@ async def test_auto_stop_feature(
 
             # Then delete the process group
             delete_pg_args = {
-                "deletion_requests": [{
+                "objects": [{
                     "object_type": "process_group",
                     "object_id": pg_id,
                     "name": "mcp-test-pg-auto-stop"
@@ -356,7 +356,7 @@ async def test_auto_delete_feature(
             client=async_client,
             base_url=base_url,
             tool_name="create_nifi_connections",
-            arguments={"connections": [connect_args]},
+            arguments={"connections": [connect_args], "process_group_id": pg_id},
             headers=mcp_headers,
             custom_logger=global_logger
         )
@@ -375,8 +375,8 @@ async def test_auto_delete_feature(
             start_result = await call_tool(
                 client=async_client,
                 base_url=base_url,
-                tool_name="operate_nifi_object",
-                arguments=start_args,
+                tool_name="operate_nifi_objects",
+                arguments={"operations": [start_args]},
                 headers=mcp_headers,
                 custom_logger=global_logger
             )
@@ -396,8 +396,8 @@ async def test_auto_delete_feature(
             stop_result = await call_tool(
                 client=async_client,
                 base_url=base_url,
-                tool_name="operate_nifi_object",
-                arguments=stop_args,
+                tool_name="operate_nifi_objects",
+                arguments={"operations": [stop_args]},
                 headers=mcp_headers,
                 custom_logger=global_logger
             )
@@ -410,7 +410,7 @@ async def test_auto_delete_feature(
         # Test deletion with Auto-Delete enabled
         headers_enabled = {**mcp_headers, "X-Mcp-Auto-Delete-Enabled": "true"}
         delete_args = {
-            "deletion_requests": [{
+            "objects": [{
                 "object_type": "processor",
                 "object_id": source_proc_id,
                 "name": "mcp-test-generate-auto-delete-enabled"
@@ -535,7 +535,7 @@ async def test_auto_delete_feature(
             client=async_client,
             base_url=base_url,
             tool_name="create_nifi_connections",
-            arguments={"connections": [disabled_connect_args]},
+            arguments={"connections": [disabled_connect_args], "process_group_id": disabled_pg_id},
             headers=mcp_headers,
             custom_logger=global_logger
         )
@@ -554,8 +554,8 @@ async def test_auto_delete_feature(
             start_result = await call_tool(
                 client=async_client,
                 base_url=base_url,
-                tool_name="operate_nifi_object",
-                arguments=start_args,
+                tool_name="operate_nifi_objects",
+                arguments={"operations": [start_args]},
                 headers=mcp_headers,
                 custom_logger=global_logger
             )
@@ -568,7 +568,7 @@ async def test_auto_delete_feature(
         # Test deletion with Auto-Delete disabled
         headers_disabled = {**mcp_headers, "X-Mcp-Auto-Delete-Enabled": "false"}
         delete_args = {
-            "deletion_requests": [{
+            "objects": [{
                 "object_type": "processor",
                 "object_id": disabled_source_id,
                 "name": "mcp-test-generate-auto-delete-disabled"
@@ -601,8 +601,8 @@ async def test_auto_delete_feature(
                 await call_tool(
                     client=async_client,
                     base_url=base_url,
-                    tool_name="operate_nifi_object",
-                    arguments=stop_pg_args,
+                    tool_name="operate_nifi_objects",
+                    arguments={"operations": [stop_pg_args]},
                     headers=mcp_headers,
                     custom_logger=global_logger
                 )
@@ -611,7 +611,7 @@ async def test_auto_delete_feature(
 
                 # Then delete the process group
                 delete_pg_args = {
-                    "deletion_requests": [{
+                    "objects": [{
                         "object_type": "process_group",
                         "object_id": cur_pg_id,
                         "name": f"mcp-test-pg-auto-delete-{cur_pg_id}"
@@ -715,8 +715,8 @@ async def test_feature_configuration_defaults(
         start_result_list = await call_tool(
             client=async_client,
             base_url=base_url,
-            tool_name="operate_nifi_object",
-            arguments=start_args,
+            tool_name="operate_nifi_objects",
+            arguments={"operations": [start_args]},
             headers=mcp_headers,
             custom_logger=global_logger
         )
@@ -742,7 +742,7 @@ async def test_feature_configuration_defaults(
 
         # Test without any feature headers (should use config defaults)
         delete_args = {
-            "deletion_requests": [{
+            "objects": [{
                 "object_type": "processor",
                 "object_id": test_proc_id,
                 "name": "mcp-test-generate-defaults"
@@ -775,8 +775,8 @@ async def test_feature_configuration_defaults(
             await call_tool(
                 client=async_client,
                 base_url=base_url,
-                tool_name="operate_nifi_object",
-                arguments=stop_pg_args,
+                tool_name="operate_nifi_objects",
+                arguments={"operations": [stop_pg_args]},
                 headers=mcp_headers,
                 custom_logger=global_logger
             )
@@ -785,7 +785,7 @@ async def test_feature_configuration_defaults(
 
             # Then delete the process group
             delete_pg_args = {
-                "deletion_requests": [{
+                "objects": [{
                     "object_type": "process_group",
                     "object_id": pg_id,
                     "name": "mcp-test-pg-defaults"
@@ -896,7 +896,7 @@ async def test_intelligent_relationship_update_with_auto_delete(
             client=async_client,
             base_url=base_url,
             tool_name="create_nifi_connections",
-            arguments={"connections": [connect_args]},
+            arguments={"connections": [connect_args], "process_group_id": pg_id},
             headers=mcp_headers,
             custom_logger=global_logger
         )
@@ -967,7 +967,7 @@ async def test_intelligent_relationship_update_with_auto_delete(
             client=async_client,
             base_url=base_url,
             tool_name="create_nifi_connections",
-            arguments={"connections": [connect_args]},
+            arguments={"connections": [connect_args], "process_group_id": pg_id},
             headers=mcp_headers,
             custom_logger=global_logger
         )
@@ -1038,8 +1038,8 @@ async def test_intelligent_relationship_update_with_auto_delete(
             await call_tool(
                 client=async_client,
                 base_url=base_url,
-                tool_name="operate_nifi_object",
-                arguments=stop_pg_args,
+                tool_name="operate_nifi_objects",
+                arguments={"operations": [stop_pg_args]},
                 headers=mcp_headers,
                 custom_logger=global_logger
             )
@@ -1048,7 +1048,7 @@ async def test_intelligent_relationship_update_with_auto_delete(
 
             # Then delete the process group
             delete_pg_args = {
-                "deletion_requests": [{
+                "objects": [{
                     "object_type": "process_group",
                     "object_id": pg_id,
                     "name": "mcp-test-pg-intelligent-relationships"

@@ -4,6 +4,8 @@ import uuid # Added for context IDs
 import time # Added for timing tracking
 from loguru import logger # Import logger directly
 from st_copy_to_clipboard import st_copy_to_clipboard # Import the new component
+from typing import List, Dict
+from chat_manager import calculate_input_tokens  # Import for smart pruning
 
 # Set page config MUST be the first Streamlit call
 st.set_page_config(page_title="NiFi Chat UI", layout="wide")
@@ -99,12 +101,6 @@ if "stop_requested" not in st.session_state:
     st.session_state.stop_requested = False
 if "pending_execution" not in st.session_state:
     st.session_state.pending_execution = None
-
-# Initialize action limit feedback settings
-if "enable_status_reports" not in st.session_state:
-    st.session_state.enable_status_reports = True
-if "hide_status_reports" not in st.session_state:
-    st.session_state.hide_status_reports = False
 
 # Initialize input counter for clearing input field
 if "input_counter" not in st.session_state:
@@ -260,101 +256,34 @@ with st.sidebar:
     
     # Initialize workflow session state
     if "workflow_execution_mode" not in st.session_state:
-        st.session_state.workflow_execution_mode = config.get_workflow_execution_mode()
+        st.session_state.workflow_execution_mode = "unguided"  # Default to unguided
     if "selected_workflow" not in st.session_state:
         st.session_state.selected_workflow = None
     if "available_workflows" not in st.session_state:
         st.session_state.available_workflows = []
     
-    # Execution Mode Selection
-    execution_modes = ["unguided", "guided"]
-    current_mode_index = execution_modes.index(st.session_state.workflow_execution_mode) if st.session_state.workflow_execution_mode in execution_modes else 0
+    # Execution Mode Selection - Temporarily hidden
+    # execution_modes = ["unguided", "guided"]
+    # current_mode_index = execution_modes.index(st.session_state.workflow_execution_mode) if st.session_state.workflow_execution_mode in execution_modes else 0
+    # 
+    # def on_execution_mode_change():
+    #     new_mode = st.session_state.execution_mode_selector
+    #     if st.session_state.workflow_execution_mode != new_mode:
+    #         st.session_state.workflow_execution_mode = new_mode
+    #         # Reset workflow selection when mode changes
+    #         st.session_state.selected_workflow = None
+    #         logger.info(f"Workflow execution mode changed to: {new_mode}")
+    # 
+    # st.selectbox(
+    #     "Execution Mode:",
+    #     options=execution_modes,
+    #     index=current_mode_index,
+    #     key="execution_mode_selector",
+    #     on_change=on_execution_mode_change,
+    #     help="Select workflow execution mode: 'unguided' for free-form chat, 'guided' for structured workflows"
+    # )
     
-    def on_execution_mode_change():
-        new_mode = st.session_state.execution_mode_selector
-        if st.session_state.workflow_execution_mode != new_mode:
-            st.session_state.workflow_execution_mode = new_mode
-            # Reset workflow selection when mode changes
-            st.session_state.selected_workflow = None
-            logger.info(f"Workflow execution mode changed to: {new_mode}")
-    
-    st.selectbox(
-        "Execution Mode:",
-        options=execution_modes,
-        index=current_mode_index,
-        key="execution_mode_selector",
-        on_change=on_execution_mode_change,
-        help="Select workflow execution mode: 'unguided' for free-form chat, 'guided' for structured workflows"
-    )
-    
-    # Workflow Selection (only shown in guided mode)
-    if st.session_state.workflow_execution_mode == "guided":
-        try:
-            # Fetch available workflows from the backend
-            from nifi_mcp_server.workflows.registry import get_workflow_registry
-            registry = get_workflow_registry()
-            workflows = registry.list_workflows(enabled_only=True)
-            
-            if workflows:
-                workflow_options = {w.name: w.display_name for w in workflows}
-                workflow_names = list(workflow_options.keys())
-                
-                # Function to update selected workflow
-                def on_workflow_change():
-                    selected_name = st.session_state.workflow_selector
-                    if st.session_state.selected_workflow != selected_name:
-                        st.session_state.selected_workflow = selected_name
-                        logger.info(f"Selected workflow: {selected_name}")
-                
-                # Determine default selection - initialize if not set
-                if not st.session_state.selected_workflow and workflow_names:
-                    st.session_state.selected_workflow = workflow_names[0]
-                    logger.info(f"Auto-selected first workflow: {workflow_names[0]}")
-                
-                current_workflow = st.session_state.selected_workflow
-                try:
-                    default_workflow_index = workflow_names.index(current_workflow) if current_workflow in workflow_names else 0
-                except (ValueError, IndexError):
-                    default_workflow_index = 0
-                
-                selected_workflow_name = st.selectbox(
-                    "Select Workflow:",
-                    options=workflow_names,
-                    format_func=lambda name: workflow_options.get(name, name),
-                    index=default_workflow_index,
-                    key="workflow_selector",
-                    on_change=on_workflow_change,
-                    help="Choose a guided workflow to execute"
-                )
-                
-                # Ensure session state is synchronized with current selection
-                if selected_workflow_name != st.session_state.selected_workflow:
-                    st.session_state.selected_workflow = selected_workflow_name
-                    logger.info(f"Synchronized workflow selection: {selected_workflow_name}")
-                
-                # Show workflow details if one is selected
-                if st.session_state.selected_workflow:
-                    workflow_info = registry.get_workflow_info(st.session_state.selected_workflow)
-                    if workflow_info:
-                        with st.expander("ℹ️ Workflow Details", expanded=False):
-                            st.markdown(f"**Category:** {workflow_info.get('category', 'N/A')}")
-                            st.markdown(f"**Description:** {workflow_info.get('description', 'No description')}")
-                            phases = workflow_info.get('phases', [])
-                            if phases:
-                                st.markdown(f"**Phases:** {', '.join(phases)}")
-                            nodes_count = workflow_info.get('nodes_count', 0)
-                            if nodes_count > 0:
-                                st.markdown(f"**Steps:** {nodes_count}")
-            else:
-                st.warning("No guided workflows available")
-                
-        except Exception as e:
-            logger.error(f"Error loading workflows: {e}", exc_info=True)
-            st.warning("Unable to load workflows. Check server connection.")
-    
-    # ----------------------------- #
-
-    # --- Phase Selection --- 
+    # === PHASE SELECTION ===
     st.markdown("---") # Add separator
     phase_options = ["All", "Review", "Build", "Modify", "Operate"]
     # Initialize session state for selected_phase if it doesn't exist
@@ -412,8 +341,11 @@ with st.sidebar:
     else:
          st.warning("No MCP tools available or failed to retrieve.")
          
-    # --- Auto Prune Settings --- 
+    # --- Execution Settings ---
     st.markdown("---") # Separator
+    st.subheader("Execution Settings")
+    
+    # Auto Prune Settings (moved under Execution Settings)
     st.checkbox(
         "Auto-prune History", 
         key="auto_prune_history", # Binds to session state
@@ -425,23 +357,7 @@ with st.sidebar:
         key="max_tokens_limit", # Binds to session state
         help="The maximum approximate number of tokens to include in the request to the LLM when auto-pruning is enabled."
     )
-    # --------------------------
-
-    # --- Execution Settings ---
-    st.markdown("---") # Separator
-    st.subheader("Execution Settings")
-    st.checkbox(
-        "Enable Status Reports",
-        value=True,
-        key="enable_status_reports",
-        help="When LLM reaches the 10-action limit, automatically request a status report"
-    )
-    st.checkbox(
-        "Hide Status Reports from History",
-        value=False, 
-        key="hide_status_reports",
-        help="Remove status report messages from chat history after display"
-    )
+    
     st.number_input(
         "Max Actions per Request",
         min_value=1,
@@ -629,10 +545,11 @@ Keep this concise but informative.
             bound_logger.info("Status report generated and displayed successfully")
             
             # Optional: Remove from history if configured to do so
-            if st.session_state.get("hide_status_reports", False):
-                # We'll remove it after a delay or on next interaction
-                # For now, just mark it for potential removal
-                pass
+            # Status reports are kept in history (hide_status_reports = False by default)
+            # if st.session_state.get("hide_status_reports", False):
+            #     # We'll remove it after a delay or on next interaction
+            #     # For now, just mark it for potential removal
+            #     pass
             
     except Exception as e:
         bound_logger.error(f"Failed to generate status report: {e}", exc_info=True)
@@ -789,6 +706,29 @@ def run_workflow_execution(workflow_name: str, provider: str, model_name: str, b
                 if total_tokens > 0:
                     st.markdown(f"📊 **Workflow Summary:** {total_tokens:,} tokens ({tokens_in:,} in, {tokens_out:,} out) • {execution_duration:.1f}s")
             
+            # Generate status report when max iterations reached (like unguided mode)
+            if max_iterations_reached and st.session_state.get("enable_status_reports", True):
+                bound_logger.info("Max iterations reached in workflow - generating status report")
+                
+                # Prepare context messages for status report (like unguided mode)
+                llm_context_messages = [{"role": "system", "content": effective_system_prompt}]
+                llm_context_messages.extend(st.session_state.messages)
+                
+                # Call the same status report function used in unguided mode
+                send_status_report(provider, model_name, effective_system_prompt, 
+                                 llm_context_messages, user_req_id, loop_count, bound_logger)
+            elif loop_count > 1 and st.session_state.get("enable_status_reports", True):
+                # Also generate status report for successful multi-iteration workflows
+                bound_logger.info("Multi-iteration workflow completed - generating status report")
+                
+                # Prepare context messages for status report (like unguided mode)
+                llm_context_messages = [{"role": "system", "content": effective_system_prompt}]
+                llm_context_messages.extend(st.session_state.messages)
+                
+                # Call the same status report function used in unguided mode
+                send_status_report(provider, model_name, effective_system_prompt, 
+                                 llm_context_messages, user_req_id, loop_count, bound_logger)
+            
             # Add the workflow completion message to session state
             completion_message = "✅ **Workflow completed successfully**"
             
@@ -847,6 +787,370 @@ def run_workflow_execution(workflow_name: str, provider: str, model_name: str, b
         st.session_state.stop_requested = False
         # Force a rerun to update the UI back to input mode
         st.rerun()
+
+def smart_prune_messages(messages: List[Dict], max_tokens: int, provider: str, model_name: str, tools, logger) -> List[Dict]:
+    """
+    Intelligently prune messages to fit within token limits while maintaining conversation structure.
+    
+    Args:
+        messages: List of conversation messages
+        max_tokens: Maximum allowed tokens
+        provider: LLM provider (e.g., "openai")
+        model_name: Model name for token calculation
+        tools: Available tools for token calculation
+        logger: Logger instance
+        
+    Returns:
+        Pruned message list that maintains valid conversation structure
+    """
+    if len(messages) <= 2:  # System + 1 user message minimum
+        return messages
+    
+    # Calculate current tokens
+    try:
+        current_tokens = calculate_input_tokens(messages, provider, model_name, tools)
+        logger.info(f"SMART_PRUNE_DEBUG: Initial tokens: {current_tokens}, Limit: {max_tokens}, Messages: {len(messages)}")
+        if current_tokens <= max_tokens:
+            logger.info("SMART_PRUNE_DEBUG: Already under limit, no pruning needed")
+            return messages  # No pruning needed
+    except Exception as e:
+        logger.error(f"Error calculating tokens during smart pruning: {e}")
+        return messages  # Return original on error
+    
+    # Keep system message (index 0) and work with the rest
+    system_message = messages[0]
+    conversation_messages = messages[1:]
+    
+    # DEBUG: Log message structure
+    logger.info(f"SMART_PRUNE_DEBUG: Message structure analysis:")
+    for i, msg in enumerate(conversation_messages):
+        role = msg.get("role", "unknown")
+        has_tool_calls = "tool_calls" in msg and len(msg.get("tool_calls", [])) > 0
+        tool_call_id = msg.get("tool_call_id", "")
+        logger.info(f"  [{i}] {role}{' (has_tool_calls)' if has_tool_calls else ''}{' (tool_call_id: ' + tool_call_id + ')' if tool_call_id else ''}")
+    
+    # Find safe removal points (complete conversation turns)
+    # We'll build a list of "removal groups" - sets of message indices that can be removed together
+    removal_groups = []
+    i = 0
+    
+    while i < len(conversation_messages):
+        message = conversation_messages[i]
+        role = message.get("role")
+        
+        if role == "user":
+            logger.debug(f"SMART_PRUNE_DEBUG: Processing user message at index {i}")
+            # Start of a potential removal group
+            group_start = i
+            group_end = i  # At least include the user message
+            
+            # Look ahead for the complete turn
+            j = i + 1
+            while j < len(conversation_messages):
+                next_message = conversation_messages[j]
+                next_role = next_message.get("role")
+                
+                if next_role == "assistant":
+                    group_end = j
+                    # Check if this assistant message has tool calls
+                    if "tool_calls" in next_message:
+                        # Must include corresponding tool responses
+                        tool_call_ids = {tc.get("id") for tc in next_message.get("tool_calls", [])}
+                        k = j + 1
+                        while k < len(conversation_messages) and tool_call_ids:
+                            tool_message = conversation_messages[k]
+                            if (tool_message.get("role") == "tool" and 
+                                tool_message.get("tool_call_id") in tool_call_ids):
+                                tool_call_ids.remove(tool_message.get("tool_call_id"))
+                                group_end = k
+                            elif tool_message.get("role") != "tool":
+                                break  # End of tool responses
+                            k += 1
+                    # Don't break here - continue looking for more assistant messages in this turn
+                elif next_role == "tool":
+                    # Orphaned tool message (shouldn't happen, but handle gracefully)
+                    group_end = j
+                elif next_role == "user":
+                    # Found next user message - end of current turn
+                    break
+                else:
+                    break
+                j += 1
+            
+            logger.debug(f"SMART_PRUNE_DEBUG: Turn found at indices {group_start}-{group_end}")
+            
+            # More aggressive pruning: preserve only the most recent complete conversation turn
+            # Count how many complete turns we have
+            total_turns = 0
+            temp_i = 0
+            while temp_i < len(conversation_messages):
+                if conversation_messages[temp_i].get("role") == "user":
+                    total_turns += 1
+                    # Skip to end of this turn
+                    temp_j = temp_i + 1
+                    while temp_j < len(conversation_messages) and conversation_messages[temp_j].get("role") != "user":
+                        temp_j += 1
+                    temp_i = temp_j
+                else:
+                    temp_i += 1
+            
+            # Count which turn this is (1-based)
+            current_turn = 0
+            temp_i = 0
+            while temp_i <= i:
+                if conversation_messages[temp_i].get("role") == "user":
+                    current_turn += 1
+                temp_i += 1
+            
+            logger.debug(f"SMART_PRUNE_DEBUG: Turn {current_turn}/{total_turns}, indices {group_start}-{group_end}")
+            
+            # More aggressive pruning when severely over limit
+            turns_to_preserve = 2  # Default: preserve last 2 turns
+            if current_tokens > max_tokens * 2:  # If more than 2x the limit
+                turns_to_preserve = 1  # Only preserve the last 1 turn
+                logger.debug(f"SMART_PRUNE_DEBUG: Severe token limit exceeded ({current_tokens} > {max_tokens * 2}), preserving only last {turns_to_preserve} turn(s)")
+            else:
+                logger.debug(f"SMART_PRUNE_DEBUG: Standard pruning, preserving last {turns_to_preserve} turn(s)")
+            
+            # Only preserve the specified number of recent complete turns
+            if current_turn <= total_turns - turns_to_preserve:
+                removal_groups.append((group_start, group_end))
+                logger.debug(f"SMART_PRUNE_DEBUG: Added removal group {group_start}-{group_end} (turn {current_turn}/{total_turns})")
+            else:
+                logger.debug(f"SMART_PRUNE_DEBUG: Preserving recent turn {current_turn}/{total_turns} at {group_start}-{group_end}")
+            
+            i = group_end + 1
+        else:
+            # Skip orphaned assistant/tool messages (shouldn't happen in well-formed conversations)
+            logger.debug(f"SMART_PRUNE_DEBUG: Skipping orphaned {role} message at index {i}")
+            i += 1
+    
+    # Remove groups from oldest to newest until we're under the token limit
+    # CRITICAL FIX: Remove one group at a time and recalculate
+    logger.info(f"SMART_PRUNE_DEBUG: Found {len(removal_groups)} removal groups to consider")
+    pruned_messages = [system_message] + conversation_messages.copy()
+    
+    # Process removals one at a time, recalculating groups after each removal
+    while removal_groups:
+        # Take the first (oldest) group
+        group_start, group_end = removal_groups[0]
+        
+        # Calculate current indices (accounting for system message)
+        adjusted_start = group_start + 1  # +1 for system message
+        adjusted_end = group_end + 1      # +1 for system message
+        
+        # Validate indices are still valid
+        if adjusted_start >= len(pruned_messages) or adjusted_end >= len(pruned_messages):
+            logger.warning(f"Invalid indices after previous removals: {adjusted_start}-{adjusted_end}, message count: {len(pruned_messages)}")
+            break
+        
+        # Remove the group
+        removed_messages = pruned_messages[adjusted_start:adjusted_end + 1]
+        pruned_messages = pruned_messages[:adjusted_start] + pruned_messages[adjusted_end + 1:]
+        
+        # Log what was removed
+        removed_roles = [msg.get("role") for msg in removed_messages]
+        logger.info(f"Smart pruning removed message group (roles: {removed_roles}) - indices {adjusted_start}-{adjusted_end}")
+        
+        # CRITICAL FIX: Validate message structure after removal
+        if not validate_message_structure(pruned_messages, logger):
+            logger.warning("Message structure validation failed after removal, reverting...")
+            # Revert the removal
+            pruned_messages = pruned_messages[:adjusted_start] + removed_messages + pruned_messages[adjusted_start:]
+            break
+        
+        # Check if we're now under the limit
+        try:
+            new_tokens = calculate_input_tokens(pruned_messages, provider, model_name, tools)
+            logger.debug(f"After removing group: {new_tokens} tokens (limit: {max_tokens})")
+            if new_tokens <= max_tokens:
+                break
+        except Exception as e:
+            logger.error(f"Error calculating tokens after removal: {e}")
+            break
+            
+        # Remove the processed group and recalculate remaining groups
+        removal_groups.pop(0)
+        
+        # Recalculate removal groups for the updated message list
+        # This is necessary because indices have shifted after removal
+        conversation_messages = pruned_messages[1:]  # Exclude system message
+        removal_groups = []
+        i = 0
+        
+        while i < len(conversation_messages):
+            message = conversation_messages[i]
+            role = message.get("role")
+            
+            if role == "user":
+                # Start of a potential removal group
+                group_start = i
+                group_end = i  # At least include the user message
+                
+                # Look ahead for the complete turn
+                j = i + 1
+                while j < len(conversation_messages):
+                    next_message = conversation_messages[j]
+                    next_role = next_message.get("role")
+                    
+                    if next_role == "assistant":
+                        group_end = j
+                        # Check if this assistant message has tool calls
+                        if "tool_calls" in next_message:
+                            # Must include corresponding tool responses
+                            tool_call_ids = {tc.get("id") for tc in next_message.get("tool_calls", [])}
+                            k = j + 1
+                            while k < len(conversation_messages) and tool_call_ids:
+                                tool_message = conversation_messages[k]
+                                if (tool_message.get("role") == "tool" and 
+                                    tool_message.get("tool_call_id") in tool_call_ids):
+                                    tool_call_ids.remove(tool_message.get("tool_call_id"))
+                                    group_end = k
+                                elif tool_message.get("role") != "tool":
+                                    break  # End of tool responses
+                                k += 1
+                        # Don't break here - continue looking for more assistant messages in this turn
+                    elif next_role == "tool":
+                        # Orphaned tool message (shouldn't happen, but handle gracefully)
+                        group_end = j
+                    elif next_role == "user":
+                        # Found next user message - end of current turn
+                        break
+                    else:
+                        break
+                    j += 1
+                
+                # More aggressive pruning: preserve only the most recent complete conversation turn
+                # Count how many complete turns we have
+                total_turns = 0
+                temp_i = 0
+                while temp_i < len(conversation_messages):
+                    if conversation_messages[temp_i].get("role") == "user":
+                        total_turns += 1
+                        # Skip to end of this turn
+                        temp_j = temp_i + 1
+                        while temp_j < len(conversation_messages) and conversation_messages[temp_j].get("role") != "user":
+                            temp_j += 1
+                        temp_i = temp_j
+                    else:
+                        temp_i += 1
+                
+                # Count which turn this is (1-based)
+                current_turn = 0
+                temp_i = 0
+                while temp_i <= i:
+                    if conversation_messages[temp_i].get("role") == "user":
+                        current_turn += 1
+                    temp_i += 1
+                
+                # More aggressive pruning when severely over limit (same logic as initial pass)
+                try:
+                    recalc_tokens = calculate_input_tokens(pruned_messages, provider, model_name, tools)
+                except Exception:
+                    recalc_tokens = max_tokens * 2  # Assume severe if we can't calculate
+                
+                turns_to_preserve = 2  # Default: preserve last 2 turns
+                if recalc_tokens > max_tokens * 2:  # If more than 2x the limit
+                    turns_to_preserve = 1  # Only preserve the last 1 turn
+                
+                # Only preserve the specified number of recent complete turns
+                if current_turn <= total_turns - turns_to_preserve:
+                    removal_groups.append((group_start, group_end))
+                
+                i = group_end + 1
+            else:
+                # Skip orphaned assistant/tool messages (shouldn't happen in well-formed conversations)
+                logger.debug(f"SMART_PRUNE_DEBUG: Skipping orphaned {role} message at index {i}")
+                i += 1
+    
+    # Final validation and token check
+    if not validate_message_structure(pruned_messages, logger):
+        logger.error("Final message structure validation failed, returning original messages")
+        return messages
+    
+    try:
+        final_tokens = calculate_input_tokens(pruned_messages, provider, model_name, tools)
+        logger.info(f"Smart pruning complete: {len(messages)} → {len(pruned_messages)} messages, {current_tokens} → {final_tokens} tokens")
+    except Exception:
+        pass
+    
+    return pruned_messages
+
+
+def validate_message_structure(messages: List[Dict], logger) -> bool:
+    """
+    Validate that the message structure is valid for OpenAI API.
+    
+    Rules:
+    1. Every 'tool' message must be preceded by an 'assistant' message with 'tool_calls'
+    2. No orphaned tool messages
+    3. System message should be first (if present)
+    4. Assistant messages with tool_calls must have all corresponding tool responses
+    
+    Args:
+        messages: List of messages to validate
+        logger: Logger instance
+        
+    Returns:
+        True if structure is valid, False otherwise
+    """
+    if not messages:
+        return True
+    
+    # Track tool calls that need responses
+    pending_tool_calls = set()
+    
+    for i, message in enumerate(messages):
+        role = message.get("role")
+        
+        if role == "system":
+            # System message should be first
+            if i != 0:
+                logger.warning(f"System message found at position {i}, should be at position 0")
+                return False
+                
+        elif role == "assistant":
+            # Check if there are unresolved tool calls from previous assistant message
+            if pending_tool_calls:
+                logger.warning(f"Previous assistant message has unresolved tool calls: {pending_tool_calls}")
+                return False
+            
+            # Clear pending tool calls and check for new ones
+            pending_tool_calls.clear()
+            
+            # Check for new tool calls
+            tool_calls = message.get("tool_calls", [])
+            for tool_call in tool_calls:
+                tool_call_id = tool_call.get("id")
+                if tool_call_id:
+                    pending_tool_calls.add(tool_call_id)
+                    
+        elif role == "tool":
+            # Tool message must have a corresponding tool_call_id
+            tool_call_id = message.get("tool_call_id")
+            if not tool_call_id:
+                logger.warning(f"Tool message at position {i} missing tool_call_id")
+                return False
+                
+            if tool_call_id not in pending_tool_calls:
+                logger.warning(f"Tool message at position {i} has orphaned tool_call_id: {tool_call_id}")
+                return False
+                
+            # Remove this tool call from pending
+            pending_tool_calls.remove(tool_call_id)
+            
+        elif role == "user":
+            # User messages should not appear while tool calls are pending
+            if pending_tool_calls:
+                logger.warning(f"User message while tool calls pending: {pending_tool_calls}")
+                return False
+    
+    # Check if there are any unresolved tool calls at the end
+    if pending_tool_calls:
+        logger.warning(f"Unresolved tool calls at end: {pending_tool_calls}")
+        return False
+    
+    return True
 
 # --- Refactored Execution Loop Function --- 
 def run_execution_loop(provider: str, model_name: str, base_sys_prompt: str, user_req_id: str):
@@ -936,45 +1240,58 @@ def run_execution_loop(provider: str, model_name: str, base_sys_prompt: str, use
                 current_loop_logger.info("Auto-pruning enabled. Checking token count...")
                 max_tokens = st.session_state.get("max_tokens_limit", 8000)
                 
-                pruning_iterations = 0
-                while pruning_iterations < 200:
-                    pruning_iterations += 1
-                    try:
-                        # PASS formatted_tools to the token calculation here
-                        current_tokens = calculate_input_tokens(
-                            llm_context_messages, 
-                            provider, 
-                            model_name, 
-                            tools=formatted_tools # Pass the prepared tools
+                # ENHANCED DEBUG: Always log current state
+                current_loop_logger.info(f"DEBUG: Message count before pruning check: {len(llm_context_messages)}")
+                current_loop_logger.info(f"DEBUG: Max token limit: {max_tokens}")
+                
+                # CRITICAL FIX: Use smart pruning instead of naive pruning
+                try:
+                    current_tokens = calculate_input_tokens(
+                        llm_context_messages, 
+                        provider, 
+                        model_name, 
+                        tools=formatted_tools
+                    )
+                    current_loop_logger.info(f"DEBUG: Current token count (incl. tools): {current_tokens}, Limit: {max_tokens}")
+                    
+                    if current_tokens > max_tokens:
+                        current_loop_logger.info(f"DEBUG: Token limit exceeded ({current_tokens} > {max_tokens}). Applying smart pruning...")
+                        
+                        original_count = len(llm_context_messages)
+                        llm_context_messages = smart_prune_messages(
+                            messages=llm_context_messages,
+                            max_tokens=max_tokens,
+                            provider=provider,
+                            model_name=model_name,
+                            tools=formatted_tools,
+                            logger=current_loop_logger
                         )
-                        current_loop_logger.debug(f"Current token count (incl. tools): {current_tokens}, Limit: {max_tokens}")
-                    except Exception as token_calc_err:
-                        current_loop_logger.error(f"Error calculating tokens during pruning: {token_calc_err}", exc_info=True)
-                        st.warning("Error calculating tokens, cannot prune history accurately.")
-                        break
-
-                    if current_tokens > max_tokens and len(llm_context_messages) > 2:
-                        removed_message = llm_context_messages.pop(1)
-                        # Recalculate tokens after removal for logging difference (optional but helpful)
-                        # Note: Recalculating just for logging adds a bit of overhead
+                        
+                        # Enhanced verification
+                        final_count = len(llm_context_messages)
+                        current_loop_logger.info(f"DEBUG: Smart pruning results: {original_count} → {final_count} messages")
+                        
                         try:
-                            new_token_count = calculate_input_tokens(llm_context_messages, provider, model_name, tools=formatted_tools)
-                            tokens_removed = current_tokens - new_token_count
-                        except:
-                            tokens_removed = "N/A"
-                        current_loop_logger.info(f"Pruning message at index 1 (Role: {removed_message.get('role')}, Approx Tokens Removed: {tokens_removed}) to fit token limit.")
+                            final_tokens = calculate_input_tokens(llm_context_messages, provider, model_name, tools=formatted_tools)
+                            current_loop_logger.info(f"DEBUG: Smart pruning token results: {current_tokens} → {final_tokens} tokens")
+                            
+                            if final_tokens > max_tokens:
+                                current_loop_logger.warning(f"DEBUG: Smart pruning failed to get under limit! Still at {final_tokens} tokens")
+                            else:
+                                current_loop_logger.info(f"DEBUG: Smart pruning successful! Now at {final_tokens} tokens")
+                                
+                        except Exception as verify_e:
+                            current_loop_logger.warning(f"Could not verify final token count after smart pruning: {verify_e}")
                     else:
-                        if current_tokens <= max_tokens:
-                            current_loop_logger.debug("Token count is within limit. No more pruning needed.")
-                        elif len(llm_context_messages) <= 2:
-                            current_loop_logger.warning(f"Cannot prune further. Only system prompt and last user message remain, but token count ({current_tokens}) still exceeds limit ({max_tokens}).")
-                        break
-                else:
-                     current_loop_logger.warning(f"Pruning loop safety break hit after {pruning_iterations} iterations.")
-
-                current_loop_logger.debug(f"Final llm_context_messages length after pruning: {len(llm_context_messages)}")
+                        current_loop_logger.info(f"DEBUG: Token count is within limit ({current_tokens} <= {max_tokens}). No pruning needed.")
+                        
+                except Exception as token_calc_err:
+                    current_loop_logger.error(f"Error calculating tokens during pruning: {token_calc_err}", exc_info=True)
+                    st.warning("Error calculating tokens, cannot prune history accurately. Disabling auto-prune for this request.")
+                
+                current_loop_logger.info(f"DEBUG: Final message count after pruning check: {len(llm_context_messages)}")
             else:
-                current_loop_logger.debug("Auto-pruning disabled.")
+                current_loop_logger.info("DEBUG: Auto-pruning disabled in UI settings.")
             # ------------------------------------------
             
             # --- LLM Action ID --- # Moved Action ID generation closer to the LLM call
@@ -1118,8 +1435,20 @@ def run_execution_loop(provider: str, model_name: str, base_sys_prompt: str, use
                             action_id=llm_action_id # Use llm_action_id here
                         )
                         
+                        # Handle validation errors gracefully
+                        if isinstance(tool_result, dict) and tool_result.get("validation_error"):
+                            # Display friendly message to user
+                            ui_message = tool_result.get("ui_message", "Adjusting parameters...")
+                            with st.chat_message("assistant"):
+                                st.info(f"⚙️ {ui_message}")
+                            
+                            # But send detailed error to LLM for learning
+                            tool_result_content = json.dumps(tool_result)
+                        else:
+                            # Normal tool result - format for LLM
+                            tool_result_content = json.dumps(tool_result) if tool_result is not None else "null"
+                        
                         # Format result for the LLM
-                        tool_result_content = json.dumps(tool_result) if tool_result is not None else "null"
                         tool_loop_logger.debug(f"Tool {function_name} execution result: {tool_result_content[:200]}...") # Log snippet
 
                         # Add tool result message to history for the next LLM iteration
@@ -1159,10 +1488,10 @@ def run_execution_loop(provider: str, model_name: str, base_sys_prompt: str, use
                 "content": f"⚠️ **Reached maximum action limit ({max_iterations} actions)**\n\nI've completed as much as possible within the action limit."
             })
             
-            # Optional: Send status report
-            if st.session_state.get("enable_status_reports", True):
-                send_status_report(provider, model_name, effective_system_prompt, 
-                                 llm_context_messages, user_req_id, loop_count, bound_logger)
+            # Optional: Send status report (always enabled by default)
+            # if st.session_state.get("enable_status_reports", True):
+            send_status_report(provider, model_name, effective_system_prompt, 
+                             llm_context_messages, user_req_id, loop_count, bound_logger)
         
     except Exception as e:
         bound_logger.error(f"Unexpected error in execution loop: {e}", exc_info=True)

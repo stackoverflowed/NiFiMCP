@@ -21,22 +21,24 @@ async def test_create_and_verify_connection(
     # Get processor IDs from the fixture
     generate_proc_id = test_pg_with_processors.get("generate_proc_id")
     log_proc_id = test_pg_with_processors.get("log_proc_id")
+    pg_id = test_pg_with_processors.get("pg_id")
     assert generate_proc_id, "Generate Processor ID not found from fixture."
     assert log_proc_id, "Log Processor ID not found from fixture."
+    assert pg_id, "Process Group ID not found from fixture."
 
     global_logger.info(f"Test: Creating connection from GenerateFlowFile ({generate_proc_id}) to LogAttribute ({log_proc_id})")
     
     # Create connection
     connect_args = {
-        "source_id": generate_proc_id,
+        "source_name": generate_proc_id,
         "relationships": ["success"],
-        "target_id": log_proc_id
+        "target_name": log_proc_id
     }
     conn_result_list = await call_tool(
         client=async_client,
         base_url=base_url,
         tool_name="create_nifi_connections",
-        arguments={"connections": [connect_args]},
+        arguments={"connections": [connect_args], "process_group_id": pg_id},
         headers=mcp_headers,
         custom_logger=global_logger
     )
@@ -83,19 +85,20 @@ async def test_delete_connection(
     # First create a connection
     generate_proc_id = test_pg_with_processors.get("generate_proc_id")
     log_proc_id = test_pg_with_processors.get("log_proc_id")
-    assert generate_proc_id and log_proc_id, "Processor IDs not found from fixture."
+    pg_id = test_pg_with_processors.get("pg_id")
+    assert generate_proc_id and log_proc_id and pg_id, "Processor IDs and PG ID not found from fixture."
 
     # Create connection
     connect_args = {
-        "source_id": generate_proc_id,
+        "source_name": generate_proc_id,
         "relationships": ["success"],
-        "target_id": log_proc_id
+        "target_name": log_proc_id
     }
     conn_result_list = await call_tool(
         client=async_client,
         base_url=base_url,
         tool_name="create_nifi_connections",
-        arguments={"connections": [connect_args]},
+        arguments={"connections": [connect_args], "process_group_id": pg_id},
         headers=mcp_headers,
         custom_logger=global_logger
     )
@@ -105,7 +108,7 @@ async def test_delete_connection(
 
     # Now delete the connection
     delete_args = {
-        "deletion_requests": [{
+        "objects": [{
             "object_type": "connection",
             "object_id": connection_id,
             "name": f"test-connection-{connection_id}"
@@ -155,10 +158,11 @@ async def test_auto_purge_connection_with_queued_data(
     global_logger: Any
 ):
     """Test that deleting a connection with queued data and auto-purge enabled works correctly."""
-    # Get processor IDs from the fixture
+    # Get processor IDs and process group ID from the fixture
     generate_proc_id = test_pg_with_processors.get("generate_proc_id")
     log_proc_id = test_pg_with_processors.get("log_proc_id")
-    assert generate_proc_id and log_proc_id, "Processor IDs not found from fixture."
+    pg_id = test_pg_with_processors.get("pg_id")
+    assert generate_proc_id and log_proc_id and pg_id, "Processor IDs and PG ID not found from fixture."
 
     # First auto-terminate relationships for the generator
     update_rels_args = {
@@ -179,15 +183,15 @@ async def test_auto_purge_connection_with_queued_data(
 
     # Create connection between processors
     connect_args = {
-        "source_id": generate_proc_id,
+        "source_name": generate_proc_id,
         "relationships": ["success"],
-        "target_id": log_proc_id
+        "target_name": log_proc_id
     }
     conn_result_list = await call_tool(
         client=async_client,
         base_url=base_url,
         tool_name="create_nifi_connections",
-        arguments={"connections": [connect_args]},
+        arguments={"connections": [connect_args], "process_group_id": pg_id},
         headers=mcp_headers,
         custom_logger=global_logger
     )
@@ -205,8 +209,8 @@ async def test_auto_purge_connection_with_queued_data(
     start_result_list = await call_tool(
         client=async_client,
         base_url=base_url,
-        tool_name="operate_nifi_object",
-        arguments=start_args,
+        tool_name="operate_nifi_objects",
+        arguments={"operations": [start_args]},
         headers=mcp_headers,
         custom_logger=global_logger
     )
@@ -223,8 +227,8 @@ async def test_auto_purge_connection_with_queued_data(
     stop_result_list = await call_tool(
         client=async_client,
         base_url=base_url,
-        tool_name="operate_nifi_object",
-        arguments=stop_args,
+        tool_name="operate_nifi_objects",
+        arguments={"operations": [stop_args]},
         headers=mcp_headers,
         custom_logger=global_logger
     )
@@ -252,7 +256,7 @@ async def test_auto_purge_connection_with_queued_data(
     # Attempt delete with Auto-Purge enabled
     headers_auto_purge_true = {**mcp_headers, "X-Mcp-Auto-Purge-Enabled": "true"}
     delete_args = {
-        "deletion_requests": [{
+        "objects": [{
             "object_type": "connection",
             "object_id": connection_id,
             "name": f"test-connection-auto-purge-{connection_id}"
@@ -294,7 +298,7 @@ async def test_auto_purge_connection_with_queued_data(
         client=async_client,
         base_url=base_url,
         tool_name="create_nifi_connections",
-        arguments={"connections": [connect_args]},
+        arguments={"connections": [connect_args], "process_group_id": pg_id},
         headers=mcp_headers,
         custom_logger=global_logger
     )
@@ -307,8 +311,8 @@ async def test_auto_purge_connection_with_queued_data(
     await call_tool(
         client=async_client,
         base_url=base_url,
-        tool_name="operate_nifi_object",
-        arguments=start_args,  # Start generator
+        tool_name="operate_nifi_objects",
+        arguments={"operations": [start_args]},  # Start generator
         headers=mcp_headers,
         custom_logger=global_logger
     )
@@ -316,8 +320,8 @@ async def test_auto_purge_connection_with_queued_data(
     await call_tool(
         client=async_client,
         base_url=base_url,
-        tool_name="operate_nifi_object",
-        arguments=stop_args,  # Stop generator
+        tool_name="operate_nifi_objects",
+        arguments={"operations": [stop_args]},  # Stop generator
         headers=mcp_headers,
         custom_logger=global_logger
     )
@@ -343,7 +347,7 @@ async def test_auto_purge_connection_with_queued_data(
     # Attempt delete with Auto-Purge disabled
     headers_auto_purge_false = {**mcp_headers, "X-Mcp-Auto-Purge-Enabled": "false"}
     delete_args = {
-        "deletion_requests": [{
+        "objects": [{
             "object_type": "connection",
             "object_id": new_connection_id,
             "name": f"test-connection-auto-purge-disabled-{new_connection_id}"
@@ -370,10 +374,11 @@ async def test_purge_single_connection(
     global_logger: Any
 ):
     """Test purging flowfiles from a single connection."""
-    # Get processor IDs from the fixture
+    # Get processor IDs and process group ID from the fixture
     generate_proc_id = test_pg_with_processors.get("generate_proc_id")
     log_proc_id = test_pg_with_processors.get("log_proc_id")
-    assert generate_proc_id and log_proc_id, "Processor IDs not found from fixture."
+    pg_id = test_pg_with_processors.get("pg_id")
+    assert generate_proc_id and log_proc_id and pg_id, "Processor IDs and PG ID not found from fixture."
 
     # First auto-terminate relationships for the generator
     update_rels_args = {
@@ -394,15 +399,15 @@ async def test_purge_single_connection(
 
     # Create connection between processors
     connect_args = {
-        "source_id": generate_proc_id,
+        "source_name": generate_proc_id,
         "relationships": ["success"],
-        "target_id": log_proc_id
+        "target_name": log_proc_id
     }
     conn_result_list = await call_tool(
         client=async_client,
         base_url=base_url,
         tool_name="create_nifi_connections",
-        arguments={"connections": [connect_args]},
+        arguments={"connections": [connect_args], "process_group_id": pg_id},
         headers=mcp_headers,
         custom_logger=global_logger
     )
@@ -420,8 +425,8 @@ async def test_purge_single_connection(
     start_result_list = await call_tool(
         client=async_client,
         base_url=base_url,
-        tool_name="operate_nifi_object",
-        arguments=start_args,
+        tool_name="operate_nifi_objects",
+        arguments={"operations": [start_args]},
         headers=mcp_headers,
         custom_logger=global_logger
     )
@@ -438,8 +443,8 @@ async def test_purge_single_connection(
     stop_result_list = await call_tool(
         client=async_client,
         base_url=base_url,
-        tool_name="operate_nifi_object",
-        arguments=stop_args,
+        tool_name="operate_nifi_objects",
+        arguments={"operations": [stop_args]},
         headers=mcp_headers,
         custom_logger=global_logger
     )
@@ -535,18 +540,20 @@ async def test_purge_process_group(
 
         # Configure processor properties
         config_args = {
-            "processor_id": proc_id,
-            "processor_config_properties": {
-                "File Size": "0B",
-                "Batch Size": "1",
-                "Data Format": "Text",
-                "Unique FlowFiles": "false"
-            }
+            "updates": [{
+                "processor_id": proc_id,
+                "properties": {
+                    "File Size": "0B",
+                    "Batch Size": "1",
+                    "Data Format": "Text",
+                    "Unique FlowFiles": "false"
+                }
+            }]
         }
         config_result_list = await call_tool(
             client=async_client,
             base_url=base_url,
-            tool_name="update_nifi_processor_properties",
+            tool_name="update_nifi_processors_properties",
             arguments=config_args,
             headers=mcp_headers,
             custom_logger=global_logger
@@ -579,15 +586,15 @@ async def test_purge_process_group(
     for i, source_id in enumerate(source_processors):
         # Create connection
         connect_args = {
-            "source_id": source_id,
+            "source_name": source_id,
             "relationships": ["success"],
-            "target_id": log_proc_id
+            "target_name": log_proc_id
         }
         conn_result_list = await call_tool(
             client=async_client,
             base_url=base_url,
             tool_name="create_nifi_connections",
-            arguments={"connections": [connect_args]},
+            arguments={"connections": [connect_args], "process_group_id": pg_id},
             headers=mcp_headers,
             custom_logger=global_logger
         )
@@ -608,8 +615,8 @@ async def test_purge_process_group(
             start_result_list = await call_tool(
                 client=async_client,
                 base_url=base_url,
-                tool_name="operate_nifi_object",
-                arguments=start_args,
+                tool_name="operate_nifi_objects",
+                arguments={"operations": [start_args]},
                 headers=mcp_headers,
                 custom_logger=global_logger
             )
@@ -626,8 +633,8 @@ async def test_purge_process_group(
             stop_result_list = await call_tool(
                 client=async_client,
                 base_url=base_url,
-                tool_name="operate_nifi_object",
-                arguments=stop_args,
+                tool_name="operate_nifi_objects",
+                arguments={"operations": [stop_args]},
                 headers=mcp_headers,
                 custom_logger=global_logger
             )
@@ -704,8 +711,8 @@ async def test_purge_process_group(
                 await call_tool(
                     client=async_client,
                     base_url=base_url,
-                    tool_name="operate_nifi_object",
-                    arguments=stop_args,
+                    tool_name="operate_nifi_objects",
+                    arguments={"operations": [stop_args]},
                     headers=mcp_headers,
                     custom_logger=global_logger
                 )
@@ -716,7 +723,7 @@ async def test_purge_process_group(
         for conn_id in connections:
             try:
                 delete_args = {
-                    "deletion_requests": [{
+                    "objects": [{
                         "object_type": "connection",
                         "object_id": conn_id,
                         "name": f"cleanup-connection-{conn_id}"
@@ -739,7 +746,7 @@ async def test_purge_process_group(
         for proc_id in processors:  # Only delete the ones we created
             try:
                 delete_args = {
-                    "deletion_requests": [{
+                    "objects": [{
                         "object_type": "processor",
                         "object_id": proc_id,
                         "name": f"cleanup-processor-{proc_id}"

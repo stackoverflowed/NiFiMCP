@@ -32,7 +32,7 @@ except ImportError:
         }
         # Fallback functions for when settings can't be imported
         def get_llm_enqueue_enabled():
-            return True
+            return False  # Temporarily disabled to fix macOS semaphore issues
         def get_interface_debug_enabled():
             return False
 
@@ -197,7 +197,7 @@ def setup_logging(context: str | None = None):
                 filter=client_filter,  # Only include client module logs
                 mode="w",  # Changed back to write/overwrite
                 encoding='utf8',
-                enqueue=True,  # Add for thread/process safety
+                enqueue=False,  # Disabled to fix macOS semaphore issues
                 backtrace=False,  # Disable backtrace for cleaner logs
                 diagnose=False,   # Disable diagnosis info for cleaner logs
             )
@@ -218,7 +218,7 @@ def setup_logging(context: str | None = None):
                 filter=server_filter,  # Only include server module logs
                 mode="w",  # Changed back to write/overwrite
                 encoding='utf8',
-                enqueue=True,  # Add for thread/process safety
+                enqueue=False,  # Disabled to fix macOS semaphore issues
                 backtrace=False,  # Disable backtrace for cleaner logs
                 diagnose=False,   # Disable diagnosis info for cleaner logs
             )
@@ -248,7 +248,7 @@ def setup_logging(context: str | None = None):
                 sink_filter = lambda record, name=interface_name: record["extra"].get("interface") == name
 
                 # Use configurable enqueue setting for LLM logs to avoid pickle errors
-                use_enqueue = True
+                use_enqueue = False  # Disabled to fix macOS semaphore issues
                 if interface_name == 'llm':
                     use_enqueue = get_llm_enqueue_enabled()
 
@@ -283,7 +283,7 @@ def setup_logging(context: str | None = None):
                     format=interface_format,  # Use the simple format string that accesses json_data
                     mode="w", # Changed back to write/overwrite
                     encoding='utf8',
-                    enqueue=True, # Keep enqueue enabled for NiFi logs (they don't have pickle issues)
+                    enqueue=False, # Disabled to fix macOS semaphore issues
                     backtrace=False,  # Disable backtrace for cleaner logs
                     diagnose=False # Disable traceback to avoid recursion issues
                 )

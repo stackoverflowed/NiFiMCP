@@ -44,7 +44,7 @@ class GuidedWorkflowExecutor:
             node.set_context_manager(self.context_manager)
             node.set_progress_tracker(self.progress_tracker)
             node.set_action_limit(get_workflow_action_limit())
-            
+        
     @property
     def bound_logger(self):
         """Get a logger bound with current context."""
@@ -68,7 +68,7 @@ class GuidedWorkflowExecutor:
         )
         
     def _create_flow(self) -> Flow:
-        """Create a PocketFlow Flow from the workflow nodes."""
+        """Create a PocketFlow Flow from the workflow nodes with proper chaining."""
         if not self.nodes:
             raise WorkflowNodeError("Cannot create flow: no nodes provided")
             
@@ -76,9 +76,11 @@ class GuidedWorkflowExecutor:
         flow = Flow(self.nodes[0])
         
         # Chain the nodes together if there are multiple
+        # PocketFlow will use the post() method return values for navigation
         for i in range(1, len(self.nodes)):
             flow = flow >> self.nodes[i]
             
+        self.bound_logger.debug(f"Created flow with {len(self.nodes)} nodes in sequence")
         return flow
         
     def execute(self, initial_context: Optional[Dict[str, Any]] = None, 

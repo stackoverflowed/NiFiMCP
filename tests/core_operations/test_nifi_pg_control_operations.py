@@ -17,7 +17,7 @@ async def test_start_and_stop_process_group(
     global_logger: Any
 ):
     """Test starting and stopping a process group with processors."""
-    pg_id = test_pg_with_processors.get("pg_details", {}).get("id")
+    pg_id = test_pg_with_processors.get("pg_id")
     assert pg_id, "Process Group ID not found from fixture."
     
     # First, ensure the LogAttribute processor's relationships are auto-terminated
@@ -52,7 +52,7 @@ async def test_start_and_stop_process_group(
         client=async_client,
         base_url=base_url,
         tool_name="create_nifi_connections",
-        arguments={"connections": [connect_args]},
+        arguments={"connections": [connect_args], "process_group_id": pg_id},
         headers=mcp_headers,
         custom_logger=global_logger
     )
@@ -89,8 +89,8 @@ async def test_start_and_stop_process_group(
     start_result_list = await call_tool(
         client=async_client,
         base_url=base_url,
-        tool_name="operate_nifi_object",
-        arguments=start_args,
+        tool_name="operate_nifi_objects",
+        arguments={"operations": [start_args]},
         headers=mcp_headers,
         custom_logger=global_logger
     )
@@ -129,8 +129,8 @@ async def test_start_and_stop_process_group(
     stop_result_list = await call_tool(
         client=async_client,
         base_url=base_url,
-        tool_name="operate_nifi_object",
-        arguments=stop_args,
+        tool_name="operate_nifi_objects",
+        arguments={"operations": [stop_args]},
         headers=mcp_headers,
         custom_logger=global_logger
     )
@@ -168,7 +168,7 @@ async def test_process_group_status_after_operations(
     global_logger: Any
 ):
     """Test process group status changes after start/stop operations."""
-    pg_id = test_pg_with_processors.get("pg_details", {}).get("id")
+    pg_id = test_pg_with_processors.get("pg_id")
     assert pg_id, "Process Group ID not found from fixture."
 
     # First, ensure the LogAttribute processor's relationships are auto-terminated
@@ -186,7 +186,7 @@ async def test_process_group_status_after_operations(
         client=async_client,
         base_url=base_url,
         tool_name="create_nifi_connections",
-        arguments={"connections": [connect_args]},
+        arguments={"connections": [connect_args], "process_group_id": pg_id},
         headers=mcp_headers,
         custom_logger=global_logger
     )
@@ -221,8 +221,8 @@ async def test_process_group_status_after_operations(
     await call_tool(
         client=async_client,
         base_url=base_url,
-        tool_name="operate_nifi_object",
-        arguments=start_args,
+        tool_name="operate_nifi_objects",
+        arguments={"operations": [start_args]},
         headers=mcp_headers,
         custom_logger=global_logger
     )
@@ -241,8 +241,8 @@ async def test_process_group_status_after_operations(
     await call_tool(
         client=async_client,
         base_url=base_url,
-        tool_name="operate_nifi_object",
-        arguments=stop_args,
+        tool_name="operate_nifi_objects",
+        arguments={"operations": [stop_args]},
         headers=mcp_headers,
         custom_logger=global_logger
     )

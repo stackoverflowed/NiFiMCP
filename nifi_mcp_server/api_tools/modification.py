@@ -15,7 +15,8 @@ from .utils import (
     # ensure_authenticated, # Removed
     filter_created_processor_data,
     filter_connection_data,
-    filter_controller_service_data  # Add controller service filter
+    filter_controller_service_data,  # Add controller service filter
+    smart_parameter_validation
 )
 from .review import get_nifi_object_details, list_nifi_objects  # Import both functions at the top
 from nifi_mcp_server.nifi_client import NiFiClient, NiFiAuthenticationError
@@ -23,9 +24,44 @@ from mcp.server.fastmcp.exceptions import ToolError
 
 # --- Tool Definitions --- 
 
-@mcp.tool()
-@tool_phases(["Modify"])
-async def update_nifi_processor_properties(
+def _requires_restart_for_property_change(processor_type: str, property_name: str, old_value: Any, new_value: Any) -> bool:
+    """
+    Determine if a processor restart is required for a specific property change.
+    
+    EFFICIENCY IMPROVEMENT: Avoid unnecessary restarts for properties that can be updated without restart.
+    """
+    # Properties that don't require restart for most processors
+    non_restart_properties = {
+        "Log Level",
+        "Bulletin Level", 
+        "Yield Duration",
+        "Penalty Duration",
+        "Concurrent Tasks",
+        "Scheduling Strategy",
+        "Scheduling Period"
+    }
+    
+    if property_name in non_restart_properties:
+        return False
+    
+    # Script processors need restart for script changes
+    if processor_type == "org.apache.nifi.processors.script.ExecuteScript":
+        script_properties = {"Script Body", "Script File", "Module Directory"}
+        if property_name in script_properties:
+            return True
+    
+    # HTTP processors don't need restart for most property changes
+    if "HandleHttp" in processor_type:
+        http_non_restart = {"HTTP Status Code", "Attributes to add to the HTTP Response (Regex)"}
+        if property_name in http_non_restart:
+            return False
+    
+    # Default: assume restart needed for safety
+    return True
+
+# DEPRECATED: Use update_nifi_processors_properties instead
+# This function is kept for backward compatibility but will be removed
+async def _update_nifi_processor_properties_legacy(
     processor_id: str,
     processor_config_properties: Dict[str, Any]
 ) -> Dict:
@@ -1127,11 +1163,12 @@ async def update_nifi_connection(
         return {"status": "error", "message": f"An unexpected error occurred during connection update: {e}", "entity": None}
 
 
+@smart_parameter_validation
 @mcp.tool()
 @tool_phases(["Modify"])
 @handle_nifi_errors
 async def delete_nifi_objects(
-    deletion_requests: List[Dict[str, Any]]
+    objects: List[Dict[str, Any]]
 ) -> List[Dict]:
     """
     Deletes multiple NiFi objects (processors, connections, ports, process groups, or controller services) in batch.
@@ -1141,7 +1178,7 @@ async def delete_nifi_objects(
     Attempts Auto-Disable for enabled controller services.
 
     Args:
-        deletion_requests: A list of deletion request dictionaries, each containing:
+        objects: A list of deletion request dictionaries, each containing:
             - object_type: The type of the object to delete ('processor', 'connection', 'port', 'process_group', 'controller_service')
             - object_id: The UUID of the object to delete
             - name (optional): A descriptive name for the object (used in logging/results)
@@ -1176,13 +1213,13 @@ async def delete_nifi_objects(
     if not local_logger:
          raise ToolError("Request logger context is not set.")
     
-    if not deletion_requests:
-        raise ToolError("The 'deletion_requests' list cannot be empty.")
-    if not isinstance(deletion_requests, list):
-        raise ToolError("Invalid 'deletion_requests' type. Expected a list of dictionaries.")
+    if not objects:
+        raise ToolError("The 'objects' list cannot be empty.")
+    if not isinstance(objects, list):
+        raise ToolError("Invalid 'objects' type. Expected a list of dictionaries.")
     
     # Validate each deletion request
-    for i, req in enumerate(deletion_requests):
+    for i, req in enumerate(objects):
         if not isinstance(req, dict):
             raise ToolError(f"Deletion request {i} is not a dictionary.")
         if "object_type" not in req or "object_id" not in req:
@@ -1190,17 +1227,17 @@ async def delete_nifi_objects(
         if req["object_type"] not in ["processor", "connection", "port", "process_group", "controller_service"]:
             raise ToolError(f"Deletion request {i} has invalid object_type '{req['object_type']}'. Must be one of: processor, connection, port, process_group, controller_service.")
 
-    local_logger.info(f"Executing delete_nifi_objects for {len(deletion_requests)} objects")
+    local_logger.info(f"Executing delete_nifi_objects for {len(objects)} objects")
     
     results = []
     
-    for i, deletion_request in enumerate(deletion_requests):
+    for i, deletion_request in enumerate(objects):
         object_type = deletion_request["object_type"]
         object_id = deletion_request["object_id"]
         object_name = deletion_request.get("name", object_id)
         
         request_logger = local_logger.bind(object_id=object_id, object_type=object_type, request_index=i)
-        request_logger.info(f"Processing deletion request {i+1}/{len(deletion_requests)} for {object_type} '{object_name}' ({object_id})")
+        request_logger.info(f"Processing deletion request {i+1}/{len(objects)} for {object_type} '{object_name}' ({object_id})")
         
         try:
             # Call the original deletion logic for a single object
@@ -1695,3 +1732,108 @@ async def _delete_single_nifi_object(
         logger.error(f"Unexpected error deleting {object_type} {object_id}: {e}", exc_info=True)
         logger.bind(interface="nifi", direction="response", data={"error": str(e)}).debug("Received error from NiFi API (delete)")
         return {"status": "error", "message": f"An unexpected error occurred during deletion: {e}"}
+
+
+@smart_parameter_validation
+@mcp.tool()
+@tool_phases(["Modify"])
+async def update_nifi_processors_properties(
+    updates: List[Dict[str, Any]]
+) -> List[Dict]:
+    """
+    Updates one or more processors' properties efficiently.
+    
+    This tool handles both single processor updates and batch updates, automatically
+    optimizing the operation for the number of processors provided.
+    
+    Args:
+        updates: List of property update dictionaries, each containing:
+            - processor_id: UUID of the processor to update
+            - properties: Dictionary of properties to update
+            - name (optional): Descriptive name for logging
+            
+    Example:
+    ```python
+    updates = [
+        {
+            "processor_id": "abc-123",
+            "properties": {"Log Level": "info", "Yield Duration": "1 sec"},
+            "name": "LogRawInput"
+        },
+        {
+            "processor_id": "def-456", 
+            "properties": {"Log Level": "info"},
+            "name": "LogResponse"
+        }
+    ]
+    ```
+    
+    Returns:
+        List of update results, one per processor.
+    """
+    nifi_client: Optional[NiFiClient] = current_nifi_client.get()
+    local_logger = current_request_logger.get() or logger
+    if not nifi_client:
+        raise ToolError("NiFi client context is not set. This tool requires the X-Nifi-Server-Id header.")
+    if not local_logger:
+         raise ToolError("Request logger context is not set.")
+    
+    if not updates:
+        raise ToolError("The 'updates' list cannot be empty.")
+    if not isinstance(updates, list):
+        raise ToolError("Invalid 'updates' type. Expected a list of dictionaries.")
+    
+    # Validate each update request
+    for i, update in enumerate(updates):
+        if not isinstance(update, dict):
+            raise ToolError(f"Property update {i} is not a dictionary.")
+        if "processor_id" not in update or "properties" not in update:
+            raise ToolError(f"Property update {i} missing required fields 'processor_id' and/or 'properties'.")
+        if not isinstance(update["properties"], dict) or not update["properties"]:
+            raise ToolError(f"Property update {i} 'properties' must be a non-empty dictionary.")
+
+    local_logger.info(f"Executing batch property updates for {len(updates)} processors")
+    
+    results = []
+    
+    for i, update in enumerate(updates):
+        processor_id = update["processor_id"]
+        properties = update["properties"]
+        processor_name = update.get("name", processor_id)
+        
+        request_logger = local_logger.bind(processor_id=processor_id, request_index=i)
+        request_logger.info(f"Processing property update {i+1}/{len(updates)} for processor '{processor_name}' ({processor_id})")
+        
+        try:
+            # Call the legacy single processor update function
+            result = await _update_nifi_processor_properties_legacy(
+                processor_id=processor_id,
+                processor_config_properties=properties
+            )
+            
+            # Add metadata to the result
+            result["processor_id"] = processor_id
+            result["processor_name"] = processor_name
+            result["request_index"] = i
+            
+            results.append(result)
+            
+        except Exception as e:
+            error_result = {
+                "status": "error",
+                "message": f"Unexpected error updating processor '{processor_name}' ({processor_id}): {e}",
+                "processor_id": processor_id,
+                "processor_name": processor_name,
+                "request_index": i
+            }
+            results.append(error_result)
+            request_logger.error(f"Unexpected error in property update {i}: {e}", exc_info=True)
+    
+    # Summary logging
+    successful_updates = [r for r in results if r.get("status") == "success"]
+    failed_updates = [r for r in results if r.get("status") == "error"]
+    warning_updates = [r for r in results if r.get("status") in ["warning", "partial_success"]]
+    
+    local_logger.info(f"Batch property updates completed: {len(successful_updates)} successful, {len(failed_updates)} failed, {len(warning_updates)} warnings")
+    
+    return results

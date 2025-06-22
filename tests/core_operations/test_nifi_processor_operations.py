@@ -136,8 +136,10 @@ async def test_update_processor_properties_and_verify(
     """Tests updating a processor's properties and verifies the update."""
     log_proc_id = test_pg_with_processors.get("log_proc_id")
     generate_proc_id = test_pg_with_processors.get("generate_proc_id")
+    pg_id = test_pg_with_processors.get("pg_id")
     assert log_proc_id, "Log Processor ID not found from fixture."
     assert generate_proc_id, "Generate Processor ID not found from fixture."
+    assert pg_id, "Process Group ID not found from fixture."
 
     # First auto-terminate relationships to make the processor valid
     global_logger.info(f"Test: Auto-terminating relationships for LogAttribute Processor ID: {log_proc_id}")
@@ -165,7 +167,7 @@ async def test_update_processor_properties_and_verify(
     }
     connection_result_list = await call_tool(
         client=async_client, base_url=base_url, tool_name="create_nifi_connections",
-        arguments={"connections": [create_connection_args]}, headers=mcp_headers, custom_logger=global_logger
+        arguments={"connections": [create_connection_args], "process_group_id": pg_id}, headers=mcp_headers, custom_logger=global_logger
     )
     assert isinstance(connection_result_list, list) and connection_result_list and isinstance(connection_result_list[0], dict), \
         "Unexpected response format for create_nifi_connection"
@@ -178,19 +180,21 @@ async def test_update_processor_properties_and_verify(
     global_logger.info(f"Test: Updating LogAttribute ({log_proc_id}) properties.")
     target_log_level = "warn"
     update_props_args = {
-        "processor_id": log_proc_id,
-        "processor_config_properties": {
-            "Log Level": target_log_level,
-            "Attributes to Log": ".*",      # As per original test
-            "Log prefix": "mcp-test"       # As per original test
-        }
+        "updates": [{
+            "processor_id": log_proc_id,
+            "properties": {
+                "Log Level": target_log_level,
+                "Attributes to Log": ".*",      # As per original test
+                "Log prefix": "mcp-test"       # As per original test
+            }
+        }]
     }
     update_result_list = await call_tool(
-        client=async_client, base_url=base_url, tool_name="update_nifi_processor_properties",
+        client=async_client, base_url=base_url, tool_name="update_nifi_processors_properties",
         arguments=update_props_args, headers=mcp_headers, custom_logger=global_logger
     )
     assert isinstance(update_result_list, list) and update_result_list and isinstance(update_result_list[0], dict), \
-        "Unexpected response format for update_nifi_processor_properties"
+        "Unexpected response format for update_nifi_processors_properties"
     update_result = update_result_list[0]
     assert update_result.get("status") in ["success", "warning"], \
         f"Failed to update properties: {update_result.get('message')}"
@@ -274,8 +278,8 @@ async def test_auto_stop_update_running_processor(
     start_result_list = await call_tool(
         client=async_client,
         base_url=base_url,
-        tool_name="operate_nifi_object",
-        arguments=start_args,
+        tool_name="operate_nifi_objects",
+        arguments={"operations": [start_args]},
         headers=mcp_headers,
         custom_logger=global_logger
     )
@@ -311,20 +315,23 @@ async def test_auto_stop_update_running_processor(
     # Attempt update with Auto-Stop enabled
     headers_auto_stop_true = {**mcp_headers, "X-Mcp-Auto-Stop-Enabled": "true"}
     update_args = {
-        "processor_id": generate_proc_id,
-        "processor_config_properties": {
-            "File Size": target_file_size
-        }
+        "updates": [{
+            "processor_id": generate_proc_id,
+            "properties": {
+                "File Size": target_file_size
+            }
+        }]
     }
     update_result_list = await call_tool(
         client=async_client,
         base_url=base_url,
-        tool_name="update_nifi_processor_properties",
+        tool_name="update_nifi_processors_properties",
         arguments=update_args,
         headers=headers_auto_stop_true,
         custom_logger=global_logger
     )
     # Now that Auto-Stop is implemented, expect success
+    assert isinstance(update_result_list, list) and len(update_result_list) > 0, "Expected list response from batch tool"
     update_result = update_result_list[0]
     assert update_result.get("status") == "success", \
         "Expected success with Auto-Stop enabled (feature is now implemented)"
@@ -367,19 +374,22 @@ async def test_auto_stop_update_running_processor(
     # Use a different target value for the disabled test
     disabled_test_file_size = "3 kB" if target_file_size != "3 kB" else "4 kB"
     disabled_update_args = {
-        "processor_id": generate_proc_id,
-        "processor_config_properties": {
-            "File Size": disabled_test_file_size
-        }
+        "updates": [{
+            "processor_id": generate_proc_id,
+            "properties": {
+                "File Size": disabled_test_file_size
+            }
+        }]
     }
     update_result_list = await call_tool(
         client=async_client,
         base_url=base_url,
-        tool_name="update_nifi_processor_properties",
+        tool_name="update_nifi_processors_properties",
         arguments=disabled_update_args,
         headers=headers_auto_stop_false,
         custom_logger=global_logger
     )
+    assert isinstance(update_result_list, list) and len(update_result_list) > 0, "Expected list response from batch tool"
     assert update_result_list[0].get("status") == "error", \
         "Expected error when updating running processor with Auto-Stop disabled"
     global_logger.info("Test: Got expected error with Auto-Stop disabled")
@@ -401,4 +411,305 @@ async def test_auto_stop_update_running_processor(
     unchanged_file_size = unchanged_properties.get("File Size")
     assert unchanged_file_size == target_file_size, \
         f"File Size property should not have changed from successful update. Expected '{target_file_size}', got '{unchanged_file_size}'"
-    global_logger.info(f"Test: Confirmed processor {generate_proc_id} is still running with File Size: {target_file_size}") 
+    global_logger.info(f"Test: Confirmed processor {generate_proc_id} is still running with File Size: {target_file_size}")
+
+@pytest.mark.anyio
+async def test_create_processor_with_service_reference_resolution(
+    test_pg: dict,
+    async_client: httpx.AsyncClient,
+    base_url: str,
+    mcp_headers: dict,
+    global_logger: any
+):
+    """Tests that processors can be created with service references that get resolved automatically."""
+    pg_id = test_pg["id"]
+    
+    global_logger.info(f"Test: Creating HTTP Context Map service in PG {pg_id}")
+    
+    # Step 1: Create a controller service
+    create_service_result = await call_tool(
+        client=async_client,
+        base_url=base_url,
+        tool_name="create_nifi_controller_service",
+        arguments={
+            "service_type": "org.apache.nifi.http.StandardHttpContextMap",
+            "name": "TestHttpContextMap",
+            "process_group_id": pg_id
+        },
+        headers=mcp_headers,
+        custom_logger=global_logger
+    )
+    
+    assert create_service_result[0]["status"] == "success", f"Failed to create controller service: {create_service_result[0].get('message')}"
+    service_id = create_service_result[0]["entity"]["id"]
+    global_logger.info(f"Test: Successfully created service with ID: {service_id}")
+    
+    # Step 2: Create processors that reference the service by name (should be auto-resolved to UUID)
+    processors_data = [{
+        "processor_type": "org.apache.nifi.processors.standard.HandleHttpRequest",
+        "name": "TestHttpRequest",
+        "position_x": 100,
+        "position_y": 100,
+        "process_group_id": pg_id,
+        "properties": {
+            "HTTP Context Map": "TestHttpContextMap",  # Reference by name, should be resolved to UUID
+            "Listening Port": "8080",
+            "Base Path": "/test"
+        }
+    }, {
+        "processor_type": "org.apache.nifi.processors.standard.HandleHttpResponse",
+        "name": "TestHttpResponse",
+        "position_x": 300,
+        "position_y": 100,
+        "process_group_id": pg_id,
+        "properties": {
+            "HTTP Context Map": "TestHttpContextMap"  # Reference by name, should be resolved to UUID
+        }
+    }]
+    
+    global_logger.info(f"Test: Creating processors with service references in PG {pg_id}")
+    create_processors_result = await call_tool(
+        client=async_client,
+        base_url=base_url,
+        tool_name="create_nifi_processors",
+        arguments={"processors": processors_data},
+        headers=mcp_headers,
+        custom_logger=global_logger
+    )
+    
+    # Verify both processors were created successfully
+    assert len(create_processors_result) == 2, f"Expected 2 processor results, got {len(create_processors_result)}"
+    
+    for i, result in enumerate(create_processors_result):
+        processor_name = processors_data[i]["name"]
+        assert result["status"] in ["success", "warning"], f"Failed to create processor {processor_name}: {result.get('message')}"
+        
+        # Verify the service reference was resolved correctly
+        processor_entity = result["entity"]
+        properties = processor_entity.get("properties", {})
+        http_context_map_value = properties.get("HTTP Context Map")
+        
+        # The service reference should now be the UUID, not the name
+        assert http_context_map_value == service_id, f"Service reference not resolved correctly for {processor_name}. Expected {service_id}, got {http_context_map_value}"
+        
+        global_logger.info(f"Test: Successfully created processor {processor_name} with resolved service reference {service_id}") 
+
+@pytest.mark.anyio
+async def test_create_processor_with_invalid_base_path_property(
+    test_pg: dict,
+    async_client: httpx.AsyncClient,
+    base_url: str,
+    mcp_headers: dict,
+    global_logger: any
+):
+    """Tests that Phase 2B property validation removes invalid 'Base Path' property from HandleHttpRequest."""
+    pg_id = test_pg["id"]
+    
+    global_logger.info(f"Test: Creating HandleHttpRequest processor with invalid 'Base Path' property in PG {pg_id}")
+    
+    # Create processor with invalid "Base Path" property (should be "Allowed Paths")
+    processors_data = [{
+        "processor_type": "org.apache.nifi.processors.standard.HandleHttpRequest",
+        "name": "TestInvalidBasePathProcessor",
+        "position_x": 100,
+        "position_y": 100,
+        "process_group_id": pg_id,
+        "properties": {
+            "Listening Port": "8080",
+            "Base Path": "/test/invalid",  # This is INVALID for HandleHttpRequest
+            "Allow GET": "true"
+        }
+    }]
+    
+    create_result = await call_tool(
+        client=async_client,
+        base_url=base_url,
+        tool_name="create_nifi_processors",
+        arguments={"processors": processors_data},
+        headers=mcp_headers,
+        custom_logger=global_logger
+    )
+    
+    # Should be a list with one result
+    assert isinstance(create_result, list) and len(create_result) == 1
+    result = create_result[0]
+    
+    # Should succeed with warnings (invalid property removed)
+    assert result["status"] in ["success", "warning"], f"Expected success/warning, got: {result.get('message')}"
+    
+    # Verify warnings about invalid property
+    warnings = result.get("warnings", [])
+    invalid_base_path_warning = any(
+        "invalid property" in warning.lower() and "base path" in warning.lower() 
+        for warning in warnings
+    )
+    assert invalid_base_path_warning, f"Expected warning about invalid 'Base Path' property. Got warnings: {warnings}"
+    
+    # Verify processor was created successfully
+    entity = result.get("entity", {})
+    assert entity.get("id"), "Processor should have been created"
+    processor_id = entity["id"]
+    
+    # Verify the invalid property was removed
+    properties = entity.get("properties", {})
+    assert "Base Path" not in properties, f"Invalid 'Base Path' property should have been removed. Found properties: {list(properties.keys())}"
+    
+    # Verify valid properties are still there
+    assert properties.get("Listening Port") == "8080", "Valid properties should be preserved"
+    assert properties.get("Allow GET") == "true", "Valid properties should be preserved"
+    
+    global_logger.info(f"Test: Successfully validated Phase 2B property removal for processor {processor_id}")
+    global_logger.info(f"Test: Warnings generated: {warnings}") 
+
+@pytest.mark.anyio
+async def test_create_processor_with_nested_position_format(
+    test_pg: dict,
+    async_client: httpx.AsyncClient,
+    base_url: str,
+    mcp_headers: dict,
+    global_logger: any
+):
+    """Tests that processors can be created with nested position format {"position": {"x": 100, "y": 200}}."""
+    pg_id = test_pg["id"]
+    
+    global_logger.info(f"Test: Creating processor with nested position format in PG {pg_id}")
+    
+    # Test both flat and nested position formats
+    processors_data = [
+        {
+            "processor_type": "org.apache.nifi.processors.standard.LogAttribute",
+            "name": "TestNestedPosition",
+            "position": {"x": 200, "y": 150},  # Nested format
+            "process_group_id": pg_id,
+            "properties": {
+                "Log Level": "info"
+            }
+        },
+        {
+            "processor_type": "org.apache.nifi.processors.standard.LogAttribute", 
+            "name": "TestFlatPosition",
+            "position_x": 400,  # Flat format
+            "position_y": 150,
+            "process_group_id": pg_id,
+            "properties": {
+                "Log Level": "debug"
+            }
+        }
+    ]
+    
+    create_result = await call_tool(
+        client=async_client,
+        base_url=base_url,
+        tool_name="create_nifi_processors",
+        arguments={"processors": processors_data},
+        headers=mcp_headers,
+        custom_logger=global_logger
+    )
+    
+    # Should be a list with two results
+    assert isinstance(create_result, list) and len(create_result) == 2
+    
+    # Both should succeed
+    for i, result in enumerate(create_result):
+        assert result["status"] in ["success", "warning"], f"Processor {i} creation failed: {result.get('message')}"
+        
+        # Verify processor was created with correct position
+        entity = result.get("entity", {})
+        assert entity.get("id"), f"Processor {i} should have been created"
+        
+        position = entity.get("position", {})
+        expected_positions = [{"x": 200.0, "y": 150.0}, {"x": 400.0, "y": 150.0}]
+        assert position == expected_positions[i], f"Processor {i} should have correct position {expected_positions[i]}, got {position}"
+        
+        global_logger.info(f"Test: Successfully created processor {entity.get('name')} at position {position}") 
+
+@pytest.mark.anyio
+async def test_create_processor_with_invalid_property_name_service_reference(
+    test_pg: dict,
+    async_client: httpx.AsyncClient,
+    base_url: str,
+    mcp_headers: dict,
+    global_logger: any
+):
+    """Tests that Phase 2B property validation maps invalid property names containing service references to correct names."""
+    pg_id = test_pg["id"]
+    
+    global_logger.info(f"Test: Creating HTTP Context Map service first in PG {pg_id}")
+    
+    # Step 1: Create a controller service
+    create_service_result = await call_tool(
+        client=async_client,
+        base_url=base_url,
+        tool_name="create_nifi_controller_service",
+        arguments={
+            "service_type": "org.apache.nifi.http.StandardHttpContextMap",
+            "name": "TestHttpContextMap",
+            "process_group_id": pg_id
+        },
+        headers=mcp_headers,
+        custom_logger=global_logger
+    )
+    
+    assert create_service_result[0]["status"] == "success", f"Failed to create controller service: {create_service_result[0].get('message')}"
+    service_id = create_service_result[0]["entity"]["id"]
+    global_logger.info(f"Test: Successfully created service with ID: {service_id}")
+    
+    # Step 2: Create processor with wrong property name but correct service reference
+    processors_data = [{
+        "processor_type": "org.apache.nifi.processors.standard.HandleHttpRequest",
+        "name": "TestInvalidPropertyNameServiceRef",
+        "position_x": 100,
+        "position_y": 100,
+        "process_group_id": pg_id,
+        "properties": {
+            "Listening Port": "8080",
+            "Context Map": "@TestHttpContextMap",  # WRONG property name but CORRECT service reference
+            "Allow GET": "true"
+        }
+    }]
+    
+    create_result = await call_tool(
+        client=async_client,
+        base_url=base_url,
+        tool_name="create_nifi_processors",
+        arguments={"processors": processors_data},
+        headers=mcp_headers,
+        custom_logger=global_logger
+    )
+    
+    # Should be a list with one result
+    assert isinstance(create_result, list) and len(create_result) == 1
+    result = create_result[0]
+    
+    # Should succeed with warnings (property name mapped)
+    assert result["status"] in ["success", "warning"], f"Expected success/warning, got: {result.get('message')}"
+    
+    # Verify warnings about property name mapping
+    warnings = result.get("warnings", [])
+    property_mapping_warning = any(
+        "mapped invalid property name" in warning.lower() and "context map" in warning.lower() and "http context map" in warning.lower()
+        for warning in warnings
+    )
+    assert property_mapping_warning, f"Expected warning about property name mapping. Got warnings: {warnings}"
+    
+    # Verify processor was created successfully
+    entity = result.get("entity", {})
+    assert entity.get("id"), "Processor should have been created"
+    processor_id = entity["id"]
+    
+    # Verify the property name was corrected AND service reference was resolved
+    properties = entity.get("properties", {})
+    assert "Context Map" not in properties, "Invalid property name should have been removed"
+    assert "HTTP Context Map" in properties, "Correct property name should be present"
+    
+    # CRITICAL: Verify the service reference was resolved to the UUID
+    http_context_map_value = properties.get("HTTP Context Map")
+    assert http_context_map_value == service_id, f"Service reference should be resolved to UUID {service_id}, got {http_context_map_value}"
+    
+    # Verify other valid properties are still there
+    assert properties.get("Listening Port") == "8080", "Valid properties should be preserved"
+    assert properties.get("Allow GET") == "true", "Valid properties should be preserved"
+    
+    global_logger.info(f"Test: Successfully validated property name mapping and service resolution for processor {processor_id}")
+    global_logger.info(f"Test: Service reference '@TestHttpContextMap' was correctly mapped and resolved to UUID {service_id}")
+    global_logger.info(f"Test: Warnings generated: {warnings}") 

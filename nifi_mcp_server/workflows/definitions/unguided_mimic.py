@@ -2,7 +2,7 @@
 Unguided Mimic Workflow for NiFi MCP.
 
 This workflow replicates the existing unguided LLM execution loop behavior
-to ensure backward compatibility and identical results.
+using multiple nodes to better demonstrate PocketFlow's capabilities.
 """
 
 import json
@@ -17,218 +17,214 @@ from nifi_chat_ui.mcp_handler import get_available_tools, execute_mcp_tool
 from config.logging_setup import request_context
 
 
-class UnguidedMimicNode(NiFiWorkflowNode):
+class InitializeExecutionNode(NiFiWorkflowNode):
     """
-    Single node that replicates the entire unguided LLM execution loop.
-    
-    This node mimics the existing run_execution_loop function to ensure
-    identical behavior and results in guided mode.
+    Initialize execution context and prepare for LLM iterations.
     """
     
     def __init__(self):
         super().__init__(
-            name="unguided_mimic",
-            description="Replicates existing unguided LLM execution loop behavior",
+            name="initialize_execution",
+            description="Set up execution context and initialize iteration state",
             allowed_phases=["Review", "Creation", "Modification", "Operation"]
         )
-        self.max_iterations = 10  # Default, can be overridden
-        # For single-node workflow, ensure no successors to avoid hashing issues
-        self.successors = {}
-        
-    def post(self, shared, prep_res, exec_res):
-        """Override post to store results and return navigation key."""
-        # Store the complex execution results in shared state
-        shared["unguided_mimic_result"] = exec_res
-        shared["execution_completed"] = True
-        
-        # For single-node workflow, always navigate to completion
-        # In multi-node workflows, this would determine the next step
-        return "completed"  # Simple string for PocketFlow navigation
+        # Simplified successors for basic flow
+        self.successors = {
+            "ready": "llm_iteration",
+            "error": "finalize_execution"
+        }
         
     def exec(self, prep_res: Dict[str, Any]) -> Dict[str, Any]:
-        """Execute the unguided mimic workflow step."""
-        # Extract context 
-        provider = prep_res.get("provider", "anthropic")
-        model_name = prep_res.get("model_name", "claude-sonnet-4-20250109")
-        system_prompt = prep_res.get("system_prompt", "You are a helpful assistant.")
-        user_req_id = prep_res.get("user_request_id", "unknown")
-        initial_messages = prep_res.get("messages", [])
-        nifi_server_id = prep_res.get("selected_nifi_server_id")
-        
-        self.bound_logger.info(f"Starting unguided mimic execution with {len(initial_messages)} initial messages")
-        
-        # Initialize execution state
-        loop_count = 0
-        max_iterations = 10
-        messages = initial_messages.copy() if initial_messages else []
-        tool_results = []
-        request_tokens_in = 0
-        request_tokens_out = 0
-        
+        """Initialize execution context."""
         try:
-            # Main execution loop - replicating run_execution_loop logic
-            while loop_count < max_iterations:
-                loop_count += 1
-                llm_action_id = str(uuid.uuid4())
-                current_loop_logger = self.bound_logger.bind(loop=loop_count, action_id=llm_action_id)
-                current_loop_logger.info(f"Starting execution loop iteration {loop_count}")
-                
-                # Prepare tools
-                formatted_tools = self._prepare_tools(provider, user_req_id, current_loop_logger)
-                
-                # Prepare LLM context
-                llm_context_messages = [{"role": "system", "content": system_prompt}]
-                llm_context_messages.extend(messages)
-                
-                # Call LLM
-                response_data = self._call_llm(
-                    llm_context_messages, system_prompt, formatted_tools,
-                    provider, model_name, user_req_id, current_loop_logger
-                )
-                
-                # Handle LLM response
-                if "error" in response_data:
-                    # LLM error - return error result
-                    self.workflow_logger.bind(
-                        direction="response",
-                        data={"error": response_data["error"], "iteration": loop_count}
-                    ).error("LLM returned error response")
-                    
-                    final_result = {
-                        "status": "error",
-                        "message": f"LLM error: {response_data['error']}",
-                        "loop_count": loop_count,
-                        "messages": messages
-                    }
-                    break
-                    
-                llm_content = response_data.get("content")
-                tool_calls = response_data.get("tool_calls")
-                token_count_in = response_data.get("token_count_in", 0)
-                token_count_out = response_data.get("token_count_out", 0)
-                
-                # Log detailed LLM response for debugging
-                self.workflow_logger.bind(
-                    direction="response", 
-                    data={
-                        "iteration": loop_count,
-                        "content_length": len(llm_content) if llm_content else 0,
-                        "content_preview": llm_content[:200] if llm_content else None,
-                        "tool_calls_count": len(tool_calls) if tool_calls else 0,
-                        "token_count_in": token_count_in,
-                        "token_count_out": token_count_out,
-                        "has_content": bool(llm_content),
-                        "has_tool_calls": bool(tool_calls)
-                    }
-                ).info("LLM response received")
-                
-                request_tokens_in += token_count_in
-                request_tokens_out += token_count_out
-                
-                # Add assistant message to history
-                assistant_message = {"role": "assistant"}
-                if llm_content:
-                    assistant_message["content"] = llm_content
-                if tool_calls:
-                    assistant_message["tool_calls"] = tool_calls
-                messages.append(assistant_message)
-                
-                # Handle tool calls or completion
-                if not tool_calls:
-                    # No tool calls - check for completion
-                    if llm_content and "TASK COMPLETE" in llm_content:
-                        self.workflow_logger.bind(
-                            direction="decision",
-                            data={"reason": "task_complete_detected", "content_preview": llm_content[:100]}
-                        ).info("Ending execution loop - TASK COMPLETE detected")
-                        current_loop_logger.info("TASK COMPLETE detected. Ending execution loop.")
-                        break
-                    else:
-                        # For unguided mimic, if LLM responds without tool calls and doesn't say complete,
-                        # it means the response is complete for this user request. 
-                        # This mimics the original behavior where each user message gets one execution cycle.
-                        self.workflow_logger.bind(
-                            direction="decision",
-                            data={
-                                "reason": "no_tool_calls_no_task_complete", 
-                                "content_preview": llm_content[:100] if llm_content else None,
-                                "has_content": bool(llm_content)
-                            }
-                        ).info("Ending execution loop - LLM response without tool calls")
-                        current_loop_logger.info("LLM provided response without tool calls. Execution complete for this request.")
-                        break
-                else:
-                    # Process tool calls
-                    self.workflow_logger.bind(
-                        direction="decision",
-                        data={"reason": "processing_tool_calls", "tool_calls_count": len(tool_calls)}
-                    ).info("Processing tool calls - continuing execution loop")
-                    current_loop_logger.info(f"Processing {len(tool_calls)} tool call(s)")
-                    tool_results_this_iteration = []
-                    
-                    for tool_call in tool_calls:
-                        tool_result = self._execute_tool_call(
-                            tool_call, nifi_server_id, user_req_id, 
-                            llm_action_id, current_loop_logger
-                        )
-                        
-                        if tool_result:
-                            messages.append(tool_result["message"])
-                            tool_results_this_iteration.append(tool_result)
-                            
-                    tool_results.extend(tool_results_this_iteration)
-                    current_loop_logger.debug(f"Completed {len(tool_results_this_iteration)} tool calls")
-                    
-            # Prepare final results
-            final_result = {
-                "status": "success",
-                "message": f"Unguided mimic execution completed after {loop_count} iterations",
-                "loop_count": loop_count,
-                "max_iterations_reached": loop_count >= max_iterations,
-                "messages": messages,
-                "total_tokens_in": request_tokens_in,
-                "total_tokens_out": request_tokens_out,
-                "tool_calls_executed": len(tool_results),
-                "tool_results": tool_results
+            # Extract context from UI with fallbacks instead of strict validation
+            provider = prep_res.get("provider", "anthropic") 
+            model_name = prep_res.get("model_name", "claude-sonnet-4-20250109")
+            system_prompt = prep_res.get("system_prompt", "You are a helpful assistant.")
+            user_req_id = prep_res.get("user_request_id", "unknown")
+            initial_messages = prep_res.get("messages", [])
+            nifi_server_id = prep_res.get("selected_nifi_server_id")
+            
+            # Log warnings for missing fields instead of failing
+            missing_fields = []
+            if not provider: missing_fields.append("provider")
+            if not model_name: missing_fields.append("model_name") 
+            if not system_prompt: missing_fields.append("system_prompt")
+            if not user_req_id: missing_fields.append("user_request_id")
+            if not initial_messages: missing_fields.append("messages")
+            if not nifi_server_id: missing_fields.append("selected_nifi_server_id")
+            
+            if missing_fields:
+                self.bound_logger.warning(f"Missing context fields: {missing_fields}, using fallbacks")
+            
+            self.bound_logger.info(f"Initializing execution with provider: {provider}, model: {model_name}")
+            
+            # Initialize state
+            execution_state = {
+                "provider": provider,
+                "model_name": model_name,
+                "system_prompt": system_prompt,
+                "user_request_id": user_req_id,
+                "nifi_server_id": nifi_server_id,
+                "messages": initial_messages.copy() if initial_messages else [],
+                "loop_count": 0,
+                "max_iterations": 10,
+                "tool_results": [],
+                "request_tokens_in": 0,
+                "request_tokens_out": 0,
+                "execution_complete": False
             }
             
-            if loop_count >= max_iterations:
-                final_result["status"] = "warning"
-                final_result["message"] = f"Reached maximum iterations ({max_iterations})"
-                
-            self.bound_logger.info(f"Unguided mimic execution completed: {final_result['status']}")
-            return final_result
+            return {
+                "status": "success",
+                "execution_state": execution_state,
+                "message": "Execution initialized successfully"
+            }
             
         except Exception as e:
-            self.bound_logger.error(f"Error in unguided mimic execution: {e}", exc_info=True)
+            self.bound_logger.error(f"Error initializing execution: {e}", exc_info=True)
             return {
                 "status": "error",
-                "message": f"Execution failed: {e}",
-                "loop_count": loop_count,
-                "messages": messages
+                "error": str(e),
+                "message": "Failed to initialize execution"
             }
-            
-    def _prepare_tools(self, provider: str, user_req_id: str, logger) -> Optional[List[Dict[str, Any]]]:
-        """Prepare tools for LLM call, replicating the existing logic."""
+    
+    def post(self, shared, prep_res, exec_res):
+        """Store initialization results."""
+        shared["execution_state"] = exec_res.get("execution_state", {})
+        
+        if exec_res.get("status") == "error":
+            return "error"
+        # For single-node workflow, return 'completed' instead of 'ready'
+        return "completed"
+
+
+class LLMIterationNode(NiFiWorkflowNode):
+    """
+    Execute a single LLM iteration with tool processing.
+    """
+    
+    def __init__(self):
+        super().__init__(
+            name="llm_iteration", 
+            description="Execute LLM call and process any tool calls",
+            allowed_phases=["Review", "Creation", "Modification", "Operation"]
+        )
+        # Simplified successors - just continue to next node
+        self.successors = {
+            "continue": "evaluate_completion",
+            "error": "finalize_execution"
+        }
+        
+    def exec(self, prep_res: Dict[str, Any]) -> Dict[str, Any]:
+        """Execute single LLM iteration."""
         try:
-            # Get available tools - check both possible keys for nifi_server_id
-            nifi_server_id = None
-            if self.context_manager:
-                # Try both keys - server passes "nifi_server_id", UI might pass "selected_nifi_server_id"
-                nifi_server_id = (
-                    self.context_manager.shared_state.get("nifi_server_id") or 
-                    self.context_manager.shared_state.get("selected_nifi_server_id")
-                )
+            execution_state = prep_res.get("execution_state", {})
+            execution_state["loop_count"] += 1
+            loop_count = execution_state["loop_count"]
+            max_iterations = execution_state.get("max_iterations", 10)
+            
+            self.bound_logger.info(f"Starting LLM iteration {loop_count}/{max_iterations}")
+            
+            # Check max iterations
+            if loop_count > max_iterations:
+                return {
+                    "status": "max_iterations_reached",
+                    "execution_state": execution_state,
+                    "message": f"Reached maximum iterations ({max_iterations})"
+                }
+            
+            # Prepare tools
+            formatted_tools = self._prepare_tools(execution_state)
+            
+            # Prepare LLM context
+            llm_context_messages = [{"role": "system", "content": execution_state["system_prompt"]}]
+            llm_context_messages.extend(execution_state["messages"])
+            
+            # Call LLM
+            response_data = self._call_llm(llm_context_messages, formatted_tools, execution_state)
+            
+            if "error" in response_data:
+                return {
+                    "status": "error",
+                    "execution_state": execution_state,
+                    "error": response_data["error"]
+                }
+            
+            # Update token counts
+            execution_state["request_tokens_in"] += response_data.get("token_count_in", 0)
+            execution_state["request_tokens_out"] += response_data.get("token_count_out", 0)
+            
+            # Add assistant message to history
+            llm_content = response_data.get("content")
+            tool_calls = response_data.get("tool_calls")
+            
+            assistant_message = {"role": "assistant"}
+            if llm_content:
+                assistant_message["content"] = llm_content
+            if tool_calls:
+                assistant_message["tool_calls"] = tool_calls
+            execution_state["messages"].append(assistant_message)
+            
+            # Process tool calls if any
+            if tool_calls:
+                tool_results = self._process_tool_calls(tool_calls, execution_state)
+                execution_state["tool_results"].extend(tool_results)
+                
+                # Add tool results to messages
+                for tool_result in tool_results:
+                    execution_state["messages"].append(tool_result["message"])
+            
+            # Check for completion
+            task_complete = llm_content and "TASK COMPLETE" in llm_content
+            
+            return {
+                "status": "success", 
+                "execution_state": execution_state,
+                "llm_content": llm_content,
+                "task_complete": task_complete,
+                "tool_calls_processed": len(tool_calls) if tool_calls else 0,
+                "max_iterations_reached": loop_count >= max_iterations
+            }
+                
+        except Exception as e:
+            self.bound_logger.error(f"Error in LLM iteration: {e}", exc_info=True)
+            return {
+                "status": "error",
+                "execution_state": execution_state,
+                "error": str(e)
+            }
+    
+    def post(self, shared, prep_res, exec_res):
+        """Update shared state and determine next step."""
+        shared["execution_state"] = exec_res.get("execution_state", {})
+        shared["last_iteration_result"] = exec_res
+        
+        status = exec_res.get("status")
+        if status == "error":
+            return "error"
+        elif exec_res.get("max_iterations_reached") or exec_res.get("task_complete"):
+            # Skip evaluation, go directly to finalization
+            return "complete"
+        else:
+            return "continue"
+    
+    def _prepare_tools(self, execution_state: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
+        """Prepare tools for LLM call."""
+        try:
+            user_req_id = execution_state.get("user_request_id")
+            provider = execution_state.get("provider")
+            nifi_server_id = execution_state.get("nifi_server_id")
             
             raw_tools_list = get_available_tools(
                 user_request_id=user_req_id,
                 selected_nifi_server_id=nifi_server_id
             )
+            
             if not raw_tools_list:
-                logger.warning("No raw tools available")
+                self.bound_logger.warning("No raw tools available")
                 return None
                 
-            # Format tools for the provider
             formatted_tools = get_formatted_tool_definitions(
                 provider=provider,
                 raw_tools=raw_tools_list,
@@ -236,24 +232,24 @@ class UnguidedMimicNode(NiFiWorkflowNode):
             )
             
             if formatted_tools:
-                logger.debug(f"Tools successfully formatted for {provider} ({len(formatted_tools)} tools)")
-            else:
-                logger.warning(f"Tool formatting returned None for {provider}")
-                
+                self.bound_logger.debug(f"Tools prepared for {provider} ({len(formatted_tools)} tools)")
+            
             return formatted_tools
             
         except Exception as e:
-            logger.error(f"Error preparing tools for {provider}: {e}", exc_info=True)
+            self.bound_logger.error(f"Error preparing tools: {e}", exc_info=True)
             return None
-            
-    def _call_llm(self, messages: List[Dict[str, Any]], system_prompt: str, 
-                  tools: Optional[List[Dict[str, Any]]], provider: str, 
-                  model_name: str, user_req_id: str, logger) -> Dict[str, Any]:
+    
+    def _call_llm(self, messages: List[Dict[str, Any]], tools: Optional[List[Dict[str, Any]]], 
+                  execution_state: Dict[str, Any]) -> Dict[str, Any]:
         """Call LLM with the prepared context."""
         try:
-            logger.info(f"Calling LLM ({provider} - {model_name})")
-            logger.debug(f"LLM request - Messages: {len(messages)}, Tools: {len(tools) if tools else 0}")
-            logger.debug(f"LLM request - System prompt length: {len(system_prompt)}")
+            provider = execution_state.get("provider")
+            model_name = execution_state.get("model_name") 
+            system_prompt = execution_state.get("system_prompt")
+            user_req_id = execution_state.get("user_request_id")
+            
+            self.bound_logger.info(f"Calling LLM ({provider} - {model_name})")
             
             response_data = get_llm_response(
                 messages=messages,
@@ -264,111 +260,201 @@ class UnguidedMimicNode(NiFiWorkflowNode):
                 user_request_id=user_req_id
             )
             
-            logger.debug(f"LLM raw response type: {type(response_data)}")
-            if response_data:
-                logger.debug(f"LLM response keys: {list(response_data.keys()) if isinstance(response_data, dict) else 'not dict'}")
-                logger.debug(f"LLM response content length: {len(str(response_data.get('content', ''))) if isinstance(response_data, dict) else 'N/A'}")
-                logger.debug(f"LLM response token counts: in={response_data.get('token_count_in', 'N/A')}, out={response_data.get('token_count_out', 'N/A')}")
-            else:
-                logger.warning("LLM response_data is None/empty")
-            
             if response_data is None:
-                logger.error("LLM response data was None")
                 return {"error": "LLM response was empty"}
+            
+            return response_data
+            
+        except Exception as e:
+            self.bound_logger.error(f"Error calling LLM: {e}", exc_info=True)
+            return {"error": f"Error calling LLM: {e}"}
+    
+    def _process_tool_calls(self, tool_calls: List[Dict[str, Any]], 
+                           execution_state: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Process tool calls and return results."""
+        tool_results = []
+        user_req_id = execution_state.get("user_request_id")
+        nifi_server_id = execution_state.get("nifi_server_id")
+        
+        for tool_call in tool_calls:
+            try:
+                tool_id = tool_call.get("id")
+                function_call = tool_call.get("function", {})
+                function_name = function_call.get("name")
+                function_args_str = function_call.get("arguments", "{}")
+                
+                self.bound_logger.info(f"Executing tool: {function_name} (ID: {tool_id})")
+                
+                arguments = json.loads(function_args_str)
+                
+                tool_result = execute_mcp_tool(
+                    tool_name=function_name,
+                    params=arguments,
+                    selected_nifi_server_id=nifi_server_id,
+                    user_request_id=user_req_id,
+                    action_id=str(uuid.uuid4())
+                )
+                
+                tool_result_content = json.dumps(tool_result) if tool_result is not None else "null"
+                
+                tool_message = {
+                    "role": "tool",
+                    "tool_call_id": tool_id,
+                    "content": tool_result_content
+                }
+                
+                tool_results.append({
+                    "tool_name": function_name,
+                    "tool_id": tool_id,
+                    "arguments": arguments,
+                    "result": tool_result,
+                    "message": tool_message
+                })
+                
+            except Exception as e:
+                self.bound_logger.error(f"Error executing tool {function_name}: {e}", exc_info=True)
+                error_message = {
+                    "role": "tool", 
+                    "tool_call_id": tool_id,
+                    "content": f"Error executing tool: {e}"
+                }
+                tool_results.append({
+                    "tool_name": function_name,
+                    "tool_id": tool_id,
+                    "error": str(e),
+                    "message": error_message
+                })
+        
+        return tool_results
+
+
+class EvaluateCompletionNode(NiFiWorkflowNode):
+    """
+    Evaluate whether the workflow should continue or complete.
+    """
+    
+    def __init__(self):
+        super().__init__(
+            name="evaluate_completion",
+            description="Determine if execution should continue or complete",
+            allowed_phases=["Review"]
+        )
+        self.successors = {
+            "continue": "llm_iteration",
+            "complete": "finalize_execution"
+        }
+    
+    def exec(self, prep_res: Dict[str, Any]) -> Dict[str, Any]:
+        """Evaluate completion status."""
+        try:
+            execution_state = prep_res.get("execution_state", {})
+            last_result = prep_res.get("last_iteration_result", {})
+            
+            loop_count = execution_state.get("loop_count", 0)
+            max_iterations = execution_state.get("max_iterations", 10)
+            task_complete = last_result.get("task_complete", False)
+            
+            # Simple completion logic
+            if loop_count >= max_iterations or task_complete:
+                return {
+                    "status": "complete",
+                    "decision": "complete",
+                    "reason": "Task complete or max iterations reached"
+                }
             else:
-                logger.info(f"Received response from LLM ({provider})")
-                return response_data
+                return {
+                    "status": "continue",
+                    "decision": "continue",
+                    "reason": "More iterations needed"
+                }
                 
         except Exception as e:
-            logger.error(f"Error calling LLM API ({provider}): {e}", exc_info=True)
-            return {"error": f"Error calling LLM API: {e}"}
-            
-    def _execute_tool_call(self, tool_call: Dict[str, Any], nifi_server_id: Optional[str],
-                          user_req_id: str, action_id: str, logger) -> Optional[Dict[str, Any]]:
-        """Execute a single tool call, replicating the existing logic."""
+            self.bound_logger.error(f"Error evaluating completion: {e}", exc_info=True)
+            return {
+                "status": "error",
+                "decision": "complete",
+                "error": str(e)
+            }
+    
+    def post(self, shared, prep_res, exec_res):
+        """Determine next step based on evaluation."""
+        shared["completion_evaluation"] = exec_res
+        decision = exec_res.get("decision", "complete")
+        return decision
+
+
+class FinalizeExecutionNode(NiFiWorkflowNode):
+    """
+    Finalize execution and prepare final results.
+    """
+    
+    def __init__(self):
+        super().__init__(
+            name="finalize_execution",
+            description="Generate final results and completion summary",
+            allowed_phases=["Review"]
+        )
+        # No successors - this is the final node
+        self.successors = {}
+    
+    def exec(self, prep_res: Dict[str, Any]) -> Dict[str, Any]:
+        """Finalize execution and prepare results."""
         try:
-            tool_id = tool_call.get("id")
-            function_call = tool_call.get("function")
+            execution_state = prep_res.get("execution_state", {})
             
-            if not tool_id or not function_call or not isinstance(function_call, dict):
-                logger.error(f"Invalid tool call structure: {tool_call}")
-                return None
-                
-            function_name = function_call.get("name")
-            function_args_str = function_call.get("arguments", "{}")
+            loop_count = execution_state.get("loop_count", 0)
+            max_iterations = execution_state.get("max_iterations", 10)
+            max_iterations_reached = loop_count >= max_iterations
             
-            logger.info(f"Executing tool: {function_name} (ID: {tool_id})")
-            
-            # Parse arguments
-            arguments = json.loads(function_args_str)
-            logger.debug(f"Parsed arguments for {function_name}: {arguments}")
-            
-            # Execute the tool using mcp_handler
-            tool_result = execute_mcp_tool(
-                tool_name=function_name,
-                params=arguments,
-                selected_nifi_server_id=nifi_server_id,
-                user_request_id=user_req_id,
-                action_id=action_id
-            )
-            
-            # Format result for the LLM
-            tool_result_content = json.dumps(tool_result) if tool_result is not None else "null"
-            logger.debug(f"Tool {function_name} execution result: {tool_result_content[:200]}...")
-            
-            # Create tool result message for LLM
-            tool_message = {
-                "role": "tool",
-                "tool_call_id": tool_id,
-                "content": tool_result_content
+            # Prepare final results
+            final_result = {
+                "status": "success",
+                "message": f"Unguided mimic execution completed after {loop_count} iterations",
+                "loop_count": loop_count,
+                "max_iterations_reached": max_iterations_reached,
+                "messages": execution_state.get("messages", []),
+                "total_tokens_in": execution_state.get("request_tokens_in", 0),
+                "total_tokens_out": execution_state.get("request_tokens_out", 0),
+                "tool_calls_executed": len(execution_state.get("tool_results", [])),
+                "tool_results": execution_state.get("tool_results", [])
             }
             
+            if max_iterations_reached:
+                final_result["status"] = "warning"
+                final_result["message"] = f"Reached maximum iterations ({max_iterations})"
+            
+            self.bound_logger.info(f"Execution finalized: {final_result['status']}")
+            return final_result
+            
+        except Exception as e:
+            self.bound_logger.error(f"Error finalizing execution: {e}", exc_info=True)
             return {
-                "tool_name": function_name,
-                "tool_id": tool_id,
-                "arguments": arguments,
-                "result": tool_result,
-                "message": tool_message
+                "status": "error",
+                "message": f"Execution failed: {e}",
+                "loop_count": 0,
+                "messages": []
             }
-            
-        except json.JSONDecodeError as json_err:
-            error_content = f"Error parsing arguments for {function_name}: {json_err}"
-            logger.error(error_content)
-            return {
-                "tool_name": function_name,
-                "tool_id": tool_id,
-                "error": error_content,
-                "message": {
-                    "role": "tool",
-                    "tool_call_id": tool_id,
-                    "content": error_content
-                }
-            }
-        except Exception as tool_err:
-            error_content = f"Error executing tool {function_name}: {tool_err}"
-            logger.error(error_content, exc_info=True)
-            return {
-                "tool_name": function_name,
-                "tool_id": tool_id,
-                "error": error_content,
-                "message": {
-                    "role": "tool",
-                    "tool_call_id": tool_id,
-                    "content": error_content
-                }
-            }
+    
+    def post(self, shared, prep_res, exec_res):
+        """Store final results."""
+        shared["unguided_mimic_result"] = exec_res
+        shared["execution_completed"] = True
+        return "completed"
 
 
 def create_unguided_mimic_workflow() -> List[NiFiWorkflowNode]:
-    """Factory function to create the unguided mimic workflow."""
-    return [UnguidedMimicNode()]
+    """Factory function to create the unguided mimic workflow - temporarily simplified to debug."""
+    # Temporarily use only the initialization node to test basic execution
+    return [
+        InitializeExecutionNode()
+    ]
 
 
 # Register the unguided mimic workflow
 unguided_mimic_workflow = WorkflowDefinition(
     name="unguided_mimic",
     display_name="Unguided Mimic",
-    description="Replicates the existing unguided LLM execution behavior for backward compatibility",
+    description="Replicates the existing unguided LLM execution behavior using multi-node workflow",
     category="Basic",
     phases=["Review", "Creation", "Modification", "Operation"],
     factory=create_unguided_mimic_workflow,

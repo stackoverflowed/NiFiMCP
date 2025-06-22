@@ -420,7 +420,48 @@ docs/
 - User questions are handled smoothly within workflow
 - Performance comparison shows benefits of guided approach
 
-### Phase 4: Build New Workflow (Week 6-8)
+### Phase 4: Debugging Workflow (Week 6-7) **[NEW - HIGH PRIORITY]**
+
+**Goal**: Implement systematic debugging workflow to address LLM issues observed in practice
+
+**Tasks**:
+1. **Implement Debugging workflow nodes**
+   - `AnalyzeErrorPatternsNode` (Review phase) - Parse bulletins/logs systematically
+   - `GetCurrentStateNode` (Review phase) - Get fresh processor/flow state with revision data
+   - `IdentifyRootCauseNode` (Review phase) - Correlate errors with configuration
+   - `PlanFixStrategyNode` (Review phase) - Plan fix before implementing
+   - `PrepareFixEnvironmentNode` (Modification phase) - Stop processors, clear queues safely
+   - `ImplementFixNode` (Modification phase) - Apply fix with current revision data
+   - `ValidateFixNode` (Review phase) - Check validation status immediately
+   - `TestFixNode` (Operation phase) - Test the fix end-to-end
+   - `DocumentSolutionNode` (Review phase) - Document what worked
+
+2. **Systematic error analysis**
+   - Implement mandatory bulletin/error message parsing
+   - Add pattern recognition for common NiFi issues (stream lifecycle, revision conflicts)
+   - Create error correlation with processor configuration
+   - Force analysis before allowing blind retries
+
+3. **Revision-aware operations**
+   - Always get fresh processor state before modifications
+   - Handle revision conflicts with automatic retry using fresh state
+   - Track revision changes through workflow steps
+   - Prevent revision mismatch errors through systematic state management
+
+4. **Context-aware decision making**
+   - Force LLM to analyze ALL returned data from tool calls
+   - Extract actionable insights from error messages before proceeding
+   - Make decisions based on actual system state, not assumptions
+   - Prevent ignoring rich diagnostic information
+
+**Success Criteria**:
+- Debugging workflow prevents blind iteration cycles seen in manual debugging
+- Systematic error analysis identifies root causes before attempting fixes
+- Revision conflicts are handled automatically with fresh state retrieval
+- Context from tool responses is fully utilized for decision making
+- Maximum 3 retries with mandatory failure analysis between attempts
+
+### Phase 5: Build New Workflow (Week 8-9)
 
 **Goal**: Implement complex multi-phase workflow with creation/modification tools
 
@@ -455,7 +496,7 @@ docs/
 - Error handling prevents workflow from getting stuck
 - Validation catches common mistakes early
 
-### Phase 5: Build Modify Workflow (Week 9-10)
+### Phase 6: Build Modify Workflow (Week 10-11)
 
 **Goal**: Implement workflow that works with existing flows
 
@@ -482,7 +523,7 @@ docs/
 - No unintended side effects on existing flow components
 - Clear feedback on what was changed and why
 
-### Phase 6: Optimization and Polish (Week 11-12)
+### Phase 7: Optimization and Polish (Week 12-13)
 
 **Goal**: Optimize performance, improve user experience, comprehensive testing
 
@@ -904,8 +945,351 @@ Our investigation confirmed several critical architectural decisions:
 
 ---
 
+## Debugging Workflow Implementation Details
+
+### Code Structure for Debugging Workflow
+
+Based on PocketFlow's 100-line core design and our existing implementation patterns, here's the detailed structure for the debugging workflow:
+
+#### 1. Debugging Workflow Definition
+
+```python
+# nifi_mcp_server/workflows/definitions/debugging.py
+
+from typing import Dict, Any, List
+from ..nodes.nifi_node import NiFiWorkflowNode
+from ..registry import WorkflowDefinition, register_workflow
+from nifi_chat_ui.chat_manager import get_llm_response
+
+
+class AnalyzeErrorPatternsNode(NiFiWorkflowNode):
+    """
+    Systematically analyze error patterns from NiFi bulletins and logs.
+    Prevents blind iteration by forcing comprehensive error analysis.
+    """
+    
+    def __init__(self):
+        super().__init__(
+            name="analyze_error_patterns",
+            description="Parse and analyze NiFi error patterns systematically",
+            allowed_phases=["Review"]
+        )
+        self.successors = {
+            "errors_found": "get_current_state",
+            "no_errors": "validate_current_state", 
+            "analysis_failed": "escalate_to_human"
+        }
+    
+    def exec(self, prep_res: Dict[str, Any]) -> Dict[str, Any]:
+        """Analyze error patterns from NiFi system."""
+        target_processor_id = prep_res.get("target_processor_id")
+        process_group_id = prep_res.get("process_group_id")
+        
+        try:
+            # MANDATORY: Get processor details to analyze bulletins
+            processor_details = await self.call_mcp_tool(
+                "get_nifi_object_details",
+                object_type="processor",
+                object_id=target_processor_id
+            )
+            
+            # MANDATORY: Get flow status for additional error context
+            flow_status = await self.call_mcp_tool(
+                "get_flow_status",
+                process_group_id=process_group_id
+            )
+            
+            # Extract and categorize errors
+            bulletins = processor_details.get("bulletins", [])
+            error_patterns = self._categorize_errors(bulletins)
+            
+            # Analyze error patterns with LLM
+            analysis_prompt = self._build_error_analysis_prompt(error_patterns, processor_details)
+            
+            analysis_result = await get_llm_response(
+                messages=[{"role": "user", "content": analysis_prompt}],
+                provider=prep_res.get("provider"),
+                model_name=prep_res.get("model_name"),
+                system_prompt="You are a NiFi debugging expert. Analyze error patterns systematically."
+            )
+            
+            return {
+                "status": "success",
+                "error_patterns": error_patterns,
+                "analysis": analysis_result.get("content"),
+                "processor_details": processor_details,
+                "flow_status": flow_status,
+                "has_errors": len(error_patterns) > 0
+            }
+            
+        except Exception as e:
+            return {
+                "status": "error",
+                "error": str(e),
+                "message": "Failed to analyze error patterns"
+            }
+    
+    def post(self, shared, prep_res, exec_res):
+        """Store analysis results and determine next step."""
+        shared["error_analysis"] = exec_res
+        shared["current_processor_details"] = exec_res.get("processor_details")
+        shared["current_flow_status"] = exec_res.get("flow_status")
+        
+        if exec_res.get("status") == "error":
+            return "analysis_failed"
+        elif exec_res.get("has_errors"):
+            return "errors_found"
+        else:
+            return "no_errors"
+    
+    def _categorize_errors(self, bulletins: List[Dict]) -> Dict[str, List[Dict]]:
+        """Categorize errors by type for systematic analysis."""
+        categories = {
+            "stream_lifecycle": [],
+            "revision_conflicts": [],
+            "validation_errors": [],
+            "script_errors": [],
+            "connection_errors": [],
+            "other": []
+        }
+        
+        for bulletin in bulletins:
+            message = bulletin.get("bulletin", {}).get("message", "")
+            
+            if "already in use" in message or "OutputStream" in message:
+                categories["stream_lifecycle"].append(bulletin)
+            elif "revision mismatch" in message or "Conflict" in message:
+                categories["revision_conflicts"].append(bulletin)
+            elif "validation" in message.lower() or "invalid" in message.lower():
+                categories["validation_errors"].append(bulletin)
+            elif "script" in message.lower() or "ScriptException" in message:
+                categories["script_errors"].append(bulletin)
+            elif "connection" in message.lower():
+                categories["connection_errors"].append(bulletin)
+            else:
+                categories["other"].append(bulletin)
+                
+        return categories
+
+
+class GetCurrentStateNode(NiFiWorkflowNode):
+    """
+    Get fresh processor and flow state with current revision data.
+    Prevents revision mismatch errors by always using latest state.
+    """
+    
+    def __init__(self):
+        super().__init__(
+            name="get_current_state",
+            description="Get fresh processor state with current revision",
+            allowed_phases=["Review"]
+        )
+        self.successors = {
+            "state_retrieved": "identify_root_cause",
+            "state_error": "escalate_to_human"
+        }
+    
+    def exec(self, prep_res: Dict[str, Any]) -> Dict[str, Any]:
+        """Get current state with fresh revision data."""
+        target_processor_id = prep_res.get("target_processor_id")
+        
+        try:
+            # ALWAYS get fresh state before any modifications
+            current_state = await self.call_mcp_tool(
+                "get_nifi_object_details",
+                object_type="processor", 
+                object_id=target_processor_id
+            )
+            
+            # Extract critical state information
+            revision = current_state.get("revision", {})
+            component = current_state.get("component", {})
+            
+            return {
+                "status": "success",
+                "current_revision": revision.get("version"),
+                "processor_state": component.get("state"),
+                "validation_status": component.get("validationStatus"),
+                "validation_errors": component.get("validationErrors"),
+                "full_state": current_state
+            }
+            
+        except Exception as e:
+            return {
+                "status": "error",
+                "error": str(e),
+                "message": "Failed to get current processor state"
+            }
+    
+    def post(self, shared, prep_res, exec_res):
+        """Store current state for use in subsequent nodes."""
+        shared["current_state"] = exec_res
+        shared["current_revision"] = exec_res.get("current_revision")
+        
+        if exec_res.get("status") == "error":
+            return "state_error"
+        else:
+            return "state_retrieved"
+
+
+class ImplementFixNode(NiFiWorkflowNode):
+    """
+    Implement fix using current revision data and systematic approach.
+    Prevents revision conflicts through proper state management.
+    """
+    
+    def __init__(self):
+        super().__init__(
+            name="implement_fix",
+            description="Apply fix with current revision data",
+            allowed_phases=["Modification"]
+        )
+        self.successors = {
+            "fix_applied": "validate_fix",
+            "revision_conflict": "get_current_state",  # Retry with fresh state
+            "fix_failed": "plan_fix_strategy",  # Go back to planning
+            "max_retries_reached": "escalate_to_human"
+        }
+    
+    def exec(self, prep_res: Dict[str, Any]) -> Dict[str, Any]:
+        """Apply the planned fix using current revision data."""
+        fix_plan = prep_res.get("fix_plan", {})
+        target_processor_id = prep_res.get("target_processor_id")
+        current_revision = prep_res.get("current_revision")
+        
+        try:
+            # Apply fix based on the plan type
+            fix_type = fix_plan.get("type")
+            
+            if fix_type == "script_update":
+                result = await self._apply_script_fix(
+                    target_processor_id, fix_plan, current_revision
+                )
+            elif fix_type == "property_update":
+                result = await self._apply_property_fix(
+                    target_processor_id, fix_plan, current_revision
+                )
+            elif fix_type == "state_change":
+                result = await self._apply_state_fix(
+                    target_processor_id, fix_plan, current_revision
+                )
+            else:
+                raise ValueError(f"Unknown fix type: {fix_type}")
+                
+            return result
+            
+        except Exception as e:
+            return {
+                "status": "error",
+                "error": str(e),
+                "message": f"Failed to apply {fix_type} fix"
+            }
+    
+    def post(self, shared, prep_res, exec_res):
+        """Handle fix results and determine next step."""
+        shared["fix_result"] = exec_res
+        
+        # Track retry count for this fix attempt
+        retry_count = shared.get("fix_retry_count", 0)
+        
+        if exec_res.get("status") == "error":
+            error_msg = exec_res.get("error", "")
+            
+            if "revision mismatch" in error_msg.lower() or "conflict" in error_msg.lower():
+                if retry_count < 3:
+                    shared["fix_retry_count"] = retry_count + 1
+                    return "revision_conflict"  # Get fresh state and retry
+                else:
+                    return "max_retries_reached"
+            else:
+                return "fix_failed"
+        else:
+            shared["fix_retry_count"] = 0  # Reset on success
+            return "fix_applied"
+
+
+# Workflow definition following PocketFlow patterns
+def create_debugging_workflow() -> List[NiFiWorkflowNode]:
+    """
+    Create debugging workflow following PocketFlow's simple graph model.
+    """
+    # Create nodes
+    analyze_errors = AnalyzeErrorPatternsNode()
+    get_state = GetCurrentStateNode()
+    identify_cause = IdentifyRootCauseNode()
+    plan_fix = PlanFixStrategyNode()
+    prepare_env = PrepareFixEnvironmentNode()
+    implement_fix = ImplementFixNode()
+    validate_fix = ValidateFixNode()
+    test_fix = TestFixNode()
+    document_solution = DocumentSolutionNode()
+    
+    # Set up conditional routing (PocketFlow's successor pattern)
+    analyze_errors.successors = {
+        "errors_found": get_state,
+        "no_errors": validate_fix,
+        "analysis_failed": "escalate_to_human"
+    }
+    
+    get_state.successors = {
+        "state_retrieved": identify_cause,
+        "state_error": "escalate_to_human"
+    }
+    
+    # ... (continue routing setup for all nodes)
+    
+    return [
+        analyze_errors, get_state, identify_cause, plan_fix,
+        prepare_env, implement_fix, validate_fix, test_fix, document_solution
+    ]
+
+
+@register_workflow
+class DebuggingWorkflowDefinition(WorkflowDefinition):
+    """Debugging workflow registration."""
+    
+    name = "debugging"
+    description = "Systematic debugging workflow for NiFi issues"
+    phases = ["Review", "Modification", "Operation"]
+    
+    def create_nodes(self) -> List[NiFiWorkflowNode]:
+        return create_debugging_workflow()
+```
+
+#### 2. Key Implementation Patterns
+
+**Following PocketFlow's 100-line philosophy:**
+
+1. **Simple Node Structure**: Each node has clear `prep()`, `exec()`, `post()` methods
+2. **String-based Navigation**: `post()` returns simple strings for routing
+3. **Shared State Storage**: Complex data stored in shared state, not passed directly
+4. **Conditional Routing**: Uses `successors` dictionary for next-step determination
+5. **Minimal Dependencies**: Leverages existing NiFi MCP tools, no new dependencies
+
+**Addressing LLM Issues Systematically:**
+
+1. **Mandatory Analysis**: Can't proceed without analyzing error patterns first
+2. **Fresh State**: Always gets current revision before modifications
+3. **Context Utilization**: Forces analysis of ALL returned tool data
+4. **Retry Logic**: Maximum 3 attempts with fresh state retrieval
+5. **Pattern Recognition**: Categorizes errors to prevent repeated mistakes
+
+#### 3. Integration with Existing Codebase
+
+The debugging workflow follows all existing patterns:
+
+- **Logging**: Uses existing `bound_logger` and `workflow_logger` patterns
+- **MCP Integration**: Calls existing tools via `call_mcp_tool()` method
+- **Error Handling**: Uses existing `WorkflowNodeError` patterns
+- **Configuration**: Extends existing workflow configuration system
+- **UI Integration**: Works with existing workflow selector and progress tracking
+
+This debugging workflow would have prevented the exact issues we observed in the debugging session by forcing systematic analysis, fresh state retrieval, and proper context utilization.
+
+---
+
 ## Conclusion
 
 This implementation plan provides a structured approach to integrating PocketFlow workflows into the NiFi MCP system while maintaining backwards compatibility and enabling gradual adoption. The phased approach allows for learning and adjustment while building increasingly sophisticated workflow capabilities.
 
-The key to success will be starting simple with the guided-unguided mimic, then gradually adding complexity while maintaining focus on user experience and measurable improvements over the current approach.
+The key to success will be starting simple with the guided-unguided mimic, then immediately implementing the debugging workflow to address real-world LLM issues, before gradually adding complexity with building and modification workflows while maintaining focus on user experience and measurable improvements over the current approach.

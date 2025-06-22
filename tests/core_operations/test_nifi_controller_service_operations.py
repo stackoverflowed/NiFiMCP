@@ -3,7 +3,7 @@
 import pytest
 import httpx
 from loguru import logger
-from typing import Dict, Any, List
+from typing import Dict, Any, List, AsyncGenerator
 import anyio
 import asyncio
 
@@ -18,7 +18,7 @@ async def test_pg_with_controller_services(
     mcp_headers: dict,
     nifi_test_server_id: str,
     global_logger: Any
-) -> Dict[str, Any]:
+) -> AsyncGenerator[Dict[str, Any], None]:
     """Creates controller services within a test process group for testing."""
     pg_id = test_pg.get("id")
     pg_name = test_pg.get("name")
@@ -79,13 +79,44 @@ async def test_pg_with_controller_services(
     
     global_logger.info(f"Fixture: Successfully created controller services - SSL: {ssl_service_id}, Cache: {cache_service_id}")
     
-    return {
+    fixture_data = {
         "pg_id": pg_id,
         "pg_name": pg_name,
         "ssl_service_id": ssl_service_id,
         "cache_service_id": cache_service_id,
         "controller_services": cs_result_list
     }
+    
+    try:
+        yield fixture_data
+    finally:
+        # Teardown: Disable controller services before the process group is cleaned up
+        global_logger.info(f"Fixture: Disabling controller services in Process Group {pg_id}")
+        
+        service_ids = [ssl_service_id, cache_service_id]
+        for service_id in service_ids:
+            try:
+                disable_args = {
+                    "object_type": "controller_service",
+                    "object_id": service_id,
+                    "operation_type": "disable"
+                }
+                disable_result_list = await call_tool(
+                    client=async_client,
+                    base_url=base_url,
+                    tool_name="operate_nifi_objects",
+                    arguments={"operations": [disable_args]},
+                    headers=mcp_headers,
+                    custom_logger=global_logger
+                )
+                if disable_result_list and disable_result_list[0].get("status") == "success":
+                    global_logger.info(f"Fixture: Successfully disabled controller service {service_id}")
+                else:
+                    global_logger.warning(f"Fixture: Could not confirm controller service {service_id} disabled")
+            except Exception as e_disable:
+                global_logger.warning(f"Fixture: Error disabling controller service {service_id} (continuing): {e_disable}")
+        
+        global_logger.info(f"Fixture: Controller service cleanup completed for Process Group {pg_id}")
 
 
 @pytest.mark.anyio
@@ -329,8 +360,8 @@ async def test_operate_controller_service(
         "operation_type": "enable"
     }
     enable_result_list = await call_tool(
-        client=async_client, base_url=base_url, tool_name="operate_nifi_object",
-        arguments=enable_args, headers=mcp_headers, custom_logger=global_logger
+        client=async_client, base_url=base_url, tool_name="operate_nifi_objects",
+        arguments={"operations": [enable_args]}, headers=mcp_headers, custom_logger=global_logger
     )
     
     assert isinstance(enable_result_list, list) and enable_result_list and isinstance(enable_result_list[0], dict)
@@ -349,8 +380,8 @@ async def test_operate_controller_service(
             "operation_type": "disable"
         }
         disable_result_list = await call_tool(
-            client=async_client, base_url=base_url, tool_name="operate_nifi_object",
-            arguments=disable_args, headers=mcp_headers, custom_logger=global_logger
+            client=async_client, base_url=base_url, tool_name="operate_nifi_objects",
+            arguments={"operations": [disable_args]}, headers=mcp_headers, custom_logger=global_logger
         )
         
         assert isinstance(disable_result_list, list) and disable_result_list and isinstance(disable_result_list[0], dict)
@@ -370,8 +401,8 @@ async def test_operate_controller_service(
     }
     try:
         invalid_result_list = await call_tool(
-            client=async_client, base_url=base_url, tool_name="operate_nifi_object",
-            arguments=invalid_args, headers=mcp_headers, custom_logger=global_logger
+            client=async_client, base_url=base_url, tool_name="operate_nifi_objects",
+            arguments={"operations": [invalid_args]}, headers=mcp_headers, custom_logger=global_logger
         )
         # Should get an error response, not an exception
         assert isinstance(invalid_result_list, list) and invalid_result_list and isinstance(invalid_result_list[0], dict)
@@ -421,7 +452,7 @@ async def test_delete_controller_service(
     
     # Delete the controller service
     delete_args = {
-        "deletion_requests": [{
+        "objects": [{
             "object_type": "controller_service",
             "object_id": cache_service_id,
             "name": service_name

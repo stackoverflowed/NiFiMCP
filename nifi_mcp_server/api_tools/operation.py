@@ -17,21 +17,28 @@ from .utils import (
     filter_created_processor_data, # Keep for processor/port paths
     filter_process_group_data, # Add for process group path
     filter_connection_data,
-    filter_drop_request_data
+    filter_drop_request_data,
+    smart_parameter_validation
 )
 from nifi_mcp_server.nifi_client import NiFiClient, NiFiAuthenticationError
 from mcp.server.fastmcp.exceptions import ToolError
 
+# Import status checking function from review module
+from .review import get_process_group_status
 
-@mcp.tool()
-@tool_phases(["Operate"])
+
+# REMOVED: Single operate_nifi_object tool - replaced by operate_nifi_objects batch tool
+# This function is now internal-only, used by the batch operation helper
 async def operate_nifi_object(
     object_type: Literal["processor", "port", "process_group", "controller_service"],
     object_id: str,
     operation_type: Literal["start", "stop", "enable", "disable"]
 ) -> Dict:
     """
-    Starts, stops, enables, or disables a specific NiFi object.
+    Internal function to operate on a single NiFi object.
+    
+    This function is no longer exposed as an MCP tool - it's used internally by the 
+    operate_nifi_objects batch tool for individual operations.
 
     Args:
         object_type: The type of object to operate on ('processor', 'port', 'process_group', or 'controller_service').
@@ -309,7 +316,7 @@ async def operate_nifi_object(
                         error_list_str = ", ".join(validation_errors) if validation_errors else "No specific errors listed."
                         error_msg = f"Controller service '{name}' cannot be enabled. Validation status: {validation_status}. Errors: [{error_list_str}]"
                         local_logger.warning(error_msg)
-                        return {"status": "error", "message": error_msg, "entity": None}
+                        return {"status": "warning", "message": error_msg, "entity": None}
 
                     local_logger.info(f"Controller service pre-checks passed (Validation: {validation_status}, State: {current_state}). Proceeding with enable.")
 
@@ -386,137 +393,197 @@ async def operate_nifi_object(
         return {"status": "error", "message": f"An unexpected error occurred: {e}", "entity": None}
 
 
+# --- Internal helper function for single object operation ---
+async def _operate_single_nifi_object(
+    object_type: str,
+    object_id: str,
+    operation_type: str,
+    object_name: str,
+    nifi_client: NiFiClient,
+    logger
+) -> Dict:
+    """
+    Internal function to operate on a single NiFi object.
+    Contains the core operation logic extracted from the original operate_nifi_object function.
+    """
+    logger.info(f"Executing {operation_type} operation on {object_type} '{object_name}' ({object_id})")
+
+    # Call the original operate_nifi_object logic with context setup
+    try:
+        # Set the context for the single operation
+        from ..request_context import current_nifi_client, current_request_logger
+        token_client = current_nifi_client.set(nifi_client)
+        token_logger = current_request_logger.set(logger)
+        
+        try:
+            result = await operate_nifi_object(
+                object_type=object_type,
+                object_id=object_id,
+                operation_type=operation_type
+            )
+            return result
+        finally:
+            # Reset context
+            current_nifi_client.reset(token_client)
+            current_request_logger.reset(token_logger)
+    except Exception as e:
+        logger.error(f"Unexpected error operating on {object_type} '{object_name}' ({object_id}): {e}", exc_info=True)
+        return {
+            "status": "error",
+            "message": f"An unexpected error occurred during {operation_type} operation: {e}",
+            "entity": None
+        }
+
+
+@smart_parameter_validation
 @mcp.tool()
 @tool_phases(["Operate"])
-async def run_processor_once(processor_id: str) -> Dict:
+async def operate_nifi_objects(
+    operations: List[Dict[str, Any]]
+) -> List[Dict]:
     """
-    Attempts to run a single execution cycle for a specified processor.
-
-    Ensures the processor is stopped first, then requests a single run using the RUN_ONCE state.
-    Useful for step-by-step debugging.
-
+    Performs start, stop, enable, or disable operations on multiple NiFi objects in batch.
+    
+    This tool provides efficient batch processing for object state operations, reducing the number
+    of individual tool calls required. Each operation is processed independently, so failure of 
+    one operation does not prevent others from completing.
+    
     Args:
-        processor_id: The ID of the target processor.
-
-    Returns:
-        A dictionary indicating the status:
+        operations: A list of operation request dictionaries, each containing:
+            - object_type: The type of object ('processor', 'port', 'process_group', or 'controller_service')
+            - object_id: The UUID of the object to operate on  
+            - operation_type: The operation to perform ('start', 'stop', 'enable', or 'disable')
+            - name (optional): A descriptive name for the object (used in logging/results)
+    
+    Example:
+    ```python
+    operations = [
         {
-          "status": "success" | "warning" | "error",
-          "message": "Processor XYZ successfully triggered for one run.",
-          "processor_id": "...",
-          "final_state": "STOPPED" | "RUNNING" | "DISABLED" | "INVALID" | "UNKNOWN"
+            "object_type": "processor",
+            "object_id": "123e4567-e89b-12d3-a456-426614174000", 
+            "operation_type": "start",
+            "name": "MyProcessor"
+        },
+        {
+            "object_type": "controller_service",
+            "object_id": "456e7890-e89b-12d3-a456-426614174001",
+            "operation_type": "enable",
+            "name": "MyControllerService"
+        },
+        {
+            "object_type": "process_group",
+            "object_id": "789e1234-e89b-12d3-a456-426614174002", 
+            "operation_type": "stop"
         }
+    ]
+    result = operate_nifi_objects(operations)
+    ```
+    
+    Returns:
+        A list of dictionaries, each indicating success or failure for the corresponding operation request.
+        Each result includes:
+            - status: 'success', 'warning', or 'error'
+            - message: Descriptive message about the operation result
+            - entity: The updated NiFi entity (if successful)
+            - object_type: Type of object operated on
+            - object_id: ID of object operated on  
+            - operation_type: Operation that was performed
+            - object_name: Name of object (if provided)
+            - request_index: Index of request in the input list
     """
-    # Get client and logger from context
     nifi_client: Optional[NiFiClient] = current_nifi_client.get()
     local_logger = current_request_logger.get() or logger
     if not nifi_client:
         raise ToolError("NiFi client context is not set. This tool requires the X-Nifi-Server-Id header.")
     if not local_logger:
-        raise ToolError("Request logger context is not set.")
+         raise ToolError("Request logger context is not set.")
+    
+    if not operations:
+        raise ToolError("The 'operations' list cannot be empty.")
+    if not isinstance(operations, list):
+        raise ToolError("Invalid 'operations' type. Expected a list of dictionaries.")
+    
+    # Validate each operation request
+    for i, req in enumerate(operations):
+        if not isinstance(req, dict):
+            raise ToolError(f"Operation request {i} is not a dictionary.")
+        if "object_type" not in req or "object_id" not in req or "operation_type" not in req:
+            raise ToolError(f"Operation request {i} missing required fields 'object_type', 'object_id', and/or 'operation_type'.")
+        if req["object_type"] not in ["processor", "port", "process_group", "controller_service"]:
+            raise ToolError(f"Operation request {i} has invalid object_type '{req['object_type']}'. Must be one of: processor, port, process_group, controller_service.")
+        if req["operation_type"] not in ["start", "stop", "enable", "disable"]:
+            raise ToolError(f"Operation request {i} has invalid operation_type '{req['operation_type']}'. Must be one of: start, stop, enable, disable.")
+        
+        # Validate operation type compatibility with object type
+        object_type = req["object_type"]
+        operation_type = req["operation_type"]
+        if object_type == "controller_service" and operation_type not in ["enable", "disable"]:
+            raise ToolError(f"Operation request {i}: Invalid operation '{operation_type}' for controller service. Use 'enable' or 'disable'.")
+        elif object_type != "controller_service" and operation_type not in ["start", "stop"]:
+            raise ToolError(f"Operation request {i}: Invalid operation '{operation_type}' for {object_type}. Use 'start' or 'stop'.")
 
-    local_logger = local_logger.bind(processor_id=processor_id)
-    local_logger.info(f"Attempting to run processor {processor_id} once.")
-
-    proc_details = None
-    latest_revision = None
-    initial_state = "UNKNOWN"
-    processor_name = processor_id # Default name
-
-    try:
-        # --- Step 1: Get Current State and Revision ---
-        local_logger.info("Getting current processor state and revision...")
-        nifi_get_req = {"operation": "get_processor_details", "processor_id": processor_id}
-        local_logger.bind(interface="nifi", direction="request", data=nifi_get_req).debug("Calling NiFi API")
-        proc_details = await nifi_client.get_processor_details(processor_id)
-        latest_revision = proc_details["revision"]
-        initial_state = proc_details.get("component", {}).get("state", "UNKNOWN")
-        processor_name = proc_details.get("component", {}).get("name", processor_id)
-        local_logger.info(f"Processor '{processor_name}' current state: {initial_state}, revision: {latest_revision.get('version')}")
-        local_logger.bind(interface="nifi", direction="response", data=filter_created_processor_data(proc_details)).debug("Received from NiFi API")
-
-        # --- Step 2: Stop if Necessary ---
-        if initial_state == "RUNNING" or initial_state == "DISABLED":
-            local_logger.info(f"Processor is {initial_state}, stopping it first...")
-            nifi_stop_req = {"operation": "update_processor_state", "processor_id": processor_id, "state": "STOPPED"}
-            local_logger.bind(interface="nifi", direction="request", data=nifi_stop_req).debug("Calling NiFi API")
-            stop_result = await nifi_client.update_processor_state(processor_id, "STOPPED")
-            latest_revision = stop_result["revision"] # Get the updated revision after stopping
-            stopped_state = stop_result.get("component", {}).get("state")
-            local_logger.bind(interface="nifi", direction="response", data=filter_created_processor_data(stop_result)).debug("Received from NiFi API")
-            if stopped_state != "STOPPED":
-                local_logger.warning(f"Processor state is {stopped_state} after stop request. Proceeding with RUN_ONCE anyway.")
-            else:
-                local_logger.info(f"Processor stopped successfully. New revision: {latest_revision.get('version')}")
-        elif initial_state == "INVALID":
-             local_logger.warning(f"Processor '{processor_name}' is INVALID. Cannot run once.")
-             return {"status": "error", "message": f"Processor '{processor_name}' is INVALID and cannot be run.", "processor_id": processor_id, "final_state": "INVALID"}
-        else: # Already STOPPED
-            local_logger.info("Processor is already stopped.")
-
-        # --- Step 3: Trigger RUN_ONCE ---
-        local_logger.info(f"Triggering RUN_ONCE for processor '{processor_name}' (Revision: {latest_revision.get('version')})...")
-        run_once_payload = {
-            "revision": latest_revision,
-            "state": "RUN_ONCE",
-            "disconnectedNodeAcknowledged": False
-        }
-        client = await nifi_client._get_client() # Get httpx client
-        endpoint = f"/processors/{processor_id}/run-status"
-        nifi_runonce_req = {"operation": "set_run_once", "processor_id": processor_id, "state": "RUN_ONCE"}
-        local_logger.bind(interface="nifi", direction="request", data=nifi_runonce_req).debug("Calling NiFi API")
-        response = await client.put(endpoint, json=run_once_payload)
-        response.raise_for_status()
-        run_once_result = response.json()
-        # Update revision in case it changed again, though unlikely for RUN_ONCE
-        latest_revision = run_once_result.get("revision", latest_revision)
-        local_logger.info(f"RUN_ONCE command submitted successfully for processor '{processor_name}'.")
-        local_logger.bind(interface="nifi", direction="response", data=filter_created_processor_data(run_once_result)).debug("Received from NiFi API")
-
-        # --- Step 4: Wait and Check Final State ---
-        wait_seconds = 2 # Wait a couple of seconds for potential execution
-        local_logger.info(f"Waiting {wait_seconds} seconds before checking final state...")
-        await asyncio.sleep(wait_seconds)
-
-        local_logger.info("Checking final processor state...")
-        nifi_final_get_req = {"operation": "get_processor_details", "processor_id": processor_id}
-        local_logger.bind(interface="nifi", direction="request", data=nifi_final_get_req).debug("Calling NiFi API")
-        final_details = await nifi_client.get_processor_details(processor_id)
-        final_state = final_details.get("component", {}).get("state", "UNKNOWN")
-        local_logger.bind(interface="nifi", direction="response", data=filter_created_processor_data(final_details)).debug("Received from NiFi API")
-        local_logger.info(f"Processor '{processor_name}' final state after RUN_ONCE attempt: {final_state}")
-
-        return {
-            "status": "success",
-            "message": f"Processor '{processor_name}' successfully triggered for one run. Final state observed: {final_state}.",
-            "processor_id": processor_id,
-            "final_state": final_state
-        }
-
-    except ValueError as e:
-        local_logger.warning(f"Value error during run-once operation for processor {processor_id}: {e}")
-        local_logger.bind(interface="nifi", direction="response", data={"error": str(e)}).debug("Received error from NiFi API")
-        if "not found" in str(e).lower():
-            return {"status": "error", "message": f"Processor {processor_id} not found.", "processor_id": processor_id, "final_state": "UNKNOWN"}
-        elif "conflict" in str(e).lower():
-            return {"status": "error", "message": f"Conflict operating on processor {processor_id}: {e}. Check revision/state.", "processor_id": processor_id, "final_state": initial_state}
-        else:
-            return {"status": "error", "message": f"Error operating on processor {processor_id}: {e}", "processor_id": processor_id, "final_state": initial_state}
-
-    except (NiFiAuthenticationError, ConnectionError, ToolError) as e:
-        local_logger.error(f"API/Tool error during run-once for processor {processor_id}: {e}", exc_info=False)
-        local_logger.bind(interface="nifi", direction="response", data={"error": str(e)}).debug("Received error from NiFi API")
-        return {"status": "error", "message": f"Failed to run processor {processor_id} once: {e}", "processor_id": processor_id, "final_state": initial_state}
-    except Exception as e:
-        local_logger.error(f"Unexpected error during run-once for processor {processor_id}: {e}", exc_info=True)
-        local_logger.bind(interface="nifi", direction="response", data={"error": str(e)}).debug("Received error from NiFi API")
-        return {"status": "error", "message": f"An unexpected error occurred: {e}", "processor_id": processor_id, "final_state": initial_state}
+    local_logger.info(f"Executing operate_nifi_objects for {len(operations)} objects")
+    
+    results = []
+    
+    for i, operation_request in enumerate(operations):
+        object_type = operation_request["object_type"]
+        object_id = operation_request["object_id"]
+        operation_type = operation_request["operation_type"]
+        object_name = operation_request.get("name", object_id)
+        
+        request_logger = local_logger.bind(object_id=object_id, object_type=object_type, operation_type=operation_type, request_index=i)
+        request_logger.info(f"Processing operation request {i+1}/{len(operations)} for {object_type} '{object_name}' ({object_id}): {operation_type}")
+        
+        try:
+            # Call the helper function that wraps the original operate_nifi_object logic
+            result = await _operate_single_nifi_object(
+                object_type=object_type,
+                object_id=object_id,
+                operation_type=operation_type,
+                object_name=object_name,
+                nifi_client=nifi_client,
+                logger=request_logger
+            )
+            
+            # Add metadata to the result
+            result["object_type"] = object_type
+            result["object_id"] = object_id
+            result["operation_type"] = operation_type
+            result["object_name"] = object_name
+            result["request_index"] = i
+            
+            results.append(result)
+            
+        except Exception as e:
+            error_result = {
+                "status": "error",
+                "message": f"Unexpected error during {operation_type} operation on {object_type} '{object_name}' ({object_id}): {e}",
+                "entity": None,
+                "object_type": object_type,
+                "object_id": object_id,
+                "operation_type": operation_type,
+                "object_name": object_name,
+                "request_index": i
+            }
+            results.append(error_result)
+            request_logger.error(f"Unexpected error in operation request {i}: {e}", exc_info=True)
+    
+    # Summary logging
+    successful_operations = [r for r in results if r.get("status") == "success"]
+    failed_operations = [r for r in results if r.get("status") == "error"]
+    warning_operations = [r for r in results if r.get("status") == "warning"]
+    
+    local_logger.info(f"Batch operation completed: {len(successful_operations)} successful, {len(failed_operations)} failed, {len(warning_operations)} warnings")
+    
+    return results
 
 
 @mcp.tool()
 @tool_phases(["Operate", "Verify"])
 async def invoke_nifi_http_endpoint(
     url: str,
+    process_group_id: str,
     method: Literal["GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS", "PATCH"] = "POST",
     payload: Optional[Union[str, Dict[str, Any]]] = None,
     headers: Optional[Dict[str, str]] = None,
@@ -524,23 +591,24 @@ async def invoke_nifi_http_endpoint(
 ) -> Dict:
     """
     Sends an HTTP request to a specified URL, typically to test a NiFi flow endpoint (e.g., ListenHTTP).
-    Waits for a response or times out.
+    Waits for a response or times out, then automatically checks the flow status for context.
 
     WARNING: Ensure the URL points to a trusted endpoint, ideally one hosted by your NiFi instance or related infrastructure.
 
     Examples:
     Call (POST JSON):
     ```tool_code
-    print(default_api.invoke_nifi_http_endpoint(url='http://localhost:9999/myflow', method='POST', payload={'key': 'value'}, headers={'Content-Type': 'application/json'}))
+    print(default_api.invoke_nifi_http_endpoint(url='http://localhost:9999/myflow', process_group_id='root', method='POST', payload={'key': 'value'}, headers={'Content-Type': 'application/json'}))
     ```
 
     Call (GET):
     ```tool_code
-    print(default_api.invoke_nifi_http_endpoint(url='http://localhost:9998/status', method='GET'))
+    print(default_api.invoke_nifi_http_endpoint(url='http://localhost:9998/status', process_group_id='abc123', method='GET'))
     ```
 
     Args:
         url: The full URL of the target endpoint.
+        process_group_id: The ID of the process group to check for flow status after the HTTP request.
         method: The HTTP method to use (e.g., GET, POST). Defaults to POST.
         payload: The request body. If a dictionary, it will be sent as JSON with 'Content-Type: application/json' unless overridden in headers. If a string, it's sent as is.
         headers: A dictionary of custom request headers.
@@ -559,16 +627,30 @@ async def invoke_nifi_http_endpoint(
             "method": str,
             "headers": Dict[str, str],
             "payload_type": str # e.g., 'json', 'string', 'none'
+          },
+          "flow_status": { # Flow status information checked after HTTP request
+            "success": bool,  # Whether status check succeeded
+            "data": Optional[Dict],  # The actual status data from get_process_group_status
+            "error": Optional[str],  # Error message if status check failed
+            "process_group_id": str  # Which PG was checked
           }
         }
     """
     local_logger = current_request_logger.get() or logger
-    local_logger = local_logger.bind(target_url=url, http_method=method)
+    local_logger = local_logger.bind(target_url=url, http_method=method, process_group_id=process_group_id)
     local_logger.info(f"Attempting to invoke HTTP endpoint.")
 
     request_headers = headers or {}
     content_to_send = None
     payload_type = "none"
+    
+    # Initialize flow status structure
+    flow_status = {
+        "success": False,
+        "data": None,
+        "error": None,
+        "process_group_id": process_group_id
+    }
 
     try:
         if isinstance(payload, dict):
@@ -579,7 +661,7 @@ async def invoke_nifi_http_endpoint(
                 payload_type = "json"
             except (TypeError, OverflowError) as json_err:
                  local_logger.error(f"Failed to serialize JSON payload: {json_err}", exc_info=True)
-                 return {
+                 http_result = {
                      "status": "internal_error",
                      "message": f"Failed to serialize dictionary payload to JSON: {json_err}",
                      "response_status_code": None,
@@ -587,6 +669,21 @@ async def invoke_nifi_http_endpoint(
                      "response_body": None,
                      "request_details": {"url": url, "method": method, "headers": request_headers, "payload_type": "dict (serialization failed)"}
                  }
+                 # Still try to get flow status even after JSON serialization error
+                 local_logger.info(f"Checking flow status for process group {process_group_id} after JSON error")
+                 try:
+                     flow_status_data = await get_process_group_status(
+                         process_group_id=process_group_id,
+                         include_bulletins=True,
+                         bulletin_limit=15
+                     )
+                     flow_status["success"] = True
+                     flow_status["data"] = flow_status_data
+                 except Exception as status_err:
+                     flow_status["error"] = str(status_err)
+                 
+                 http_result["flow_status"] = flow_status
+                 return http_result
         elif isinstance(payload, str):
             content_to_send = payload.encode('utf-8') # Assume UTF-8 for strings
             payload_type = "string"
@@ -629,7 +726,7 @@ async def invoke_nifi_http_endpoint(
 
             # Check if status code indicates an HTTP error (4xx or 5xx)
             if 400 <= response.status_code < 600:
-                return {
+                http_result = {
                     "status": "http_error",
                     "message": f"Endpoint returned HTTP error status code: {response.status_code}",
                     "response_status_code": response.status_code,
@@ -638,18 +735,20 @@ async def invoke_nifi_http_endpoint(
                     "request_details": request_details_for_response
                 }
             else:
-                 return {
+                http_result = {
                     "status": "success",
                     "message": f"Successfully received response from endpoint.",
                     "response_status_code": response.status_code,
                     "response_headers": response_headers_dict,
                     "response_body": response_body_text,
                     "request_details": request_details_for_response
-                 }
+                }
+
+
 
     except httpx.TimeoutException:
         local_logger.warning(f"Request timed out after {timeout_seconds} seconds.")
-        return {
+        http_result = {
             "status": "timeout",
             "message": f"Request timed out after {timeout_seconds} seconds.",
             "response_status_code": None,
@@ -660,7 +759,7 @@ async def invoke_nifi_http_endpoint(
     except httpx.RequestError as e:
         # Covers connection errors, DNS errors, invalid URL errors (caught by httpx), etc.
         local_logger.error(f"HTTP request error: {e}", exc_info=False)
-        return {
+        http_result = {
             "status": "connection_error",
             "message": f"Failed to connect or send request: {e}",
             "response_status_code": None,
@@ -671,7 +770,7 @@ async def invoke_nifi_http_endpoint(
     except Exception as e:
         # Catch-all for unexpected errors during preparation or execution
         local_logger.error(f"Unexpected internal error during HTTP invocation: {e}", exc_info=True)
-        return {
+        http_result = {
             "status": "internal_error",
             "message": f"An unexpected internal error occurred: {e}",
             "response_status_code": None,
@@ -679,6 +778,25 @@ async def invoke_nifi_http_endpoint(
             "response_body": None,
             "request_details": {"url": url, "method": method, "headers": request_headers, "payload_type": payload_type}
         }
+
+    # Always attempt to get flow status, even after errors/timeouts
+    local_logger.info(f"Checking flow status for process group {process_group_id}")
+    try:
+        flow_status_data = await get_process_group_status(
+            process_group_id=process_group_id,
+            include_bulletins=True,
+            bulletin_limit=15  # Reasonable limit for context
+        )
+        flow_status["success"] = True
+        flow_status["data"] = flow_status_data
+        local_logger.debug(f"Successfully retrieved flow status for PG {process_group_id}")
+    except Exception as status_err:
+        local_logger.warning(f"Failed to get flow status for PG {process_group_id}: {status_err}")
+        flow_status["error"] = str(status_err)
+
+    # Combine HTTP result with flow status
+    http_result["flow_status"] = flow_status
+    return http_result
 
 
 def format_drop_request_summary(result: Dict[str, Any]) -> Dict[str, Any]:
@@ -758,3 +876,156 @@ async def purge_flowfiles(
         # Use the client's process group purge method
         results = await nifi_client.purge_process_group_flowfiles(target_id, timeout_seconds)
         return format_drop_request_summary(results)
+
+
+@mcp.tool()
+@tool_phases(["Debug"])
+async def analyze_nifi_processor_errors(
+    processor_id: str,
+    include_suggestions: bool = True
+) -> Dict[str, Any]:
+    """
+    Analyze processor errors and provide debugging suggestions for faster resolution.
+    
+    EFFICIENCY IMPROVEMENT: Proactive error analysis to reduce debugging iterations.
+    
+    Args:
+        processor_id: The ID of the processor to analyze
+        include_suggestions: Whether to include automated debugging suggestions
+        
+    Returns:
+        Analysis results including error patterns, suggestions, and potential fixes
+    """
+    nifi_client: Optional[NiFiClient] = current_nifi_client.get()
+    local_logger = current_request_logger.get() or logger
+    if not nifi_client:
+        raise ToolError("NiFi client context is not set. This tool requires the X-Nifi-Server-Id header.")
+
+    # Context IDs for logging (not currently used in this tool)
+    # user_request_id = current_user_request_id.get() or "-"
+    # action_id = current_action_id.get() or "-"
+
+    try:
+        # Get processor details
+        processor_details = await nifi_client.get_processor_details(processor_id)
+        processor_name = processor_details.get("component", {}).get("name", "Unknown")
+        processor_type = processor_details.get("component", {}).get("type", "Unknown")
+        validation_status = processor_details.get("component", {}).get("validationStatus", "UNKNOWN")
+        
+        # Get bulletins (error messages)
+        bulletins = processor_details.get("bulletins", [])
+        
+        # Analyze errors
+        analysis = {
+            "processor_id": processor_id,
+            "processor_name": processor_name,
+            "processor_type": processor_type,
+            "validation_status": validation_status,
+            "error_count": len(bulletins),
+            "errors": [],
+            "patterns": [],
+            "suggestions": [] if include_suggestions else None
+        }
+        
+        # Process each bulletin
+        for bulletin in bulletins:
+            bulletin_data = bulletin.get("bulletin", {})
+            if bulletin_data.get("level") == "ERROR":
+                error_info = {
+                    "timestamp": bulletin_data.get("timestamp"),
+                    "message": bulletin_data.get("message"),
+                    "category": bulletin_data.get("category")
+                }
+                analysis["errors"].append(error_info)
+                
+                # Analyze error patterns
+                if include_suggestions:
+                    patterns = _analyze_error_patterns(bulletin_data.get("message", ""), processor_type)
+                    analysis["patterns"].extend(patterns)
+        
+        # Generate suggestions based on patterns
+        if include_suggestions and analysis["patterns"]:
+            analysis["suggestions"] = _generate_debugging_suggestions(analysis["patterns"], processor_type)
+        
+        local_logger.info(f"Analyzed {len(bulletins)} bulletins for processor {processor_name}")
+        
+        return {
+            "status": "success",
+            "message": f"Analyzed processor '{processor_name}' errors",
+            "analysis": analysis
+        }
+        
+    except Exception as e:
+        local_logger.error(f"Error analyzing processor {processor_id}: {e}", exc_info=True)
+        raise ToolError(f"Failed to analyze processor errors: {e}")
+
+
+def _analyze_error_patterns(error_message: str, processor_type: str) -> List[str]:
+    """Analyze error message for common patterns."""
+    patterns = []
+    error_lower = error_message.lower()
+    
+    # Script processor patterns
+    if "org.apache.nifi.processors.script.ExecuteScript" in processor_type:
+        if "missingpropertyexception" in error_lower:
+            if "flowfile" in error_lower:
+                patterns.append("groovy_flowfile_scope_issue")
+        if "scriptexception" in error_lower:
+            patterns.append("groovy_script_syntax_error")
+        if "compilationexception" in error_lower:
+            patterns.append("groovy_compilation_error")
+    
+    # HTTP processor patterns  
+    if "handlehttprequest" in processor_type.lower() or "handlehttpresponse" in processor_type.lower():
+        if "context map" in error_lower:
+            patterns.append("http_context_map_missing")
+        if "connection refused" in error_lower:
+            patterns.append("http_connection_issue")
+    
+    # General patterns
+    if "validation" in error_lower and "invalid" in error_lower:
+        patterns.append("property_validation_error")
+    if "no such property" in error_lower:
+        patterns.append("missing_property_reference")
+    
+    return patterns
+
+
+def _generate_debugging_suggestions(patterns: List[str], processor_type: str) -> List[Dict[str, str]]:
+    """Generate debugging suggestions based on error patterns."""
+    suggestions = []
+    
+    for pattern in patterns:
+        if pattern == "groovy_flowfile_scope_issue":
+            suggestions.append({
+                "issue": "Groovy FlowFile Scope Issue",
+                "description": "Script references 'flowFile' variable that's not in scope",
+                "solution": "Use 'final FlowFile ff = session.get()' and import org.apache.nifi.flowfile.FlowFile",
+                "example": "import org.apache.nifi.flowfile.FlowFile\nfinal FlowFile ff = session.get()\nif (ff == null) return"
+            })
+        
+        elif pattern == "groovy_script_syntax_error":
+            suggestions.append({
+                "issue": "Groovy Script Syntax Error", 
+                "description": "Script has syntax errors preventing execution",
+                "solution": "Check script syntax, imports, and variable declarations",
+                "example": "Ensure all imports are at the top and variables are properly declared"
+            })
+        
+        elif pattern == "http_context_map_missing":
+            suggestions.append({
+                "issue": "HTTP Context Map Service Missing",
+                "description": "HTTP processor requires a context map service to be configured",
+                "solution": "Create and configure an HTTP Context Map service, then reference it in the processor",
+                "example": "Create StandardHttpContextMap service and reference it in 'HTTP Context Map' property"
+            })
+        
+        elif pattern == "property_validation_error":
+            suggestions.append({
+                "issue": "Property Validation Error",
+                "description": "One or more processor properties have invalid values",
+                "solution": "Review processor configuration and correct invalid property values",
+                "example": "Check for empty strings in optional properties - use null instead"
+            })
+    
+    return suggestions
