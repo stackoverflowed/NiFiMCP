@@ -8,7 +8,7 @@ from ..core import mcp # Removed nifi_api_client
 
 # Removed imports for NiFi types/exceptions previously needed by ensure_authenticated
 # from nifi_mcp_server.nifi_client import NiFiClient, NiFiAuthenticationError
-# from mcp.server.fastmcp.exceptions import ToolError
+from mcp.server.fastmcp.exceptions import ToolError
 
 # --- Phase Tagging Decorator --- 
 PHASE_TAGS_ATTR = "_tool_phases"
@@ -272,3 +272,211 @@ def format_drop_request_summary(drop_results: Dict[str, Any]) -> Dict[str, Any]:
             "failed_connections": failed_connections if failed_connections else None
         }
     }
+
+def filter_controller_service_data(controller_service_entity: Dict) -> Dict:
+    """Extract essential fields from a controller service entity."""
+    component = controller_service_entity.get("component", {})
+    revision = controller_service_entity.get("revision", {})
+    config = component.get("config", {})
+    properties = config.get("properties", {})
+    
+    return {
+        "id": controller_service_entity.get("id"),
+        "name": component.get("name"),
+        "type": component.get("type"),
+        "state": component.get("state"),
+        "comments": component.get("comments"),
+        "validationStatus": component.get("validationStatus"),
+        "validationErrors": component.get("validationErrors", []),
+        "properties": properties,
+        "referencingComponents": component.get("referencingComponents", []),
+        "version": revision.get("version"),
+        "bundle": component.get("bundle", {}),
+        "controllerServiceApis": component.get("controllerServiceApis", []),
+    }
+
+def _format_controller_service_summary(controller_services_data):
+    """Formats basic controller service data from NiFi API list response."""
+    formatted = []
+    if controller_services_data:  # Should be a list from list_controller_services
+        for cs in controller_services_data:
+            # Use the existing filter function for consistency
+            basic_info = filter_controller_service_data(cs)
+            formatted.append(basic_info)
+    return formatted
+
+def validate_and_suggest_parameters(tool_name: str, parameters: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Parameter validation middleware that detects common LLM mistakes and suggests corrections.
+    
+    This function can auto-correct obvious parameter naming mistakes and provide helpful
+    suggestions for malformed parameters.
+    
+    Args:
+        tool_name: Name of the tool being called
+        parameters: The parameters passed to the tool
+        
+    Returns:
+        Corrected parameters with suggestions
+        
+    Raises:
+        ToolError: If parameters cannot be corrected
+    """
+    corrected_params = parameters.copy()
+    suggestions = []
+    
+    # Define common parameter corrections by tool
+    PARAMETER_CORRECTIONS = {
+        "delete_nifi_objects": {
+            "deletion_requests": "objects",
+            "delete_requests": "objects", 
+            "items": "objects",
+            "deletions": "objects"
+        },
+        "operate_nifi_objects": {
+            "operation_requests": "operations",
+            "requests": "operations",
+            "ops": "operations",
+            "items": "operations"
+        },
+        "update_nifi_processors_properties": {
+            "property_updates": "updates",
+            "processor_updates": "updates",
+            "props": "updates",
+            "properties": "updates"
+        },
+        "create_nifi_connections": {
+            "connection_requests": "connections",
+            "conn_requests": "connections",
+            "links": "connections"
+        },
+
+    }
+    
+    # Check for parameter name corrections
+    if tool_name in PARAMETER_CORRECTIONS:
+        corrections = PARAMETER_CORRECTIONS[tool_name]
+        for wrong_param, correct_param in corrections.items():
+            if wrong_param in corrected_params and correct_param not in corrected_params:
+                # Auto-correct the parameter name
+                corrected_params[correct_param] = corrected_params.pop(wrong_param)
+                suggestions.append(f"Auto-corrected parameter '{wrong_param}' to '{correct_param}'")
+    
+    # Check for common structural mistakes
+    for param_name, param_value in corrected_params.items():
+        # Check for accidentally nested parameters
+        if isinstance(param_value, dict) and len(param_value) == 1:
+            nested_key = list(param_value.keys())[0]
+            if nested_key == param_name:
+                # Fix nested parameter (e.g., {"objects": {"objects": [...]}})
+                corrected_params[param_name] = param_value[nested_key]
+                suggestions.append(f"Fixed nested parameter structure in '{param_name}'")
+        
+        # Check for missing required list structure
+        if param_name in ["objects", "operations", "updates", "connections"]:
+            if not isinstance(param_value, list):
+                if isinstance(param_value, dict):
+                    # Convert single object to list
+                    corrected_params[param_name] = [param_value]
+                    suggestions.append(f"Converted single {param_name[:-1]} to list format")
+                else:
+                    raise ToolError(f"Parameter '{param_name}' must be a list, got {type(param_value)}")
+    
+    # Tool-specific validations
+    if tool_name == "create_nifi_connections":
+        connections = corrected_params.get("connections", [])
+        for i, conn in enumerate(connections):
+            if isinstance(conn, dict):
+                # Check for legacy vs new parameter format
+                has_legacy_params = "source_id" in conn and "target_id" in conn
+                has_new_params = "source_name" in conn and "target_name" in conn
+                
+                if has_legacy_params and not has_new_params:
+                    # Legacy format - auto-convert, preserving all other fields
+                    new_conn = conn.copy()  # Preserve all existing fields
+                    new_conn["source_name"] = new_conn.pop("source_id")  # Rename source_id to source_name
+                    new_conn["target_name"] = new_conn.pop("target_id")   # Rename target_id to target_name
+                    corrected_params["connections"][i] = new_conn
+                    suggestions.append(f"Connection {i} auto-converted from legacy 'source_id/target_id' to 'source_name/target_name' format")
+                elif not has_new_params:
+                    # Missing required fields
+                    if "source_name" not in conn:
+                        suggestions.append(f"Connection {i} missing 'source_name' field")
+                    if "target_name" not in conn:
+                        suggestions.append(f"Connection {i} missing 'target_name' field")
+                
+                # Check for missing relationships
+                if "relationships" not in conn:
+                    suggestions.append(f"Connection {i} missing 'relationships' field")
+    
+    elif tool_name == "delete_nifi_objects":
+        objects = corrected_params.get("objects", [])
+        for i, obj in enumerate(objects):
+            if isinstance(obj, dict):
+                # Check for required fields
+                if "object_type" not in obj:
+                    suggestions.append(f"Object {i} missing required 'object_type' field")
+                if "object_id" not in obj:
+                    suggestions.append(f"Object {i} missing required 'object_id' field")
+    
+    elif tool_name == "operate_nifi_objects":
+        operations = corrected_params.get("operations", [])
+        for i, op in enumerate(operations):
+            if isinstance(op, dict):
+                # Check for operation/object type compatibility
+                object_type = op.get("object_type")
+                operation_type = op.get("operation_type")
+                
+                if object_type == "controller_service" and operation_type in ["start", "stop"]:
+                    suggestions.append(f"Operation {i}: Use 'enable'/'disable' for controller services, not 'start'/'stop'")
+                elif object_type != "controller_service" and operation_type in ["enable", "disable"]:
+                    suggestions.append(f"Operation {i}: Use 'start'/'stop' for {object_type}, not 'enable'/'disable'")
+    
+    # Log suggestions if any were made
+    if suggestions:
+        from loguru import logger
+        for suggestion in suggestions:
+            logger.info(f"[Parameter Validation] {suggestion}")
+    
+    return corrected_params
+
+def smart_parameter_validation(func):
+    """
+    Decorator that applies parameter validation middleware to MCP tools.
+    
+    Usage:
+    @smart_parameter_validation
+    @mcp.tool()
+    async def my_tool(param1, param2):
+        ...
+    """
+    import functools
+    from inspect import signature
+    
+    @functools.wraps(func)
+    async def wrapper(*args, **kwargs):
+        # Get tool name from function
+        tool_name = func.__name__
+        
+        # Convert args to kwargs using function signature
+        sig = signature(func)
+        bound_args = sig.bind(*args, **kwargs)
+        bound_args.apply_defaults()
+        
+        # Apply parameter validation
+        try:
+            corrected_params = validate_and_suggest_parameters(tool_name, bound_args.arguments)
+            
+            # Update bound arguments with corrected parameters
+            for key, value in corrected_params.items():
+                if key in sig.parameters:
+                    bound_args.arguments[key] = value
+            
+            # Call original function with corrected parameters
+            return await func(**bound_args.arguments)
+            
+        except Exception as e:
+            # Re-raise with additional context
+            raise ToolError(f"Parameter validation failed for {tool_name}: {e}")
+    
+    return wrapper

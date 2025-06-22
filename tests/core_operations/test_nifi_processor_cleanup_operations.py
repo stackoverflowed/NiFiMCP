@@ -47,8 +47,8 @@ async def test_auto_stop_delete_running_processor(
     start_result_list = await call_tool(
         client=async_client,
         base_url=base_url,
-        tool_name="operate_nifi_object",
-        arguments=start_args,
+        tool_name="operate_nifi_objects",
+        arguments={"operations": [start_args]},
         headers=mcp_headers,
         custom_logger=global_logger
     )
@@ -76,7 +76,7 @@ async def test_auto_stop_delete_running_processor(
     # Attempt delete with Auto-Stop enabled
     headers_auto_stop_true = {**mcp_headers, "X-Mcp-Auto-Stop-Enabled": "true"}
     delete_args = {
-        "deletion_requests": [{
+        "objects": [{
             "object_type": "processor",
             "object_id": generate_proc_id,
             "name": "mcp-test-auto-stop"
@@ -152,7 +152,7 @@ async def test_auto_stop_delete_running_processor(
     # Attempt delete with Auto-Stop disabled (should still work since processor is already stopped)
     headers_auto_stop_false = {**mcp_headers, "X-Mcp-Auto-Stop-Enabled": "false"}
     delete_args = {
-        "deletion_requests": [{
+        "objects": [{
             "object_type": "processor",
             "object_id": extra_proc_id,
             "name": "mcp-test-auto-stop-extra"
@@ -182,7 +182,9 @@ async def test_auto_delete_processor_with_connections(
     # Get processor IDs from the fixture
     generate_proc_id = test_pg_with_processors.get("generate_proc_id")
     log_proc_id = test_pg_with_processors.get("log_proc_id")
+    pg_id = test_pg_with_processors.get("pg_id")
     assert generate_proc_id and log_proc_id, "Processor IDs not found from fixture."
+    assert pg_id, "Process Group ID not found from fixture."
 
     # Create connection between processors
     connect_args = {
@@ -194,7 +196,7 @@ async def test_auto_delete_processor_with_connections(
         client=async_client,
         base_url=base_url,
         tool_name="create_nifi_connections",
-        arguments={"connections": [connect_args]},
+        arguments={"connections": [connect_args], "process_group_id": pg_id},
         headers=mcp_headers,
         custom_logger=global_logger
     )
@@ -206,7 +208,7 @@ async def test_auto_delete_processor_with_connections(
     # First try to delete the LogAttribute processor (which has an incoming connection) with Auto-Delete disabled
     headers_auto_delete_false = {**mcp_headers, "X-Mcp-Auto-Delete-Enabled": "false"}
     delete_args = {
-        "deletion_requests": [{
+        "objects": [{
             "object_type": "processor",
             "object_id": log_proc_id,
             "name": "mcp-test-auto-delete-false"
@@ -260,7 +262,7 @@ async def test_auto_delete_processor_with_connections(
     # Now try to delete the LogAttribute processor with Auto-Delete enabled
     headers_auto_delete_true = {**mcp_headers, "X-Mcp-Auto-Delete-Enabled": "true"}
     delete_args = {
-        "deletion_requests": [{
+        "objects": [{
             "object_type": "processor",
             "object_id": log_proc_id,
             "name": "mcp-test-auto-delete-true"

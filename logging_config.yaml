@@ -37,4 +37,11 @@ nifi_debug_file:
   path: "{log_directory}/nifi_debug.log"
   level: "DEBUG"
   rotation: null # Overwrite on start
+  # Format is handled by _serialize_record function in logging_setup.py
+
+# Workflow Debug Logs (dedicated workflow execution logging)
+workflow_debug_file:
+  path: "{log_directory}/workflow.log"
+  level: "DEBUG"
+  rotation: null # Overwrite on start
   # Format is handled by _serialize_record function in logging_setup.py 

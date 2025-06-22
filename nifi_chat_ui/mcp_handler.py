@@ -151,19 +151,31 @@ def execute_mcp_tool(
             error_detail = e.response.text 
             error_body = {"raw_text": error_detail} # Store raw text if not JSON
             
-        error_message = f"API Error executing tool '{tool_name}': {e.response.status_code} - {error_detail}"
-        bound_logger.error(error_message)
+        # Check if this is a validation error (LLM input mistake) vs system error
+        is_validation_error = (
+            e.response.status_code == 400 and 
+            ("validation error" in error_detail.lower() or 
+             "field required" in error_detail.lower() or
+             "invalid" in error_detail.lower() or
+             "expected" in error_detail.lower() or
+             "parameter" in error_detail.lower())
+        )
         
-        # --- Log MCP Response (Error) ---
-        bound_logger.bind(
-            interface="mcp", 
-            direction="response", 
-            data={"status_code": e.response.status_code, "body": error_body}
-        ).debug("Received error response from MCP API")
-        # -------------------------------
-        
-        st.error(error_message) # Keep UI error
-        return error_message # Return the error string
+        if is_validation_error:
+            # Log the validation error for debugging but don't show in UI
+            bound_logger.info(f"LLM parameter validation error (not shown in UI): {error_detail}")
+            # Return a helpful message to the LLM without scary error details
+            return {
+                "error": True,
+                "validation_error": True,
+                "message": f"Parameter validation failed for '{tool_name}'. Please check the tool documentation and parameter format.",
+                "details": error_detail,  # LLM can still see the details
+                "ui_message": "Adjusting parameters..."  # Friendly message for UI
+            }
+        else:
+            # This is a real system error that should be shown
+            bound_logger.error(f"API Error executing tool '{tool_name}': {e.response.status_code} - {error_detail}")
+            raise Exception(f"API Error executing tool '{tool_name}': {e.response.status_code} - {error_detail}")
         
     except requests.exceptions.ConnectionError as e:
         error_message = f"Connection Error: Could not connect to the MCP API server at {API_BASE_URL}. Is it running?"

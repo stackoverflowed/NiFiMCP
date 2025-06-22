@@ -22,13 +22,20 @@ dependencies = [
     "docstring_parser>=0.16",
     "st-copy-to-clipboard>=0.1.6",
     "pytest>=8.0.0",
-    "anyio>=4.0.0"
+    "anyio>=4.0.0",
+    "pocketflow>=0.0.2",
 ]
 
 [tool.setuptools]
 packages = ["config", "nifi_chat_ui", "nifi_mcp_client", "nifi_mcp_server"]
 
 [tool.pytest.ini_options]
-# All pytest-asyncio specific options are removed/commented.
-# If pytest-anyio needs specific ini options, they would go here.
-# For now, relying on its defaults.
+# See tests/README.md for test organization guidelines
+markers = [
+    "unit: marks tests as unit tests (no server connectivity required)",
+]
+
+[dependency-groups]
+dev = [
+    "trio>=0.30.0",
+]

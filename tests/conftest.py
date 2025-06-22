@@ -3,8 +3,9 @@ import httpx
 import os
 import sys
 import uuid
+import asyncio
 from loguru import logger
-from typing import AsyncGenerator, Any, Dict
+from typing import AsyncGenerator, Any, Dict, List
 from config.settings import get_nifi_servers
 from tests.utils.nifi_test_utils import call_tool
 
@@ -147,10 +148,80 @@ async def test_pg(
 
     yield pg_details # Provide the PG details to the test
 
-    # Teardown: First purge any queued flowfiles, then delete the process group
+    # Teardown: First stop, then purge flowfiles, then delete the process group
     global_logger.info(f"Fixture: Cleaning up test process group: {pg_id}")
     try:
-        # First purge any queued flowfiles
+        # Step 1: Stop the process group first
+        stop_args = {
+            "object_type": "process_group",
+            "object_id": pg_id,
+            "operation_type": "stop"
+        }
+        try:
+            stop_result_list = await call_tool(
+                client=async_client,
+                base_url=base_url,
+                tool_name="operate_nifi_objects",
+                arguments={"operations": [stop_args]},
+                headers=mcp_headers,
+                custom_logger=global_logger
+            )
+            if stop_result_list and stop_result_list[0].get("status") == "success":
+                global_logger.info(f"Fixture: Successfully stopped Process Group {pg_id}")
+            else:
+                global_logger.warning(f"Fixture: Could not confirm Process Group {pg_id} stopped")
+        except Exception as e_stop:
+            global_logger.warning(f"Fixture: Error stopping Process Group {pg_id} (continuing with cleanup): {e_stop}")
+
+        # Step 2: Disable any controller services in the process group
+        try:
+            # List controller services in the process group
+            list_cs_args = {
+                "object_type": "controller_services",
+                "process_group_id": pg_id
+            }
+            cs_list_result = await call_tool(
+                client=async_client,
+                base_url=base_url,
+                tool_name="list_nifi_objects",
+                arguments=list_cs_args,
+                headers=mcp_headers,
+                custom_logger=global_logger
+            )
+            
+            if cs_list_result and isinstance(cs_list_result, list) and len(cs_list_result) > 0:
+                global_logger.info(f"Fixture: Found {len(cs_list_result)} controller services to disable in Process Group {pg_id}")
+                
+                # Disable each controller service
+                for cs in cs_list_result:
+                    cs_id = cs.get("id")
+                    if cs_id:
+                        try:
+                            disable_cs_args = {
+                                "object_type": "controller_service",
+                                "object_id": cs_id,
+                                "operation_type": "disable"
+                            }
+                            disable_cs_result = await call_tool(
+                                client=async_client,
+                                base_url=base_url,
+                                tool_name="operate_nifi_objects",
+                                arguments={"operations": [disable_cs_args]},
+                                headers=mcp_headers,
+                                custom_logger=global_logger
+                            )
+                            if disable_cs_result and disable_cs_result[0].get("status") == "success":
+                                global_logger.info(f"Fixture: Successfully disabled controller service {cs_id}")
+                            else:
+                                global_logger.warning(f"Fixture: Could not confirm controller service {cs_id} disabled")
+                        except Exception as e_cs_disable:
+                            global_logger.warning(f"Fixture: Error disabling controller service {cs_id} (continuing): {e_cs_disable}")
+            else:
+                global_logger.info(f"Fixture: No controller services found in Process Group {pg_id}")
+        except Exception as e_cs_list:
+            global_logger.warning(f"Fixture: Error listing controller services (continuing with cleanup): {e_cs_list}")
+
+        # Step 3: Purge any queued flowfiles
         purge_args = {
             "target_id": pg_id,
             "target_type": "process_group",
@@ -173,9 +244,9 @@ async def test_pg(
             # Continue even if purge fails - we'll still try to delete the Process Group
             global_logger.warning(f"Fixture: Error purging flowfiles (continuing with cleanup): {e_purge}")
 
-        # Then delete the process group
+        # Step 4: Delete the process group
         delete_pg_args = {
-            "deletion_requests": [{
+            "objects": [{
                 "object_type": "process_group", 
                 "object_id": pg_id,
                 "name": f"Test Process Group {pg_id}"
@@ -196,8 +267,12 @@ async def test_pg(
             global_logger.info(f"Fixture: Successfully deleted Test Process Group {pg_id}")
         else:
             global_logger.error(f"Fixture: Failed to delete Test Process Group {pg_id}: {delete_pg_result.get('message')}")
+            # Log this as a critical cleanup failure
+            global_logger.critical(f"CLEANUP FAILURE: Process Group {pg_id} ({pg_name}) was not deleted and may need manual cleanup!")
     except Exception as e_del_pg:
         global_logger.error(f"Fixture: Error during Test Process Group {pg_id} cleanup: {e_del_pg}", exc_info=False)
+        # Log this as a critical cleanup failure
+        global_logger.critical(f"CLEANUP FAILURE: Process Group {pg_id} ({pg_name}) may need manual cleanup due to exception!")
 
 @pytest.fixture(scope="function")
 async def test_pg_with_processors(
@@ -352,6 +427,7 @@ async def test_connection(
     """Creates a connection between the Generate and Log processors from test_pg_with_processors."""
     generate_proc_id = test_pg_with_processors["generate_proc_id"]
     log_proc_id = test_pg_with_processors["log_proc_id"]
+    pg_id = test_pg_with_processors["pg_id"]
 
     global_logger.info(f"Fixture: Connecting {generate_proc_id} -> {log_proc_id}")
 
@@ -364,7 +440,7 @@ async def test_connection(
         client=async_client,
         base_url=base_url,
         tool_name="create_nifi_connections",
-        arguments={"connections": [connect_args]},
+        arguments={"connections": [connect_args], "process_group_id": pg_id},
         headers=mcp_headers,
         custom_logger=global_logger
     )
@@ -383,7 +459,7 @@ async def test_connection(
     global_logger.info(f"Fixture: Cleaning up test connection: {connection_id}")
     try:
         delete_conn_args = {
-            "deletion_requests": [{
+            "objects": [{
                 "object_type": "connection",
                 "object_id": connection_id,
                 "name": f"test-connection-{connection_id}"
@@ -626,10 +702,10 @@ async def test_complex_flow(
             base_url=base_url,
             tool_name="create_nifi_connections",
             arguments={"connections": [{
-                "source_id": input_port_id,
-                "target_id": split_proc_id,
+                "source_name": input_port_id,
+                "target_name": split_proc_id,
                 "relationships": []  # Empty list for port connections
-            }]},
+            }], "process_group_id": pg_id},
             headers=mcp_headers,
             custom_logger=global_logger
         )
@@ -646,10 +722,10 @@ async def test_complex_flow(
             base_url=base_url,
             tool_name="create_nifi_connections",
             arguments={"connections": [{
-                "source_id": split_proc_id,
-                "target_id": transform_proc_id,
+                "source_name": split_proc_id,
+                "target_name": transform_proc_id,
                 "relationships": ["success"]
-            }]},
+            }], "process_group_id": pg_id},
             headers=mcp_headers,
             custom_logger=global_logger
         )
@@ -660,10 +736,10 @@ async def test_complex_flow(
             base_url=base_url,
             tool_name="create_nifi_connections",
             arguments={"connections": [{
-                "source_id": split_proc_id,
-                "target_id": error_log_id,
+                "source_name": split_proc_id,
+                "target_name": error_log_id,
                 "relationships": ["failure"]
-            }]},
+            }], "process_group_id": pg_id},
             headers=mcp_headers,
             custom_logger=global_logger
         )
@@ -674,10 +750,10 @@ async def test_complex_flow(
             base_url=base_url,
             tool_name="create_nifi_connections",
             arguments={"connections": [{
-                "source_id": split_proc_id,
-                "target_id": orig_log_id,
+                "source_name": split_proc_id,
+                "target_name": orig_log_id,
                 "relationships": ["original"]
-            }]},
+            }], "process_group_id": pg_id},
             headers=mcp_headers,
             custom_logger=global_logger
         )
@@ -688,10 +764,10 @@ async def test_complex_flow(
             base_url=base_url,
             tool_name="create_nifi_connections",
             arguments={"connections": [{
-                "source_id": transform_proc_id,
-                "target_id": merge_proc_id,
+                "source_name": transform_proc_id,
+                "target_name": merge_proc_id,
                 "relationships": ["success"]
-            }]},
+            }], "process_group_id": pg_id},
             headers=mcp_headers,
             custom_logger=global_logger
         )
@@ -712,8 +788,8 @@ async def test_complex_flow(
                 stop_result_list = await call_tool(
                     client=async_client,
                     base_url=base_url,
-                    tool_name="operate_nifi_object",
-                    arguments=stop_args,
+                    tool_name="operate_nifi_objects",
+                    arguments={"operations": [stop_args]},
                     headers=mcp_headers,
                     custom_logger=global_logger
                 )
@@ -724,7 +800,55 @@ async def test_complex_flow(
             except Exception as e_stop:
                 global_logger.warning(f"Fixture: Error stopping Process Group {pg_id} (continuing with cleanup): {e_stop}")
 
-            # 2. Purge any queued flowfiles
+            # 2. Disable any controller services in the process group
+            try:
+                # List controller services in the process group
+                list_cs_args = {
+                    "object_type": "controller_services",
+                    "process_group_id": pg_id
+                }
+                cs_list_result = await call_tool(
+                    client=async_client,
+                    base_url=base_url,
+                    tool_name="list_nifi_objects",
+                    arguments=list_cs_args,
+                    headers=mcp_headers,
+                    custom_logger=global_logger
+                )
+                
+                if cs_list_result and isinstance(cs_list_result, list) and len(cs_list_result) > 0:
+                    global_logger.info(f"Fixture: Found {len(cs_list_result)} controller services to disable in Process Group {pg_id}")
+                    
+                    # Disable each controller service
+                    for cs in cs_list_result:
+                        cs_id = cs.get("id")
+                        if cs_id:
+                            try:
+                                disable_cs_args = {
+                                    "object_type": "controller_service",
+                                    "object_id": cs_id,
+                                    "operation_type": "disable"
+                                }
+                                disable_cs_result = await call_tool(
+                                    client=async_client,
+                                    base_url=base_url,
+                                    tool_name="operate_nifi_objects",
+                                    arguments={"operations": [disable_cs_args]},
+                                    headers=mcp_headers,
+                                    custom_logger=global_logger
+                                )
+                                if disable_cs_result and disable_cs_result[0].get("status") == "success":
+                                    global_logger.info(f"Fixture: Successfully disabled controller service {cs_id}")
+                                else:
+                                    global_logger.warning(f"Fixture: Could not confirm controller service {cs_id} disabled")
+                            except Exception as e_cs_disable:
+                                global_logger.warning(f"Fixture: Error disabling controller service {cs_id} (continuing): {e_cs_disable}")
+                else:
+                    global_logger.info(f"Fixture: No controller services found in Process Group {pg_id}")
+            except Exception as e_cs_list:
+                global_logger.warning(f"Fixture: Error listing controller services (continuing with cleanup): {e_cs_list}")
+
+            # 3. Purge any queued flowfiles
             purge_args = {
                 "target_id": pg_id,
                 "target_type": "process_group",
@@ -746,9 +870,9 @@ async def test_complex_flow(
             except Exception as e_purge:
                 global_logger.warning(f"Fixture: Error purging flowfiles (continuing with cleanup): {e_purge}")
 
-            # 3. Delete the process group
+            # 4. Delete the process group
             delete_pg_args = {
-                "deletion_requests": [{
+                "objects": [{
                     "object_type": "process_group", 
                     "object_id": pg_id,
                     "name": f"Test Process Group {pg_id}"
@@ -762,13 +886,10 @@ async def test_complex_flow(
                 headers=mcp_headers,
                 custom_logger=global_logger
             )
-            assert isinstance(delete_pg_result_list, list) and len(delete_pg_result_list) > 0 and isinstance(delete_pg_result_list[0], dict), \
-                "Unexpected response format for delete_nifi_objects (process group) in fixture teardown"
-            delete_pg_result = delete_pg_result_list[0]
-            if delete_pg_result.get("status") == "success":
+            if delete_pg_result_list[0].get("status") == "success":
                 global_logger.info(f"Fixture: Successfully deleted Test Process Group {pg_id}")
             else:
-                global_logger.error(f"Fixture: Failed to delete Test Process Group {pg_id}: {delete_pg_result.get('message')}")
+                global_logger.error(f"Fixture: Failed to delete Test Process Group {pg_id}")
         except Exception as e_del_pg:
             global_logger.error(f"Fixture: Error during Test Process Group {pg_id} cleanup: {e_del_pg}", exc_info=False) 
 
@@ -949,10 +1070,10 @@ async def test_merge_flow(
             base_url=base_url,
             tool_name="create_nifi_connections",
             arguments={"connections": [{
-                "source_id": gen1_id,
-                "target_id": update1_id,
+                "source_name": gen1_id,
+                "target_name": update1_id,
                 "relationships": ["success"]
-            }]},
+            }], "process_group_id": pg_id},
             headers=mcp_headers,
             custom_logger=global_logger
         )
@@ -963,10 +1084,10 @@ async def test_merge_flow(
             base_url=base_url,
             tool_name="create_nifi_connections",
             arguments={"connections": [{
-                "source_id": gen2_id,
-                "target_id": update2_id,
+                "source_name": gen2_id,
+                "target_name": update2_id,
                 "relationships": ["success"]
-            }]},
+            }], "process_group_id": pg_id},
             headers=mcp_headers,
             custom_logger=global_logger
         )
@@ -977,10 +1098,10 @@ async def test_merge_flow(
             base_url=base_url,
             tool_name="create_nifi_connections",
             arguments={"connections": [{
-                "source_id": update1_id,
-                "target_id": merge_id,
+                "source_name": update1_id,
+                "target_name": merge_id,
                 "relationships": ["success"]
-            }]},
+            }], "process_group_id": pg_id},
             headers=mcp_headers,
             custom_logger=global_logger
         )
@@ -991,10 +1112,10 @@ async def test_merge_flow(
             base_url=base_url,
             tool_name="create_nifi_connections",
             arguments={"connections": [{
-                "source_id": update2_id,
-                "target_id": merge_id,
+                "source_name": update2_id,
+                "target_name": merge_id,
                 "relationships": ["success"]
-            }]},
+            }], "process_group_id": pg_id},
             headers=mcp_headers,
             custom_logger=global_logger
         )
@@ -1015,8 +1136,8 @@ async def test_merge_flow(
                 stop_result_list = await call_tool(
                     client=async_client,
                     base_url=base_url,
-                    tool_name="operate_nifi_object",
-                    arguments=stop_args,
+                    tool_name="operate_nifi_objects",
+                    arguments={"operations": [stop_args]},
                     headers=mcp_headers,
                     custom_logger=global_logger
                 )
@@ -1051,7 +1172,7 @@ async def test_merge_flow(
 
             # Delete the process group
             delete_pg_args = {
-                "deletion_requests": [{
+                "objects": [{
                     "object_type": "process_group", 
                     "object_id": pg_id,
                     "name": f"Test Process Group {pg_id}"
@@ -1071,3 +1192,5 @@ async def test_merge_flow(
                 global_logger.error(f"Fixture: Failed to delete Test Process Group {pg_id}")
         except Exception as e:
             global_logger.error(f"Fixture: Error during Test Process Group {pg_id} cleanup: {e}", exc_info=False) 
+
+ 

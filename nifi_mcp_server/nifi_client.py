@@ -2038,3 +2038,331 @@ class NiFiClient:
         except Exception as e:
             logger.error(f"Error getting {direction} content for provenance event {event_id}: {e}")
             raise ConnectionError(f"Error getting provenance event content: {e}") from e
+
+    # ==========================================
+    # Controller Service Methods
+    # ==========================================
+
+    async def list_controller_services(self, process_group_id: str, user_request_id: str = "-", action_id: str = "-") -> List[Dict]:
+        """Lists controller services within a specified process group."""
+        local_logger = logger.bind(user_request_id=user_request_id, action_id=action_id)
+        
+        if not self._token:
+            local_logger.error("Authentication required before listing controller services.")
+            raise NiFiAuthenticationError("Client is not authenticated. Call authenticate() first.")
+
+        client = await self._get_client()
+        endpoint = f"/flow/process-groups/{process_group_id}/controller-services"
+        try:
+            local_logger.info(f"Fetching controller services for group {process_group_id} from {self.base_url}{endpoint}")
+            response = await client.get(endpoint)
+            response.raise_for_status()
+            data = response.json()
+            # The response is typically a ControllerServicesEntity which has a 'controllerServices' key containing a list
+            controller_services = data.get("controllerServices", [])
+            local_logger.info(f"Found {len(controller_services)} controller services in group {process_group_id}.")
+            return controller_services
+
+        except httpx.HTTPStatusError as e:
+            local_logger.error(f"Failed to list controller services for group {process_group_id}: {e.response.status_code} - {e.response.text}")
+            raise ConnectionError(f"Failed to list controller services: {e.response.status_code}") from e
+        except (httpx.RequestError, ValueError) as e:
+            local_logger.error(f"Error listing controller services for group {process_group_id}: {e}")
+            raise ConnectionError(f"Error listing controller services: {e}") from e
+        except Exception as e:
+            local_logger.error(f"An unexpected error occurred listing controller services: {e}", exc_info=True)
+            raise ConnectionError(f"An unexpected error occurred listing controller services: {e}") from e
+
+    async def get_controller_service_details(self, controller_service_id: str, user_request_id: str = "-", action_id: str = "-") -> Dict:
+        """Gets detailed information about a specific controller service."""
+        local_logger = logger.bind(user_request_id=user_request_id, action_id=action_id)
+        
+        if not self._token:
+            local_logger.error("Authentication required before getting controller service details.")
+            raise NiFiAuthenticationError("Client is not authenticated. Call authenticate() first.")
+
+        client = await self._get_client()
+        endpoint = f"/controller-services/{controller_service_id}"
+        try:
+            local_logger.info(f"Fetching controller service details for {controller_service_id} from {self.base_url}{endpoint}")
+            response = await client.get(endpoint)
+            response.raise_for_status()
+            controller_service_entity = response.json()
+            local_logger.info(f"Successfully retrieved controller service details for {controller_service_id}.")
+            return controller_service_entity
+
+        except httpx.HTTPStatusError as e:
+            local_logger.error(f"Failed to get controller service details for {controller_service_id}: {e.response.status_code} - {e.response.text}")
+            if e.response.status_code == 404:
+                raise ValueError(f"Controller service {controller_service_id} not found") from e
+            raise ConnectionError(f"Failed to get controller service details: {e.response.status_code}") from e
+        except (httpx.RequestError, ValueError) as e:
+            local_logger.error(f"Error getting controller service details for {controller_service_id}: {e}")
+            raise ConnectionError(f"Error getting controller service details: {e}") from e
+        except Exception as e:
+            local_logger.error(f"An unexpected error occurred getting controller service details: {e}", exc_info=True)
+            raise ConnectionError(f"An unexpected error occurred getting controller service details: {e}") from e
+
+    async def create_controller_service(
+        self,
+        process_group_id: str,
+        service_type: str,
+        name: str,
+        properties: Optional[Dict[str, Any]] = None,
+        user_request_id: str = "-",
+        action_id: str = "-"
+    ) -> Dict:
+        """Creates a new controller service in the specified process group."""
+        local_logger = logger.bind(user_request_id=user_request_id, action_id=action_id)
+        
+        if not self._token:
+            local_logger.error("Authentication required before creating controller service.")
+            raise NiFiAuthenticationError("Client is not authenticated. Call authenticate() first.")
+
+        client = await self._get_client()
+        endpoint = f"/process-groups/{process_group_id}/controller-services"
+
+        # Construct the request body (ControllerServiceEntity)
+        request_body = {
+            "revision": {
+                "clientId": self._client_id,
+                "version": 0
+            },
+            "disconnectedNodeAcknowledged": False,
+            "component": {
+                "type": service_type,
+                "name": name
+            }
+        }
+
+        # Add properties if provided
+        if properties:
+            request_body["component"]["properties"] = properties
+
+        try:
+            local_logger.info(f"Creating controller service '{name}' ({service_type}) in group {process_group_id}")
+            response = await client.post(endpoint, json=request_body)
+            response.raise_for_status()
+            controller_service_entity = response.json()
+            
+            # Extract the controller service ID for logging
+            created_id = controller_service_entity.get("component", {}).get("id", "unknown")
+            local_logger.info(f"Successfully created controller service '{name}' with ID {created_id}")
+            return controller_service_entity
+
+        except httpx.HTTPStatusError as e:
+            local_logger.error(f"Failed to create controller service '{name}': {e.response.status_code} - {e.response.text}")
+            raise ConnectionError(f"Failed to create controller service: {e.response.status_code}, {e.response.text}") from e
+        except (httpx.RequestError, ValueError) as e:
+            local_logger.error(f"Error creating controller service '{name}': {e}")
+            raise ConnectionError(f"Error creating controller service: {e}") from e
+        except Exception as e:
+            local_logger.error(f"An unexpected error occurred creating controller service '{name}': {e}", exc_info=True)
+            raise ConnectionError(f"An unexpected error occurred creating controller service: {e}") from e
+
+    async def update_controller_service_properties(
+        self,
+        controller_service_id: str,
+        properties: Dict[str, Any],
+        user_request_id: str = "-",
+        action_id: str = "-"
+    ) -> Dict:
+        """Updates controller service properties."""
+        local_logger = logger.bind(user_request_id=user_request_id, action_id=action_id)
+        
+        if not self._token:
+            local_logger.error("Authentication required before updating controller service properties.")
+            raise NiFiAuthenticationError("Client is not authenticated. Call authenticate() first.")
+
+        # First, get current controller service to get revision info
+        current_entity = await self.get_controller_service_details(controller_service_id, user_request_id, action_id)
+        
+        client = await self._get_client()
+        endpoint = f"/controller-services/{controller_service_id}"
+
+        # Construct the update payload
+        request_body = {
+            "revision": current_entity.get("revision", {}),
+            "disconnectedNodeAcknowledged": False,
+            "component": {
+                "id": controller_service_id,
+                "properties": properties
+            }
+        }
+
+        try:
+            local_logger.info(f"Updating properties for controller service {controller_service_id}")
+            response = await client.put(endpoint, json=request_body)
+            response.raise_for_status()
+            updated_entity = response.json()
+            local_logger.info(f"Successfully updated properties for controller service {controller_service_id}")
+            return updated_entity
+
+        except httpx.HTTPStatusError as e:
+            local_logger.error(f"Failed to update controller service properties for {controller_service_id}: {e.response.status_code} - {e.response.text}")
+            if e.response.status_code == 404:
+                raise ValueError(f"Controller service {controller_service_id} not found") from e
+            elif e.response.status_code == 409:
+                raise ValueError(f"Conflict updating controller service {controller_service_id}. Revision mismatch: {e.response.text}") from e
+            raise ConnectionError(f"Failed to update controller service properties: {e.response.status_code}, {e.response.text}") from e
+        except (httpx.RequestError, ValueError) as e:
+            local_logger.error(f"Error updating controller service properties for {controller_service_id}: {e}")
+            raise ConnectionError(f"Error updating controller service properties: {e}") from e
+        except Exception as e:
+            local_logger.error(f"An unexpected error occurred updating controller service properties: {e}", exc_info=True)
+            raise ConnectionError(f"An unexpected error occurred updating controller service properties: {e}") from e
+
+    async def delete_controller_service(self, controller_service_id: str, version: int, user_request_id: str = "-", action_id: str = "-") -> bool:
+        """Deletes a controller service."""
+        local_logger = logger.bind(user_request_id=user_request_id, action_id=action_id)
+        
+        if not self._token:
+            local_logger.error("Authentication required before deleting controller service.")
+            raise NiFiAuthenticationError("Client is not authenticated. Call authenticate() first.")
+
+        client = await self._get_client()
+        endpoint = f"/controller-services/{controller_service_id}"
+        params = {
+            "version": version,
+            "clientId": self._client_id,
+            "disconnectedNodeAcknowledged": "false"
+        }
+
+        try:
+            local_logger.info(f"Deleting controller service {controller_service_id} with version {version}")
+            response = await client.delete(endpoint, params=params)
+            response.raise_for_status()
+            local_logger.info(f"Successfully deleted controller service {controller_service_id}")
+            return True
+
+        except httpx.HTTPStatusError as e:
+            local_logger.error(f"Failed to delete controller service {controller_service_id}: {e.response.status_code} - {e.response.text}")
+            if e.response.status_code == 404:
+                local_logger.warning(f"Controller service {controller_service_id} not found, considering it already deleted")
+                return True  # Consider it successful if already gone
+            elif e.response.status_code == 409:
+                raise ValueError(f"Conflict deleting controller service {controller_service_id}. Revision mismatch or service in use: {e.response.text}") from e
+            raise ConnectionError(f"Failed to delete controller service: {e.response.status_code}, {e.response.text}") from e
+        except (httpx.RequestError, ValueError) as e:
+            local_logger.error(f"Error deleting controller service {controller_service_id}: {e}")
+            raise ConnectionError(f"Error deleting controller service: {e}") from e
+        except Exception as e:
+            local_logger.error(f"An unexpected error occurred deleting controller service: {e}", exc_info=True)
+            raise ConnectionError(f"An unexpected error occurred deleting controller service: {e}") from e
+
+    async def enable_controller_service(self, controller_service_id: str, user_request_id: str = "-", action_id: str = "-") -> Dict:
+        """Enables a controller service."""
+        local_logger = logger.bind(user_request_id=user_request_id, action_id=action_id)
+        
+        if not self._token:
+            local_logger.error("Authentication required before enabling controller service.")
+            raise NiFiAuthenticationError("Client is not authenticated. Call authenticate() first.")
+
+        # First, get current controller service to get revision info
+        current_entity = await self.get_controller_service_details(controller_service_id, user_request_id, action_id)
+        
+        client = await self._get_client()
+        endpoint = f"/controller-services/{controller_service_id}/run-status"
+
+        # Construct the request body to enable the service
+        request_body = {
+            "revision": current_entity.get("revision", {}),
+            "disconnectedNodeAcknowledged": False,
+            "state": "ENABLED"
+        }
+
+        try:
+            local_logger.info(f"Enabling controller service {controller_service_id}")
+            response = await client.put(endpoint, json=request_body)
+            response.raise_for_status()
+            updated_entity = response.json()
+            local_logger.info(f"Successfully enabled controller service {controller_service_id}")
+            return updated_entity
+
+        except httpx.HTTPStatusError as e:
+            local_logger.error(f"Failed to enable controller service {controller_service_id}: {e.response.status_code} - {e.response.text}")
+            if e.response.status_code == 404:
+                raise ValueError(f"Controller service {controller_service_id} not found") from e
+            elif e.response.status_code == 409:
+                raise ValueError(f"Conflict enabling controller service {controller_service_id}: {e.response.text}") from e
+            raise ConnectionError(f"Failed to enable controller service: {e.response.status_code}, {e.response.text}") from e
+        except (httpx.RequestError, ValueError) as e:
+            local_logger.error(f"Error enabling controller service {controller_service_id}: {e}")
+            raise ConnectionError(f"Error enabling controller service: {e}") from e
+        except Exception as e:
+            local_logger.error(f"An unexpected error occurred enabling controller service: {e}", exc_info=True)
+            raise ConnectionError(f"An unexpected error occurred enabling controller service: {e}") from e
+
+    async def disable_controller_service(self, controller_service_id: str, user_request_id: str = "-", action_id: str = "-") -> Dict:
+        """Disables a controller service."""
+        local_logger = logger.bind(user_request_id=user_request_id, action_id=action_id)
+        
+        if not self._token:
+            local_logger.error("Authentication required before disabling controller service.")
+            raise NiFiAuthenticationError("Client is not authenticated. Call authenticate() first.")
+
+        # First, get current controller service to get revision info
+        current_entity = await self.get_controller_service_details(controller_service_id, user_request_id, action_id)
+        
+        client = await self._get_client()
+        endpoint = f"/controller-services/{controller_service_id}/run-status"
+
+        # Construct the request body to disable the service
+        request_body = {
+            "revision": current_entity.get("revision", {}),
+            "disconnectedNodeAcknowledged": False,
+            "state": "DISABLED"
+        }
+
+        try:
+            local_logger.info(f"Disabling controller service {controller_service_id}")
+            response = await client.put(endpoint, json=request_body)
+            response.raise_for_status()
+            updated_entity = response.json()
+            local_logger.info(f"Successfully disabled controller service {controller_service_id}")
+            return updated_entity
+
+        except httpx.HTTPStatusError as e:
+            local_logger.error(f"Failed to disable controller service {controller_service_id}: {e.response.status_code} - {e.response.text}")
+            if e.response.status_code == 404:
+                raise ValueError(f"Controller service {controller_service_id} not found") from e
+            elif e.response.status_code == 409:
+                raise ValueError(f"Conflict disabling controller service {controller_service_id}: {e.response.text}") from e
+            raise ConnectionError(f"Failed to disable controller service: {e.response.status_code}, {e.response.text}") from e
+        except (httpx.RequestError, ValueError) as e:
+            local_logger.error(f"Error disabling controller service {controller_service_id}: {e}")
+            raise ConnectionError(f"Error disabling controller service: {e}") from e
+        except Exception as e:
+            local_logger.error(f"An unexpected error occurred disabling controller service: {e}", exc_info=True)
+            raise ConnectionError(f"An unexpected error occurred disabling controller service: {e}") from e
+
+    async def get_controller_service_types(self, user_request_id: str = "-", action_id: str = "-") -> List[Dict]:
+        """Fetches the list of available controller service types from the NiFi instance."""
+        local_logger = logger.bind(user_request_id=user_request_id, action_id=action_id)
+        
+        if not self._token:
+            local_logger.error("Authentication required before getting controller service types.")
+            raise NiFiAuthenticationError("Client is not authenticated. Call authenticate() first.")
+
+        client = await self._get_client()
+        endpoint = "/flow/controller-service-types"
+
+        try:
+            local_logger.info(f"Fetching available controller service types from {self.base_url}{endpoint}")
+            response = await client.get(endpoint)
+            response.raise_for_status()
+            data = response.json()
+            # The response is ControllerServiceTypesEntity, containing 'controllerServiceTypes' list
+            controller_service_types = data.get("controllerServiceTypes", [])
+            local_logger.info(f"Successfully fetched {len(controller_service_types)} available controller service types.")
+            return controller_service_types
+
+        except httpx.HTTPStatusError as e:
+            local_logger.error(f"Failed to get controller service types: {e.response.status_code} - {e.response.text}")
+            raise ConnectionError(f"Failed to get controller service types: {e.response.status_code}, {e.response.text}") from e
+        except (httpx.RequestError, ValueError) as e:
+            local_logger.error(f"Error getting controller service types: {e}")
+            raise ConnectionError(f"Error getting controller service types: {e}") from e
+        except Exception as e:
+            local_logger.error(f"An unexpected error occurred getting controller service types: {e}", exc_info=True)
+            raise ConnectionError(f"An unexpected error occurred getting controller service types: {e}") from e

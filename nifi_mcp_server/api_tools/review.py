@@ -15,7 +15,9 @@ from .utils import (
     _format_connection_summary,
     _format_port_summary,
     filter_processor_data, # Keep if needed by helpers here
-    filter_connection_data # Add missing import
+    filter_connection_data, # Add missing import
+    filter_controller_service_data,  # Add controller service import
+    _format_controller_service_summary  # Add controller service summary import
 )
 # Keep NiFiClient type hint and error imports
 from nifi_mcp_server.nifi_client import NiFiClient, NiFiAuthenticationError
@@ -120,7 +122,7 @@ async def _get_process_group_contents_counts(pg_id: str) -> Dict[str, int]:
          return counts
 
 async def _list_components_recursively_with_timeout(
-    object_type: Literal["processors", "connections", "ports"],
+    object_type: Literal["processors", "connections", "ports", "controller_services"],
     pg_id: str,
     depth: int = 0,
     max_depth: int = 3,
@@ -216,6 +218,9 @@ async def _list_components_recursively_with_timeout(
             elif object_type == "connections":
                 raw_objects = await nifi_client.list_connections(pg_id, user_request_id=user_request_id, action_id=action_id)
                 current_level_objects = _format_connection_summary(raw_objects)
+            elif object_type == "controller_services":
+                raw_objects = await nifi_client.list_controller_services(pg_id, user_request_id=user_request_id, action_id=action_id)
+                current_level_objects = _format_controller_service_summary(raw_objects)
             elif object_type == "ports":
                 input_ports = await nifi_client.get_input_ports(pg_id)
                 output_ports = await nifi_client.get_output_ports(pg_id)
@@ -593,7 +598,7 @@ async def _get_process_group_hierarchy(
 @mcp.tool()
 @tool_phases(["Review", "Build", "Modify", "Operate"])
 async def list_nifi_objects(
-    object_type: Literal["processors", "connections", "ports", "process_groups"],
+    object_type: Literal["processors", "connections", "ports", "process_groups", "controller_services"],
     process_group_id: str | None = None,
     search_scope: Literal["current_group", "recursive"] = "current_group",
     timeout_seconds: Optional[float] = None,
@@ -613,12 +618,13 @@ async def list_nifi_objects(
 
     Parameters
     ----------
-    object_type : Literal["processors", "connections", "ports", "process_groups"]
+    object_type : Literal["processors", "connections", "ports", "process_groups", "controller_services"]
         The type of NiFi objects to list.
         - 'processors': Lists processors with basic details and status.
         - 'connections': Lists connections with basic details and status.
         - 'ports': Lists input and output ports with basic details and status.
         - 'process_groups': Lists child process groups under the target group (see search_scope).
+        - 'controller_services': Lists controller services with basic details and status.
     process_group_id : str | None, optional
         The ID of the target process group. If None, defaults to the root process group.
     search_scope : Literal["current_group", "recursive"], optional
@@ -637,7 +643,7 @@ async def list_nifi_objects(
     Returns
     -------
     Union[List[Dict], Dict]
-        - For object_type 'processors', 'connections', 'ports':
+        - For object_type 'processors', 'connections', 'ports', 'controller_services':
             - If search_scope='current_group': A list of simplified object summaries.
             - If search_scope='recursive': A dictionary containing:
                 - 'results': List of dictionaries with 'process_group_id', 'process_group_name', and 'objects'
@@ -706,7 +712,7 @@ async def list_nifi_objects(
                     local_logger.warning(f"Hierarchy fetch timed out. Processed {hierarchy.get('processed_count', 0)} groups. Use continuation_token to resume.")
                 return hierarchy
 
-        # --- Processor, Connection, Port Handling --- 
+        # --- Processor, Connection, Port, Controller Service Handling --- 
         else:
             local_logger.debug(f"Handling object_type '{object_type}'...")
             if search_scope == "current_group":
@@ -722,6 +728,9 @@ async def list_nifi_objects(
                     input_ports = await nifi_client.get_input_ports(target_pg_id)
                     output_ports = await nifi_client.get_output_ports(target_pg_id)
                     objects = _format_port_summary(input_ports, output_ports)
+                elif object_type == "controller_services":
+                    raw_objects = await nifi_client.list_controller_services(target_pg_id, user_request_id=user_request_id, action_id=action_id)
+                    objects = _format_controller_service_summary(raw_objects)
                     
                 local_logger.info(f"Found {len(objects)} {object_type} directly within PG {target_pg_id}")
                 return objects
@@ -929,16 +938,16 @@ async def list_nifi_objects_with_streaming(
 @mcp.tool()
 @tool_phases(["Review", "Build", "Modify", "Operate"])
 async def get_nifi_object_details(
-    object_type: Literal["processor", "connection", "port", "process_group"],
+    object_type: Literal["processor", "connection", "port", "process_group", "controller_service"],
     object_id: str,
     # mcp_context: dict = {} # Removed context parameter
 ) -> Dict:
     """
-    Retrieves detailed information for a specific NiFi processor, connection, port, or process group.
+    Retrieves detailed information for a specific NiFi processor, connection, port, process group, or controller service.
 
     Parameters
     ----------
-    object_type : Literal["processor", "connection", "port", "process_group"]
+    object_type : Literal["processor", "connection", "port", "process_group", "controller_service"]
         The type of NiFi object to retrieve details for.
     object_id : str
         The ID of the specific NiFi object.
@@ -978,6 +987,10 @@ async def get_nifi_object_details(
         elif object_type == "process_group":
             # Use the method that passes context IDs
             details = await nifi_client.get_process_group_details(
+                object_id, user_request_id=user_request_id, action_id=action_id
+            )
+        elif object_type == "controller_service":
+            details = await nifi_client.get_controller_service_details(
                 object_id, user_request_id=user_request_id, action_id=action_id
             )
         elif object_type == "port":
@@ -1154,7 +1167,7 @@ async def document_nifi_flow(
 @tool_phases(["Review", "Operate"])
 async def search_nifi_flow(
     query: str,
-    filter_object_type: Optional[Literal["processor", "connection", "port", "process_group"]] = None,
+    filter_object_type: Optional[Literal["processor", "connection", "port", "process_group", "controller_service"]] = None,
     filter_process_group_id: Optional[str] = None,
     # mcp_context: dict = {} # Removed context parameter
 ) -> Dict[str, List[Dict]]:
@@ -1167,7 +1180,7 @@ async def search_nifi_flow(
     ----------
     query : str
         The search term (e.g., processor name, property value, comment text).
-    filter_object_type : Optional[Literal["processor", "connection", "port", "process_group"]], optional
+    filter_object_type : Optional[Literal["processor", "connection", "port", "process_group", "controller_service"]], optional
         Filter results to only include objects of this type. 'port' includes both input and output ports.
     filter_process_group_id : Optional[str], optional
         Filter results to only include objects within the specified process group (including nested groups).
@@ -1176,7 +1189,7 @@ async def search_nifi_flow(
     Returns
     -------
     Dict[str, List[Dict]]
-        A dictionary containing lists of matching objects, keyed by type (e.g., 'processorResults', 'connectionResults').
+        A dictionary containing lists of matching objects, keyed by type (e.g., 'processorResults', 'connectionResults', 'controllerServiceResults').
         Each result includes basic information like id, name, and parent group.
     """
     # Get client and logger from context variables
@@ -1207,6 +1220,7 @@ async def search_nifi_flow(
             "processor": "processorResults",
             "connection": "connectionResults",
             "process_group": "processGroupResults",
+            "controller_service": "controllerServiceResults",
             "input_port": "inputPortResults", # Map generic port to specific results
             "output_port": "outputPortResults" # Map generic port to specific results
         }
