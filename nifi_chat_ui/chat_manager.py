@@ -1822,11 +1822,13 @@ def get_llm_response(
     tools: List[Dict[str, Any]] | None, 
     provider: str, 
     model_name: str,
-    user_request_id: str | None = None
+    user_request_id: str | None = None,
+    action_id: str | None = None
 ) -> Dict[str, Any]:
     """Generic LLM response dispatcher that routes to the appropriate provider."""
-    # Generate action ID for this specific LLM call
-    action_id = str(uuid.uuid4())
+    # Use provided action ID or generate a new one for this specific LLM call
+    if action_id is None:
+        action_id = str(uuid.uuid4())
     bound_logger = logger.bind(user_request_id=user_request_id, action_id=action_id)
     
     # Normalize provider name

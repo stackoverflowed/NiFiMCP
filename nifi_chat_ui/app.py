@@ -262,26 +262,77 @@ with st.sidebar:
     if "available_workflows" not in st.session_state:
         st.session_state.available_workflows = []
     
-    # Execution Mode Selection - Temporarily hidden
-    # execution_modes = ["unguided", "guided"]
-    # current_mode_index = execution_modes.index(st.session_state.workflow_execution_mode) if st.session_state.workflow_execution_mode in execution_modes else 0
-    # 
-    # def on_execution_mode_change():
-    #     new_mode = st.session_state.execution_mode_selector
-    #     if st.session_state.workflow_execution_mode != new_mode:
-    #         st.session_state.workflow_execution_mode = new_mode
-    #         # Reset workflow selection when mode changes
-    #         st.session_state.selected_workflow = None
-    #         logger.info(f"Workflow execution mode changed to: {new_mode}")
-    # 
-    # st.selectbox(
-    #     "Execution Mode:",
-    #     options=execution_modes,
-    #     index=current_mode_index,
-    #     key="execution_mode_selector",
-    #     on_change=on_execution_mode_change,
-    #     help="Select workflow execution mode: 'unguided' for free-form chat, 'guided' for structured workflows"
-    # )
+    # Execution Mode Selection
+    execution_modes = ["unguided", "guided"]
+    current_mode_index = execution_modes.index(st.session_state.workflow_execution_mode) if st.session_state.workflow_execution_mode in execution_modes else 0
+    
+    def on_execution_mode_change():
+        new_mode = st.session_state.execution_mode_selector
+        if st.session_state.workflow_execution_mode != new_mode:
+            st.session_state.workflow_execution_mode = new_mode
+            # Reset workflow selection when mode changes
+            st.session_state.selected_workflow = None
+            logger.info(f"Workflow execution mode changed to: {new_mode}")
+    
+    st.selectbox(
+        "Execution Mode:",
+        options=execution_modes,
+        index=current_mode_index,
+        key="execution_mode_selector",
+        on_change=on_execution_mode_change,
+        help="Select workflow execution mode: 'unguided' for free-form chat, 'guided' for structured workflows"
+    )
+    
+    # === WORKFLOW SELECTION (for guided mode) ===
+    if st.session_state.workflow_execution_mode == "guided":
+        st.markdown("---")
+        
+        # Get available workflows
+        try:
+            from nifi_mcp_server.workflows.registry import get_workflow_registry
+            registry = get_workflow_registry()
+            available_workflows = registry.list_workflows(enabled_only=True)
+            
+            if available_workflows:
+                workflow_options = {wf.name: wf.display_name for wf in available_workflows}
+                workflow_names = list(workflow_options.keys())
+                
+                # Determine current selection
+                current_workflow = st.session_state.get("selected_workflow")
+                if current_workflow in workflow_names:
+                    default_index = workflow_names.index(current_workflow)
+                else:
+                    default_index = 0
+                    st.session_state.selected_workflow = workflow_names[0] if workflow_names else None
+                
+                def on_workflow_change():
+                    new_workflow = st.session_state.workflow_selector
+                    if st.session_state.selected_workflow != new_workflow:
+                        st.session_state.selected_workflow = new_workflow
+                        logger.info(f"Selected workflow changed to: {new_workflow}")
+                
+                st.selectbox(
+                    "Select Workflow:",
+                    options=workflow_names,
+                    format_func=lambda x: workflow_options.get(x, x),
+                    index=default_index,
+                    key="workflow_selector",
+                    on_change=on_workflow_change,
+                    help="Choose the guided workflow to execute"
+                )
+                
+                # Show workflow description
+                if st.session_state.selected_workflow:
+                    selected_wf = next((wf for wf in available_workflows if wf.name == st.session_state.selected_workflow), None)
+                    if selected_wf:
+                        st.info(f"**{selected_wf.display_name}**: {selected_wf.description}")
+            else:
+                st.warning("No guided workflows available.")
+                st.session_state.selected_workflow = None
+                
+        except Exception as e:
+            st.error(f"Failed to load workflows: {e}")
+            st.session_state.selected_workflow = None
     
     # === PHASE SELECTION ===
     st.markdown("---") # Add separator
@@ -603,19 +654,32 @@ def run_workflow_execution(workflow_name: str, provider: str, model_name: str, b
             effective_system_prompt = base_sys_prompt
             bound_logger.debug("No objective set, using base system prompt for workflow.")
         
+        # Filter out the workflow startup message to prevent duplication
+        # The startup message we just added should not be passed to the workflow
+        filtered_messages = []
+        for msg in st.session_state.messages:
+            # Skip the workflow startup message we just added
+            if (msg.get("role") == "assistant" and 
+                msg.get("content", "").startswith("🚀 **Starting guided workflow:")):
+                continue
+            filtered_messages.append(msg)
+        
         context = {
             "provider": provider,
             "model_name": model_name,
             "system_prompt": effective_system_prompt,  # Use the effective system prompt with objective
             "user_request_id": user_req_id,
-            "messages": st.session_state.messages.copy(),
+            "messages": filtered_messages,  # Use filtered messages instead of all messages
             "selected_nifi_server_id": st.session_state.get("selected_nifi_server_id"),
             "selected_phase": st.session_state.get("selected_phase", "All"),
+            "max_loop_iterations": st.session_state.get("max_loop_iterations", MAX_LOOP_ITERATIONS),
+            "max_tokens_limit": st.session_state.get("max_tokens_limit", 8000),  # Add token limit from UI
+            "auto_prune_history": st.session_state.get("auto_prune_history", False),  # Add pruning setting
             "current_objective": current_objective  # Also pass the objective separately for workflow use
         }
         
-        # Execute workflow
-        with st.spinner(f"🤔 Thinking... (Guided Workflow: {workflow_name})"):
+        # Execute workflow with real-time LLM call display
+        with st.spinner(f"🤔 Executing Workflow: {workflow_name}"):
             result = executor.execute(context)
         
         # Calculate execution duration
@@ -627,15 +691,44 @@ def run_workflow_execution(workflow_name: str, provider: str, model_name: str, b
             
             # Extract the actual workflow results from shared state
             shared_state = result.get("shared_state", {})
+            
+            # --- FIX: Get messages from the correct key ---
+            # The complete message history is now in "final_messages"
+            workflow_messages = shared_state.get("final_messages", [])
+            
+            # DEBUG: Log what we actually received
+            workflow_logger = bound_logger.bind(
+                interface="workflow", 
+                direction="ui_processing",
+                data={
+                    "message_count": len(workflow_messages),
+                    "messages": [
+                        {
+                            "index": i,
+                            "role": msg.get("role", "unknown"),
+                            "has_content": bool(msg.get("content")),
+                            "has_tool_calls": bool(msg.get("tool_calls"))
+                        }
+                        for i, msg in enumerate(workflow_messages)
+                    ]
+                }
+            )
+            workflow_logger.info("Received workflow messages in UI")
+            
+            # Get other details from the "unguided_mimic_result" for the summary
             workflow_result = shared_state.get("unguided_mimic_result", {})
             
-            # Get the messages from the workflow execution
-            workflow_messages = workflow_result.get("messages", [])
+            # Calculate token counts correctly by summing from all messages
+            total_tokens_in = 0
+            total_tokens_out = 0
             
-            # Get token counts
-            tokens_in = workflow_result.get("total_tokens_in", 0)
-            tokens_out = workflow_result.get("total_tokens_out", 0)
-            total_tokens = tokens_in + tokens_out
+            # Sum up tokens from all assistant messages in the workflow
+            for msg in workflow_messages:
+                if msg.get("role") == "assistant":
+                    total_tokens_in += msg.get("token_count_in", 0)
+                    total_tokens_out += msg.get("token_count_out", 0)
+            
+            total_tokens = total_tokens_in + total_tokens_out
             
             # Get workflow execution details for summary
             loop_count = workflow_result.get("loop_count", 0)
@@ -653,26 +746,125 @@ def run_workflow_execution(workflow_name: str, provider: str, model_name: str, b
             
             # Extract and display the actual LLM responses from the workflow first
             if workflow_messages:
-                # Find new messages that aren't already in session state
-                existing_message_count = len(st.session_state.messages) - 1  # Subtract the start message we just added
-                new_messages = workflow_messages[existing_message_count:]
+                # CRITICAL FIX: Only process messages that are NEW from this workflow execution
+                # The workflow_messages contains ALL messages (input + new), but we only want to display the new ones
+                
+                # Calculate how many messages we originally passed to the workflow
+                original_message_count = len(filtered_messages)
+                
+                # The new messages are everything after the original message count
+                # Note: workflow_messages includes system prompt + original messages + new messages
+                # But the workflow removes the system prompt, so it's: original_messages + new_messages
+                new_messages = workflow_messages[original_message_count:] if len(workflow_messages) > original_message_count else []
+                
+                bound_logger.info(f"Message calculation: Original={original_message_count}, Total={len(workflow_messages)}, New={len(new_messages)}")
+                
+                workflow_logger.bind(
+                    direction="ui_processing", 
+                    data={
+                        "original_message_count": original_message_count,
+                        "total_workflow_messages": len(workflow_messages),
+                        "new_messages_count": len(new_messages),
+                        "message_details": [
+                            {
+                                "role": msg.get("role"),
+                                "has_content": bool(msg.get("content")),
+                                "has_tool_calls": bool(msg.get("tool_calls"))
+                            }
+                            for msg in new_messages
+                        ]
+                    }
+                ).info("Processing new workflow messages")
                 
                 for msg in new_messages:
-                    if msg.get("role") == "assistant" and msg.get("content"):
-                        # Display the LLM response
+                    if msg.get("role") == "assistant" and (msg.get("content") or msg.get("tool_calls")):
+                        # Extract workflow and step info from action_id
+                        action_id = msg.get("action_id", "")
+                        workflow_id = "unknown"
+                        step_id = "unknown"
+                        
+                        # Parse workflow context from action_id if it follows the pattern wf-{workflow}-{step}-tool-{uuid}
+                        if action_id.startswith("wf-") and "-tool-" in action_id:
+                            parts = action_id.split("-tool-")[0]  # Remove the tool UUID part
+                            if parts.startswith("wf-"):
+                                workflow_parts = parts[3:].split("-")  # Remove 'wf-' prefix
+                                if len(workflow_parts) >= 2:
+                                    # Last part is step_id, everything before is workflow_id
+                                    step_id = workflow_parts[-1]
+                                    workflow_id = "-".join(workflow_parts[:-1])
+                        
+                        # Log workflow context for debugging
+                        bound_logger.debug(f"Processing message: Action: {action_id}, Parsed Workflow: {workflow_id}, Step: {step_id}, Content: {len(msg.get('content', ''))}, Tool calls: {len(msg.get('tool_calls', []))}")
+                        msg_tokens_in = msg.get("token_count_in", 0)
+                        msg_tokens_out = msg.get("token_count_out", 0)
+                        msg_total_tokens = msg_tokens_in + msg_tokens_out
+                        
+                        # Display the LLM response with workflow context
                         with st.chat_message("assistant"):
-                            st.markdown(msg["content"])
+                            # Show workflow context like unguided mode shows Req/Act IDs
+                            st.markdown(f"**🤖 LLM Response** - Workflow: `{workflow_id}` | Step: `{step_id}` | Action: `{action_id[:8]}...`")
+                            
+                            # Show token information
+                            if msg_total_tokens > 0:
+                                st.markdown(f"*📊 {msg_total_tokens:,} tokens ({msg_tokens_in:,} in, {msg_tokens_out:,} out)*")
+                            
+                            # Show tool calls if any (like unguided mode)
+                            tool_calls = msg.get("tool_calls", [])
+                            if tool_calls:
+                                # Extract workflow context from tool_calls if available
+                                tool_call_contexts = []
+                                tool_names = []
+                                for tc in tool_calls:
+                                    tool_name = tc.get('function', {}).get('name', 'unknown')
+                                    tool_names.append(tool_name)
+                                    
+                                    # Try to extract workflow context from tool call id
+                                    tool_call_id = tc.get('id', '')
+                                    if tool_call_id.startswith("wf-") and "-tool-" in tool_call_id:
+                                        context_parts = tool_call_id.split("-tool-")[0]  # Remove UUID
+                                        if context_parts.startswith("wf-"):
+                                            context_workflow_parts = context_parts[3:].split("-")
+                                            if len(context_workflow_parts) >= 2:
+                                                context_step = context_workflow_parts[-1]
+                                                context_workflow = "-".join(context_workflow_parts[:-1])
+                                                tool_call_contexts.append(f"{context_workflow}/{context_step}")
+                                            else:
+                                                tool_call_contexts.append("unknown/unknown")
+                                        else:
+                                            tool_call_contexts.append("unknown/unknown")
+                                    else:
+                                        tool_call_contexts.append("unknown/unknown")
+                                
+                                if tool_names:
+                                    # Show tool names and their contexts
+                                    contexts_str = ", ".join(set(tool_call_contexts))  # Remove duplicates
+                                    st.markdown(f"⚙️ **Workflow Tool Call(s):** `{', '.join(tool_names)}` | Context: `{contexts_str}`")
+                                else:
+                                    st.markdown("_(Tool call with no details)_")
+                            
+                            # Show actual content if present
+                            content = msg.get("content", "")
+                            if content:
+                                st.markdown(content)
                         
                         # Add to session state
-                        st.session_state.messages.append({
+                        session_message = {
                             "role": "assistant",
-                            "content": msg["content"],
-                            "token_count_in": msg.get("token_count_in", 0),
-                            "token_count_out": msg.get("token_count_out", 0),
-                            "action_id": msg.get("action_id")
-                        })
+                            "content": content,
+                            "token_count_in": msg_tokens_in,
+                            "token_count_out": msg_tokens_out,
+                            "action_id": action_id,
+                            "workflow_id": workflow_id,
+                            "step_id": step_id
+                        }
                         
-                        bound_logger.info(f"Displayed LLM response from workflow: {len(msg['content'])} characters")
+                        # Include tool_calls if present
+                        if tool_calls:
+                            session_message["tool_calls"] = tool_calls
+                            
+                        st.session_state.messages.append(session_message)
+                        
+                        bound_logger.info(f"Displayed LLM response from workflow: {len(content)} characters, {len(tool_calls)} tool calls, Workflow: {workflow_id}, Step: {step_id}")
                     elif msg.get("role") == "tool":
                         # Handle tool call results if needed
                         bound_logger.debug(f"Workflow included tool result: {msg.get('tool_call_id', 'unknown')}")
@@ -704,7 +896,7 @@ def run_workflow_execution(workflow_name: str, provider: str, model_name: str, b
                 
                 # Display token and duration summary like unguided mode
                 if total_tokens > 0:
-                    st.markdown(f"📊 **Workflow Summary:** {total_tokens:,} tokens ({tokens_in:,} in, {tokens_out:,} out) • {execution_duration:.1f}s")
+                    st.markdown(f"📊 **Workflow Summary:** {total_tokens:,} tokens ({total_tokens_in:,} in, {total_tokens_out:,} out) • {execution_duration:.1f}s")
             
             # Generate status report when max iterations reached (like unguided mode)
             if max_iterations_reached and st.session_state.get("enable_status_reports", True):
@@ -712,7 +904,28 @@ def run_workflow_execution(workflow_name: str, provider: str, model_name: str, b
                 
                 # Prepare context messages for status report (like unguided mode)
                 llm_context_messages = [{"role": "system", "content": effective_system_prompt}]
-                llm_context_messages.extend(st.session_state.messages)
+                
+                # Validate and clean session messages before adding to context
+                clean_messages = []
+                for msg in st.session_state.messages:
+                    if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                        # For assistant messages with tool_calls, only include if we have corresponding tool responses
+                        # For now, skip these to avoid validation errors in status reports
+                        clean_msg = {
+                            "role": "assistant",
+                            "content": msg.get("content", "")
+                        }
+                        if clean_msg["content"]:  # Only add if there's actual content
+                            clean_messages.append(clean_msg)
+                    elif msg.get("role") in ["user", "assistant"] and msg.get("content"):
+                        # Include user messages and assistant messages with content (no tool_calls)
+                        clean_messages.append({
+                            "role": msg["role"],
+                            "content": msg["content"]
+                        })
+                    # Skip tool messages for status report
+                
+                llm_context_messages.extend(clean_messages)
                 
                 # Call the same status report function used in unguided mode
                 send_status_report(provider, model_name, effective_system_prompt, 
@@ -723,7 +936,28 @@ def run_workflow_execution(workflow_name: str, provider: str, model_name: str, b
                 
                 # Prepare context messages for status report (like unguided mode)
                 llm_context_messages = [{"role": "system", "content": effective_system_prompt}]
-                llm_context_messages.extend(st.session_state.messages)
+                
+                # Validate and clean session messages before adding to context
+                clean_messages = []
+                for msg in st.session_state.messages:
+                    if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                        # For assistant messages with tool_calls, only include if we have corresponding tool responses
+                        # For now, skip these to avoid validation errors in status reports
+                        clean_msg = {
+                            "role": "assistant",
+                            "content": msg.get("content", "")
+                        }
+                        if clean_msg["content"]:  # Only add if there's actual content
+                            clean_messages.append(clean_msg)
+                    elif msg.get("role") in ["user", "assistant"] and msg.get("content"):
+                        # Include user messages and assistant messages with content (no tool_calls)
+                        clean_messages.append({
+                            "role": msg["role"],
+                            "content": msg["content"]
+                        })
+                    # Skip tool messages for status report
+                
+                llm_context_messages.extend(clean_messages)
                 
                 # Call the same status report function used in unguided mode
                 send_status_report(provider, model_name, effective_system_prompt, 
@@ -744,7 +978,7 @@ def run_workflow_execution(workflow_name: str, provider: str, model_name: str, b
             if result.get("message"):
                 completion_message += f"\n\n*{result['message']}*"
             if total_tokens > 0:
-                completion_message += f"\n\n📊 **Workflow Summary:** {total_tokens:,} tokens ({tokens_in:,} in, {tokens_out:,} out) • {execution_duration:.1f}s"
+                completion_message += f"\n\n📊 **Workflow Summary:** {total_tokens:,} tokens ({total_tokens_in:,} in, {total_tokens_out:,} out) • {execution_duration:.1f}s"
             
             st.session_state.messages.append({
                 "role": "assistant",
@@ -755,7 +989,7 @@ def run_workflow_execution(workflow_name: str, provider: str, model_name: str, b
             st.session_state.last_request_duration = execution_duration
             st.session_state.conversation_total_duration = st.session_state.get("conversation_total_duration", 0) + execution_duration
             
-            bound_logger.info(f"Workflow completed: {total_tokens} tokens ({tokens_in} in, {tokens_out} out) in {execution_duration:.1f}s")
+            bound_logger.info(f"Workflow completed: {total_tokens} tokens ({total_tokens_in} in, {total_tokens_out} out) in {execution_duration:.1f}s")
         else:
             # Handle error case - could be status="error" or no result
             if result:
@@ -1009,6 +1243,7 @@ def smart_prune_messages(messages: List[Dict], max_tokens: int, provider: str, m
                                 elif tool_message.get("role") != "tool":
                                     break  # End of tool responses
                                 k += 1
+                            # Don't break here - continue looking for more assistant messages in this turn
                         # Don't break here - continue looking for more assistant messages in this turn
                     elif next_role == "tool":
                         # Orphaned tool message (shouldn't happen, but handle gracefully)
@@ -1232,7 +1467,83 @@ def run_execution_loop(provider: str, model_name: str, base_sys_prompt: str, use
                 
             # 2. Initialize LLM context messages (AFTER tool prep, BEFORE pruning)
             llm_context_messages = [{"role": "system", "content": effective_system_prompt}]
-            llm_context_messages.extend(st.session_state.messages)
+            
+            # CRITICAL FIX: Validate and clean session messages before adding to context
+            # This prevents sending incomplete tool call sequences to the LLM
+            session_messages = st.session_state.messages.copy()
+            
+            # Validate message structure first
+            if not validate_message_structure(session_messages, current_loop_logger):
+                current_loop_logger.warning("Session messages contain invalid tool call sequences. Cleaning...")
+                
+                # Clean the messages by removing incomplete tool call sequences
+                cleaned_messages = []
+                pending_tool_calls = set()
+                
+                for msg in session_messages:
+                    role = msg.get("role")
+                    
+                    if role == "assistant":
+                        # Check if we have pending tool calls from previous assistant message
+                        if pending_tool_calls:
+                            current_loop_logger.debug(f"Skipping assistant message with unresolved tool calls: {pending_tool_calls}")
+                            continue
+                            
+                        # Check for new tool calls
+                        tool_calls = msg.get("tool_calls", [])
+                        if tool_calls:
+                            # Only include if we can expect tool results to follow
+                            # For now, skip assistant messages with tool calls that don't have results
+                            tool_call_ids = {tc.get("id") for tc in tool_calls if tc.get("id")}
+                            
+                            # Look ahead to see if there are corresponding tool results
+                            has_all_results = True
+                            remaining_messages = session_messages[session_messages.index(msg) + 1:]
+                            found_tool_ids = set()
+                            
+                            for future_msg in remaining_messages:
+                                if future_msg.get("role") == "tool":
+                                    tool_call_id = future_msg.get("tool_call_id")
+                                    if tool_call_id in tool_call_ids:
+                                        found_tool_ids.add(tool_call_id)
+                                elif future_msg.get("role") == "assistant":
+                                    # Stop looking when we hit another assistant message
+                                    break
+                            
+                            if found_tool_ids != tool_call_ids:
+                                current_loop_logger.debug(f"Skipping assistant message with incomplete tool results. Expected: {tool_call_ids}, Found: {found_tool_ids}")
+                                continue
+                            else:
+                                pending_tool_calls = tool_call_ids.copy()
+                        
+                        cleaned_messages.append(msg)
+                        
+                    elif role == "tool":
+                        tool_call_id = msg.get("tool_call_id")
+                        if tool_call_id in pending_tool_calls:
+                            cleaned_messages.append(msg)
+                            pending_tool_calls.remove(tool_call_id)
+                        else:
+                            current_loop_logger.debug(f"Skipping orphaned tool message with id: {tool_call_id}")
+                            
+                    elif role == "user":
+                        # User messages are always safe to include
+                        # But if there are pending tool calls, we need to clear them
+                        if pending_tool_calls:
+                            current_loop_logger.debug(f"Clearing pending tool calls due to user message: {pending_tool_calls}")
+                            pending_tool_calls.clear()
+                        cleaned_messages.append(msg)
+                        
+                    else:
+                        # Other message types (shouldn't happen in our case)
+                        cleaned_messages.append(msg)
+                
+                current_loop_logger.info(f"Message cleaning complete: {len(session_messages)} → {len(cleaned_messages)} messages")
+                llm_context_messages.extend(cleaned_messages)
+            else:
+                # Messages are valid, use them as-is
+                llm_context_messages.extend(session_messages)
+                
             current_loop_logger.debug(f"Initial llm_context_messages length (incl system prompt): {len(llm_context_messages)}")
 
             # --- Apply Auto-Pruning (if enabled) --- 
@@ -1570,7 +1881,6 @@ if is_executing or pending_execution:
             
             if selected_workflow:
                 # Run guided workflow
-                bound_logger.info(f"Starting guided workflow execution: {selected_workflow}")
                 run_workflow_execution(
                     workflow_name=selected_workflow,
                     provider=provider, 

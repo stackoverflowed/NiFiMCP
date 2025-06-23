@@ -90,6 +90,14 @@ def context_patcher(record):
     act_id_from_ctx = ctx.get("action_id", "-")
     if act_id_from_ctx != "-":
         record["extra"]["action_id"] = act_id_from_ctx
+        
+    workflow_id_from_ctx = ctx.get("workflow_id", "-")
+    if workflow_id_from_ctx != "-":
+        record["extra"]["workflow_id"] = workflow_id_from_ctx
+        
+    step_id_from_ctx = ctx.get("step_id", "-") 
+    if step_id_from_ctx != "-":
+        record["extra"]["step_id"] = step_id_from_ctx
     # Return not strictly needed if called internally by another patcher
 # ------------------------------------ #
 
@@ -148,7 +156,7 @@ def setup_logging(context: str | None = None):
     # Configure logger to add default context IDs and patchers
     logger.configure(
         # Keep default extra values for logs outside request context
-        extra={"user_request_id": "-", "action_id": "-"},
+        extra={"user_request_id": "-", "action_id": "-", "workflow_id": "-", "step_id": "-"},
         # Chain the patchers: context_patcher runs, then interface_logger_middleware
         # Ensure context_patcher runs first by applying it to the record before passing to the next
         # patcher=lambda record: interface_logger_middleware(context_patcher(record))
@@ -178,8 +186,8 @@ def setup_logging(context: str | None = None):
     client_filter = is_client_module
     server_filter = is_server_module
 
-    # Shared log format - timestamp | level | message | module:function:line | request_id | action_id
-    file_format = "{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {message} | {name}:{function}:{line} | Req:{extra[user_request_id]} | Act:{extra[action_id]}"
+    # Shared log format - timestamp | level | message | module:function:line | request_id | action_id | workflow_id | step_id
+    file_format = "{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {message} | {name}:{function}:{line} | Req:{extra[user_request_id]} | Act:{extra[action_id]} | Wf:{extra[workflow_id]} | Step:{extra[step_id]}"
 
     # Client file sink (Only if context is 'client')
     if context == 'client':

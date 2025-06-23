@@ -11,6 +11,7 @@ from loguru import logger
 from pocketflow import Flow
 from config.logging_setup import request_context
 from config.settings import get_workflow_action_limit, get_workflow_retry_attempts
+from nifi_mcp_server.request_context import current_workflow_id, current_step_id
 
 from .context_manager import ContextManager
 from .progress_tracker import ProgressTracker
@@ -100,18 +101,25 @@ class GuidedWorkflowExecutor:
         """
         self.bound_logger.info(f"Starting workflow execution: {self.workflow_name}")
         
-        # Log workflow start
+        # Log workflow start with interface logger middleware structure
         self.workflow_logger.bind(
             direction="start",
             data={
                 "workflow_name": self.workflow_name,
                 "nodes_count": len(self.nodes),
                 "node_names": [node.name for node in self.nodes],
-                "initial_context_keys": list(initial_context.keys()) if initial_context else []
+                "initial_context_keys": list(initial_context.keys()) if initial_context else [],
+                "initial_context_values": {k: str(v)[:200] for k, v in (initial_context or {}).items()}  # Truncate for logging
             }
-        ).info("Workflow execution started")
+        ).info("workflow-start")
         
         try:
+            # Set workflow context for logging
+            workflow_id_token = current_workflow_id.set(self.workflow_name)
+            current_context = request_context.get()
+            current_context["workflow_id"] = self.workflow_name
+            request_context.set(current_context)
+            
             # Initialize progress tracking
             self.progress_tracker.start_workflow()
             
@@ -141,15 +149,26 @@ class GuidedWorkflowExecutor:
                     self.bound_logger.warning(f"Progress callback failed: {e}")
             
             # Run the flow - this is synchronous in PocketFlow 0.0.2
-            final_shared_state = self.flow.run(shared_state)
+            # PocketFlow modifies shared_state in-place. The return value is the last action.
+            self.flow.run(shared_state)
+            final_shared_state = shared_state
             
-            # Handle case where PocketFlow returns a string instead of dict
-            # This happens when the post() method returns a navigation string
-            if isinstance(final_shared_state, str):
-                # The string is the navigation result, actual state is in shared_state
-                navigation_result = final_shared_state
-                final_shared_state = shared_state
-                self.bound_logger.debug(f"PocketFlow returned navigation string: {navigation_result}")
+            # Log final shared state after flow execution with interface logger middleware structure
+            self.workflow_logger.bind(
+                direction="execution",
+                data={
+                    "shared_state_keys": list(final_shared_state.keys()),
+                    "final_messages_count": len(final_shared_state.get("final_messages", [])),
+                    "unguided_mimic_result": {
+                        "status": final_shared_state.get("unguided_mimic_result", {}).get("status", "unknown"),
+                        "loop_count": final_shared_state.get("unguided_mimic_result", {}).get("loop_count", 0),
+                        "total_tokens_in": final_shared_state.get("unguided_mimic_result", {}).get("total_tokens_in", 0),
+                        "total_tokens_out": final_shared_state.get("unguided_mimic_result", {}).get("total_tokens_out", 0),
+                        "tool_calls_executed": final_shared_state.get("unguided_mimic_result", {}).get("tool_calls_executed", 0),
+                        "max_iterations_reached": final_shared_state.get("unguided_mimic_result", {}).get("max_iterations_reached", False)
+                    }
+                }
+            ).info("workflow-execution")
             
             # Mark workflow as completed
             self.progress_tracker.complete_workflow(success=True)
@@ -172,17 +191,19 @@ class GuidedWorkflowExecutor:
                 "context_milestones": self.context_manager.key_milestones
             }
             
-            # Log workflow completion
+            # Log workflow completion with interface logger middleware structure
             self.workflow_logger.bind(
                 direction="completion",
                 data={
                     "status": "success",
+                    "workflow_name": self.workflow_name,
                     "shared_state_keys": list(final_shared_state.keys()),
-                    "progress_summary": self.progress_tracker.get_progress_summary(),
                     "step_count": len(self.progress_tracker.get_step_details()),
-                    "milestones_count": len(self.context_manager.key_milestones)
+                    "milestones_count": len(self.context_manager.key_milestones),
+                    "progress_summary": self.progress_tracker.get_progress_summary(),
+                    "step_details": self.progress_tracker.get_step_details()
                 }
-            ).info("Workflow execution completed successfully")
+            ).info("workflow-completion")
             
             self.bound_logger.info(f"Workflow execution completed successfully: {self.workflow_name}")
             return results

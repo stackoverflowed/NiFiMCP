@@ -61,16 +61,62 @@ class NiFiWorkflowNode(WorkflowNode):
         try:
             self.bound_logger.debug(f"Calling MCP tool: {tool_name} with args: {list(kwargs.keys())}")
             
+            # Log workflow tool call with interface logger middleware structure
+            self.workflow_logger.bind(
+                direction="tool_call",
+                data={
+                    "node_name": self.name,
+                    "tool_name": tool_name,
+                    "tool_args": list(kwargs.keys()),
+                    "tool_args_values": {k: str(v)[:100] for k, v in kwargs.items()},  # Truncate values
+                    "action_count": self._action_count + 1,  # Show what it will be after increment
+                    "workflow_name": getattr(self, 'workflow_name', 'unknown')
+                }
+            ).info("workflow-tool_call")
+            
             # Increment action count
             self._increment_action_count()
             
             # Call the tool via MCP
             result = await mcp.call_tool(tool_name, kwargs)
             
+            # Log workflow tool result with interface logger middleware structure
+            result_summary = {}
+            if isinstance(result, dict):
+                result_summary = {
+                    "status": result.get("status", "unknown"),
+                    "has_content": "content" in result,
+                    "content_length": len(str(result.get("content", ""))),
+                    "keys": list(result.keys())
+                }
+            
+            self.workflow_logger.bind(
+                direction="tool_result",
+                data={
+                    "node_name": self.name,
+                    "tool_name": tool_name,
+                    "result_type": type(result).__name__,
+                    "result_summary": result_summary,
+                    "workflow_name": getattr(self, 'workflow_name', 'unknown')
+                }
+            ).info("workflow-tool_result")
+            
             self.bound_logger.debug(f"MCP tool {tool_name} completed successfully")
             return result
             
         except Exception as e:
+            # Log workflow tool error with interface logger middleware structure
+            self.workflow_logger.bind(
+                direction="tool_error",
+                data={
+                    "node_name": self.name,
+                    "tool_name": tool_name,
+                    "error_type": type(e).__name__,
+                    "error_message": str(e),
+                    "workflow_name": getattr(self, 'workflow_name', 'unknown')
+                }
+            ).info("workflow-tool_error")
+            
             self.bound_logger.error(f"Error calling MCP tool {tool_name}: {e}", exc_info=True)
             raise WorkflowNodeError(f"Failed to call MCP tool {tool_name}: {e}")
             
@@ -124,14 +170,18 @@ class NiFiWorkflowNode(WorkflowNode):
         self.bound_logger.debug(f"NiFi workflow node context prepared. Tools available: {len(context.get('available_tools', []))}")
         return context
         
-    def post(self, shared: Dict[str, Any], prep_res: Dict[str, Any], exec_res: Any) -> Dict[str, Any]:
+    def post(self, shared: Dict[str, Any], prep_res: Dict[str, Any], exec_res: Any) -> str:
         """Handle results from NiFi workflow node execution."""
-        updated_shared = super().post(shared, prep_res, exec_res)
+        navigation_key = super().post(shared, prep_res, exec_res)
         
-        # Add NiFi-specific result information
-        updated_shared.update({
+        # Add NiFi-specific result information to shared state
+        shared.update({
             f"{self.name}_nifi_node_type": self.__class__.__name__,
             f"{self.name}_allowed_phases": self.allowed_phases
         })
         
-        return updated_shared 
+        return navigation_key
+        
+    def _is_phase_allowed(self, phase: str) -> bool:
+        """Check if a phase is allowed for this node."""
+        return phase in self.allowed_phases 
