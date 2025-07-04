@@ -44,6 +44,7 @@ DEFAULT_APP_CONFIG = {
         'retry_attempts': 3,
         'enabled_workflows': [
             'unguided_mimic',
+            'async_unguided_mimic',
             'documentation',
             'review_analysis',
             'build_new',

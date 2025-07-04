@@ -245,7 +245,7 @@ class TestInitializeExecutionNode:
         assert navigation == "error"
 
 
-class TestUnguidesMimicWorkflowFactory:
+class TestUnguidedMimicWorkflowFactory:
     """Test cases for the workflow factory function."""
     
     def test_create_unguided_mimic_workflow(self):
@@ -257,7 +257,7 @@ class TestUnguidesMimicWorkflowFactory:
         assert nodes[0].name == "initialize_execution"
 
 
-class TestUnguidesMimicWorkflowIntegration:
+class TestUnguidedMimicWorkflowIntegration:
     """Integration tests for the complete unguided mimic workflow."""
     
     def setup_method(self):
@@ -329,7 +329,7 @@ class TestUnguidesMimicWorkflowIntegration:
             assert "error" in result["message"].lower()
 
 
-class TestUnguidesMimicWorkflowRegistration:
+class TestUnguidedMimicWorkflowRegistration:
     """Test cases for workflow registration."""
     
     def test_workflow_definition_exists(self):
@@ -364,7 +364,7 @@ class TestUnguidesMimicWorkflowRegistration:
         assert len(executor.nodes) == 1
 
 
-class TestUnguidesMimicLoggingIntegration:
+class TestUnguidedMimicLoggingIntegration:
     """Test cases for logging integration."""
     
     def setup_method(self):

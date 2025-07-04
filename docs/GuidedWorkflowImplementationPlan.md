@@ -453,7 +453,7 @@ docs/
 **Why This Approach**: Build common capabilities that all specialized workflows will need, making future workflows trivial to implement by focusing only on their unique aspects.
 
 **Core Components**:
-1. **UnguidesMimicWorkflow** - Single workflow that replicates current unguided behavior
+1. **UnguidedMimicWorkflow** - Single workflow that replicates current unguided behavior
    - `InitializeNode` - Set up objective, available tools, context, tracking IDs
    - `LLMIterationNode` - Execute current prompts, handle tool calls, maintain state
    - `EvaluateCompletionNode` - Assess completion, determine next action, handle status
@@ -472,7 +472,7 @@ docs/
 **Detailed Tasks**:
 
 **Step 1: Core Workflow Foundation**
-1. **Implement UnguidesMimicWorkflow nodes**:
+1. **Implement UnguidedMimicWorkflow nodes**:
    ```python
    class InitializeNode(Node):
        """Set up workflow context and tracking."""
@@ -530,7 +530,7 @@ docs/
 
 **Step 2: Integration Testing**
 1. **End-to-end Integration**:
-   - UnguidesMimicWorkflow produces identical results to current unguided mode
+   - UnguidedMimicWorkflow produces identical results to current unguided mode
    - All existing functionality preserved (no regressions)
    - Real-time feedback working in Streamlit
 
@@ -552,7 +552,7 @@ docs/
    - Ready for Phase 2 common patterns
 
 **Success Criteria**:
-- ✅ UnguidesMimicWorkflow produces identical results to current unguided mode
+- ✅ UnguidedMimicWorkflow produces identical results to current unguided mode
 - ✅ Real-time tool call feedback working in Streamlit UI
 - ✅ Complete logging traceability (requestId → workflowId → nodeId → actionId)
 - ✅ All existing functionality preserved with zero regressions
@@ -608,7 +608,7 @@ docs/
 2. **Implement workflow routing infrastructure**:
    - Dynamic workflow loading based on decision
    - Workflow registration system
-   - Fallback to UnguidesMimic if decision unclear
+   - Fallback to UnguidedMimic if decision unclear
 
 **Step 2: Quality Control System**
 1. **Implement Supervisor Pattern nodes**:

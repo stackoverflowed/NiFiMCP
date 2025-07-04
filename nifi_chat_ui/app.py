@@ -325,7 +325,12 @@ with st.sidebar:
                 if st.session_state.selected_workflow:
                     selected_wf = next((wf for wf in available_workflows if wf.name == st.session_state.selected_workflow), None)
                     if selected_wf:
-                        st.info(f"**{selected_wf.display_name}**: {selected_wf.description}")
+                        # Add special indicator for async workflows
+                        async_indicator = ""
+                        if selected_wf.name == "async_unguided_mimic":
+                            async_indicator = " ⚡ **Real-time updates enabled**"
+                        
+                        st.info(f"**{selected_wf.display_name}**: {selected_wf.description}{async_indicator}")
             else:
                 st.warning("No guided workflows available.")
                 st.session_state.selected_workflow = None
@@ -608,6 +613,249 @@ Keep this concise but informative.
         bound_logger.info("Status report failed, but continuing normally")
 
 # --- Workflow Execution Function ---
+def run_async_workflow_integrated(workflow_name: str, provider: str, model_name: str, base_sys_prompt: str, user_req_id: str):
+    """Run an async workflow with integrated real-time UI updates in the main chat interface."""
+    import asyncio
+    import threading
+    import time
+    from nifi_mcp_server.workflows.core.event_system import get_event_emitter, EventTypes
+    from nifi_mcp_server.workflows.registry import get_workflow_registry
+    
+    bound_logger = logger.bind(user_request_id=user_req_id)
+    execution_start_time = time.time()
+    
+    try:
+        # Display workflow start message
+        with st.chat_message("assistant"):
+            st.markdown(f"🚀 **Starting async workflow:** {workflow_name}")
+            st.markdown("*Real-time updates will appear below...*")
+        
+        st.session_state.messages.append({
+            "role": "assistant",
+            "content": f"🚀 **Starting async workflow:** {workflow_name}\n\n*Real-time updates will appear below...*"
+        })
+        
+        # Create real-time UI containers
+        progress_container = st.empty()
+        status_container = st.empty()
+        
+        # Prepare execution context (same as sync version)
+        current_objective = st.session_state.get("current_objective", "")
+        if current_objective and current_objective.strip():
+            effective_system_prompt = f"{base_sys_prompt}\n\n## Current Objective\n{current_objective.strip()}"
+        else:
+            effective_system_prompt = base_sys_prompt
+        
+        # Filter messages (same as sync version)
+        filtered_messages = []
+        for msg in st.session_state.messages:
+            if (msg.get("role") == "assistant" and 
+                msg.get("content", "").startswith("🚀 **Starting async workflow:")):
+                continue
+            filtered_messages.append(msg)
+        
+        context = {
+            "provider": provider,
+            "model_name": model_name,
+            "system_prompt": effective_system_prompt,
+            "user_request_id": user_req_id,
+            "messages": filtered_messages,
+            "selected_nifi_server_id": st.session_state.get("selected_nifi_server_id"),
+            "selected_phase": st.session_state.get("selected_phase", "All"),
+            "max_loop_iterations": st.session_state.get("max_loop_iterations", 10),
+            "max_tokens_limit": st.session_state.get("max_tokens_limit", 8000),
+            "auto_prune_history": st.session_state.get("auto_prune_history", False),
+            "current_objective": current_objective
+        }
+        
+        # Create async executor
+        registry = get_workflow_registry()
+        async_executor = registry.create_async_executor(workflow_name)
+        
+        if not async_executor:
+            st.error(f"Failed to create async executor for workflow: {workflow_name}")
+            return
+        
+        # Set up event handling for real-time UI updates
+        events_received = []
+        event_emitter = get_event_emitter()
+        
+        def handle_workflow_event(event):
+            """Handle workflow events - just collect them for main thread processing."""
+            events_received.append(event)
+        
+        # Register event handler
+        event_emitter.on(handle_workflow_event)
+        
+        # Execute workflow asynchronously in background thread
+        result_container = {"result": None, "error": None, "completed": False}
+        
+        def run_async_workflow():
+            """Run the async workflow in a separate thread."""
+            try:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                result = loop.run_until_complete(async_executor.execute_async(context))
+                result_container["result"] = result
+                result_container["completed"] = True
+            except Exception as e:
+                result_container["error"] = str(e)
+                result_container["completed"] = True
+            finally:
+                loop.close()
+        
+        # Start async execution in background thread
+        workflow_thread = threading.Thread(target=run_async_workflow)
+        workflow_thread.start()
+        
+        # Poll for completion with progress updates
+        progress_bar = progress_container.progress(0)
+        
+        start_time = time.time()
+        max_wait_time = 300  # 5 minutes max
+        
+        while not result_container["completed"] and (time.time() - start_time) < max_wait_time:
+            elapsed = time.time() - start_time
+            progress = min(elapsed / max_wait_time, 0.95)  # Never show 100% until complete
+            
+            # Update progress bar with event count
+            progress_bar.progress(progress, text=f"Executing workflow... ({len(events_received)} events)")
+            
+            # Show latest status based on most recent events
+            if events_received:
+                latest_event = events_received[-1]
+                
+                with status_container:
+                    if latest_event.event_type == EventTypes.LLM_START:
+                        provider_name = latest_event.data.get('provider', 'Unknown')
+                        model_name = latest_event.data.get('model', 'Unknown')
+                        st.info(f"🤖 **LLM Call Started** - {provider_name} {model_name}")
+                        
+                    elif latest_event.event_type == EventTypes.LLM_COMPLETE:
+                        tokens_in = latest_event.data.get("tokens_in", 0)
+                        tokens_out = latest_event.data.get("tokens_out", 0)
+                        st.success(f"✅ **LLM Call Complete** - Tokens: {tokens_in:,}/{tokens_out:,}")
+                        
+                    elif latest_event.event_type == EventTypes.TOOL_START:
+                        tool_name = latest_event.data.get("tool_name", "Unknown")
+                        tool_index = latest_event.data.get("tool_index", 1)
+                        total_tools = latest_event.data.get("total_tools", 1)
+                        st.info(f"⚙️ **Tool Call Started:** `{tool_name}` ({tool_index}/{total_tools})")
+                        
+                    elif latest_event.event_type == EventTypes.TOOL_COMPLETE:
+                        tool_name = latest_event.data.get("tool_name", "Unknown")
+                        st.success(f"✅ **Tool Call Complete:** `{tool_name}`")
+                        
+                    elif latest_event.event_type == EventTypes.WORKFLOW_COMPLETE:
+                        loop_count = latest_event.data.get("loop_count", 0)
+                        tool_calls_executed = latest_event.data.get("tool_calls_executed", 0)
+                        st.success(f"🎉 **Workflow Complete!** Iterations: {loop_count}, Tool calls: {tool_calls_executed}")
+            
+            time.sleep(0.5)  # Update every 500ms
+        
+        # Wait for thread to complete
+        workflow_thread.join(timeout=10)
+        
+        # Clean up progress indicators
+        progress_bar.progress(1.0, text="Workflow execution complete")
+        time.sleep(1)  # Brief pause to show completion
+        progress_container.empty()
+        status_container.empty()
+        
+        # Remove event handler
+        event_emitter.remove_callback(handle_workflow_event)
+        
+        # Process results (same logic as sync workflow)
+        if result_container["error"]:
+            st.error(f"Async workflow execution failed: {result_container['error']}")
+            return
+        
+        result = result_container["result"]
+        if result and result.get("status") == "success":
+            bound_logger.info("Async workflow execution completed successfully")
+            
+            # Extract workflow results (same as sync version)
+            shared_state = result.get("shared_state", {})
+            workflow_messages = shared_state.get("final_messages", [])
+            
+            if workflow_messages:
+                # Calculate new messages (same logic as sync version)
+                original_message_count = len(filtered_messages)
+                new_messages = workflow_messages[original_message_count:] if len(workflow_messages) > original_message_count else []
+                
+                bound_logger.info(f"Async workflow completed with {len(new_messages)} new messages")
+                
+                # Process and display new messages (same as sync version)
+                for msg in new_messages:
+                    if msg.get("role") == "assistant" and (msg.get("content") or msg.get("tool_calls")):
+                        # Extract workflow context from action_id for display
+                        action_id = msg.get("action_id", "")
+                        workflow_context = ""
+                        
+                        if action_id.startswith("wf-") and "-" in action_id:
+                            parts = action_id.split("-")
+                            if len(parts) >= 3:
+                                workflow_id = parts[1]
+                                step_id = parts[2]
+                                workflow_context = f" | **Workflow:** {workflow_id} | **Step:** {step_id}"
+                        
+                        # Display assistant message with workflow context
+                        with st.chat_message("assistant"):
+                            if msg.get("content"):
+                                st.markdown(msg["content"])
+                            
+                            if msg.get("tool_calls"):
+                                tool_names = [tc.get('function', {}).get('name', 'unknown') for tc in msg.get("tool_calls", [])]
+                                if tool_names:
+                                    st.markdown(f"⚙️ **Workflow Tool Call(s):** `{', '.join(tool_names)}`{workflow_context}")
+                            
+                            # Show token info if available
+                            tokens_in = msg.get("token_count_in", 0)
+                            tokens_out = msg.get("token_count_out", 0)
+                            if tokens_in > 0 or tokens_out > 0:
+                                st.caption(f"Tokens: {tokens_in:,} in, {tokens_out:,} out | Action ID: `{action_id}`")
+                
+                # Add new messages to session state
+                for msg in new_messages:
+                    st.session_state.messages.append(msg)
+                
+                # Calculate final statistics
+                execution_duration = time.time() - execution_start_time
+                total_tokens_in = sum(msg.get("token_count_in", 0) for msg in new_messages if msg.get("role") == "assistant")
+                total_tokens_out = sum(msg.get("token_count_out", 0) for msg in new_messages if msg.get("role") == "assistant")
+                
+                # Update session totals
+                st.session_state.conversation_total_tokens_in += total_tokens_in
+                st.session_state.conversation_total_tokens_out += total_tokens_out
+                st.session_state.conversation_total_duration += execution_duration
+                
+                # Display execution summary with real-time event info
+                with st.chat_message("assistant"):
+                    st.markdown(f"📊 **Async Workflow Summary:**")
+                    st.markdown(f"- **Events Received:** {len(events_received)}")
+                    st.markdown(f"- **New Messages:** {len(new_messages)}")
+                    st.markdown(f"- **Total Tokens:** {total_tokens_in + total_tokens_out:,} ({total_tokens_in:,} in, {total_tokens_out:,} out)")
+                    st.markdown(f"- **Execution Time:** {execution_duration:.1f}s")
+                    
+                    if events_received:
+                        with st.expander("📋 Event Timeline", expanded=False):
+                            for event in events_received[-10:]:  # Show last 10 events
+                                timestamp = time.strftime("%H:%M:%S", time.localtime(event.timestamp))
+                                event_desc = event.data.get('tool_name', event.data.get('action_id', 'N/A'))
+                                st.text(f"[{timestamp}] {event.event_type}: {event_desc}")
+                
+                st.session_state.messages.append({
+                    "role": "assistant",
+                    "content": f"📊 **Async Workflow Summary:**\n- **Events Received:** {len(events_received)}\n- **New Messages:** {len(new_messages)}\n- **Total Tokens:** {total_tokens_in + total_tokens_out:,} ({total_tokens_in:,} in, {total_tokens_out:,} out)\n- **Execution Time:** {execution_duration:.1f}s"
+                })
+        else:
+            st.error("Async workflow execution failed or returned unexpected result")
+            
+    except Exception as e:
+        bound_logger.error(f"Async workflow execution error: {e}", exc_info=True)
+        st.error(f"Failed to execute async workflow: {str(e)}")
+
+
 def run_workflow_execution(workflow_name: str, provider: str, model_name: str, base_sys_prompt: str, user_req_id: str):
     """Runs a guided workflow execution."""
     bound_logger = logger.bind(user_request_id=user_req_id)
@@ -1880,14 +2128,25 @@ if is_executing or pending_execution:
             bound_logger.info(f"Guided mode execution: selected_workflow='{selected_workflow}', execution_mode='{execution_mode}'")
             
             if selected_workflow:
-                # Run guided workflow
-                run_workflow_execution(
-                    workflow_name=selected_workflow,
-                    provider=provider, 
-                    model_name=model_name, 
-                    base_sys_prompt=base_system_prompt, 
-                    user_req_id=user_req_id
-                )
+                # Check if this is an async workflow
+                if selected_workflow == "async_unguided_mimic":
+                    # Run async workflow with integrated real-time UI
+                    try:
+                        run_async_workflow_integrated(selected_workflow, provider, model_name, base_system_prompt, user_req_id)
+                    except Exception as e:
+                        bound_logger.error(f"Failed to run async workflow: {e}", exc_info=True)
+                        st.error(f"Failed to run async workflow: {str(e)}")
+                        # Fall back to regular workflow execution
+                        run_workflow_execution(selected_workflow, provider, model_name, base_system_prompt, user_req_id)
+                else:
+                    # Run regular guided workflow
+                    run_workflow_execution(
+                        workflow_name=selected_workflow,
+                        provider=provider, 
+                        model_name=model_name, 
+                        base_sys_prompt=base_system_prompt, 
+                        user_req_id=user_req_id
+                    )
             else:
                 # No workflow selected, show error and fall back to unguided
                 bound_logger.warning(f"Guided mode selected but no workflow chosen (selected_workflow='{selected_workflow}'), falling back to unguided")

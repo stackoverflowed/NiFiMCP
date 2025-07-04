@@ -342,11 +342,129 @@ def get_formatted_tool_definitions(
                 continue
                 
             # Clean up parameters schema for Gemini
+            bound_logger.debug(f"Starting schema cleaning for tool '{name}'")
             cleaned_schema = parameters_schema.copy() if parameters_schema else {}
             if isinstance(cleaned_schema, dict):
                 # Always set top-level type to OBJECT if it has properties
                 if "properties" in cleaned_schema:
                     cleaned_schema["type"] = "OBJECT"
+                
+                # Helper function for intelligent type inference
+                def _infer_property_type(prop_name, prop_schema):
+                    """
+                    Intelligently infer the property type based on name, description, and other hints.
+                    
+                    Args:
+                        prop_name: The name of the property
+                        prop_schema: The property schema dictionary
+                        
+                    Returns:
+                        The inferred type as a string (uppercase for Gemini)
+                    """
+                    prop_name_lower = prop_name.lower()
+                    description = prop_schema.get("description", "").lower()
+                    
+                    # Numeric types based on field names
+                    if any(keyword in prop_name_lower for keyword in [
+                        "timeout", "limit", "count", "size", "max", "min", "port", "seconds",
+                        "minutes", "hours", "days", "bytes", "kb", "mb", "gb", "id", "num",
+                        "number", "index", "position", "width", "height", "x", "y", "z"
+                    ]):
+                        # Check if description suggests integer or float
+                        if any(keyword in description for keyword in ["integer", "whole", "count"]):
+                            return "INTEGER"
+                        else:
+                            return "NUMBER"
+                    
+                    # Boolean types
+                    if any(keyword in prop_name_lower for keyword in [
+                        "is_", "has_", "can_", "should_", "enabled", "disabled", "active", 
+                        "inactive", "include", "exclude", "allow", "deny", "required", "optional"
+                    ]):
+                        return "BOOLEAN"
+                    
+                    # Object types based on description
+                    if any(keyword in description for keyword in [
+                        "dictionary", "object", "map", "properties", "configuration", "config",
+                        "settings", "options", "parameters", "attrs", "attributes"
+                    ]):
+                        return "OBJECT"
+                    
+                    # Array types based on description
+                    if any(keyword in description for keyword in [
+                        "list", "array", "collection", "items", "elements", "values", "names",
+                        "ids", "uuids", "entries"
+                    ]):
+                        return "ARRAY"
+                    
+                    # Default to STRING for everything else
+                    return "STRING"
+                
+                # Add debug logging wrapper
+                def _infer_property_type_with_logging(prop_name, prop_schema):
+                    inferred_type = _infer_property_type(prop_name, prop_schema)
+                    bound_logger.debug(f"Inferred type for '{prop_name}': {inferred_type} (based on description: '{prop_schema.get('description', '')[:50]}...')")
+                    return inferred_type
+                
+                # Force type correction for known problematic fields
+                def _force_type_correction(prop_name, existing_type, prop_schema):
+                    """
+                    Force correct types for known problematic fields, overriding incorrect types from MCP server.
+                    
+                    Args:
+                        prop_name: The property name
+                        existing_type: The current type (lowercase)
+                        prop_schema: The property schema
+                        
+                    Returns:
+                        The corrected type (uppercase for Gemini)
+                    """
+                    prop_name_lower = prop_name.lower()
+                    description = prop_schema.get("description", "").lower()
+                    
+                    # CRITICAL: Don't change types for fields that have enums - they must be STRING
+                    if "enum" in prop_schema:
+                        bound_logger.debug(f"Preserving STRING type for '{prop_name}' (has enum values)")
+                        return "STRING"
+                    
+                    # Don't change types for common enum fields even if enum isn't explicit
+                    enum_fields = ["object_type", "search_scope", "target_type", "filter_object_type", "service_type", "processor_type"]
+                    if prop_name_lower in enum_fields:
+                        bound_logger.debug(f"Preserving STRING type for '{prop_name}' (likely enum field)")
+                        return "STRING"
+                    
+                    # Force numeric types for known timeout/numeric fields that are incorrectly typed as string
+                    if existing_type == "string" and any(keyword in prop_name_lower for keyword in [
+                        "timeout", "limit", "count", "size", "max", "min", "seconds",
+                        "minutes", "hours", "days", "bytes", "port", "position", "width", "height", "x", "y", "z"
+                    ]):
+                        # Check description for more specific type hints
+                        if any(keyword in description for keyword in ["integer", "whole", "count"]):
+                            return "INTEGER"
+                        else:
+                            return "NUMBER"
+                    
+                    # Force boolean types for known boolean fields incorrectly typed as string
+                    if existing_type == "string" and any(keyword in prop_name_lower for keyword in [
+                        "include", "exclude", "enabled", "disabled", "active", "required", "optional"
+                    ]):
+                        return "BOOLEAN"
+                    
+                    # Force object types for properties/config fields incorrectly typed as string
+                    if existing_type == "string" and (
+                        prop_name_lower in ["properties", "config", "configuration", "settings", "options", "parameters", "headers"] or
+                        any(keyword in description for keyword in ["dictionary", "object", "map", "properties"])
+                    ):
+                        return "OBJECT"
+                    
+                    # Force array types for known list fields incorrectly typed as string
+                    if existing_type == "string" and any(keyword in description for keyword in [
+                        "list", "array", "collection", "items", "elements"
+                    ]):
+                        return "ARRAY"
+                    
+                    # Return the existing type (uppercase) if no correction needed
+                    return existing_type.upper()
                 
                 # Recursively clean properties and array items
                 def clean_gemini_schema(schema_node):
@@ -365,17 +483,34 @@ def get_formatted_tool_definitions(
                             if isinstance(prop_value, dict):
                                 # Clean nested schema
                                 props[prop_name] = clean_gemini_schema(prop_value.copy())
-                                # Ensure type is specified
+                                # Ensure type is specified with intelligent inference and correction
                                 if "type" not in props[prop_name]:
                                     if "properties" in props[prop_name]:
                                         props[prop_name]["type"] = "OBJECT"
+                                        bound_logger.debug(f"Set type to OBJECT for '{prop_name}' (has properties)")
                                     elif "items" in props[prop_name]:
                                         props[prop_name]["type"] = "ARRAY"
+                                        bound_logger.debug(f"Set type to ARRAY for '{prop_name}' (has items)")
                                     else:
-                                        props[prop_name]["type"] = "STRING"
+                                        # Smart type inference based on field name and description
+                                        inferred_type = _infer_property_type_with_logging(prop_name, props[prop_name])
+                                        props[prop_name]["type"] = inferred_type
+                                else:
+                                    # FORCE type correction for known problematic fields
+                                    existing_type = props[prop_name]["type"].lower()
+                                    corrected_type = _force_type_correction(prop_name, existing_type, props[prop_name])
+                                    
+                                    if corrected_type != existing_type.upper():
+                                        bound_logger.debug(f"CORRECTED type for '{prop_name}': {existing_type.upper()} → {corrected_type}")
+                                        props[prop_name]["type"] = corrected_type
+                                    else:
+                                        bound_logger.debug(f"Preserving existing type '{props[prop_name]['type']}' for '{prop_name}'")
                                 # Convert type to uppercase for Gemini
                                 if "type" in props[prop_name]:
+                                    original_type = props[prop_name]["type"]
                                     props[prop_name]["type"] = props[prop_name]["type"].upper()
+                                    if original_type != props[prop_name]["type"]:
+                                        bound_logger.debug(f"Converted type from '{original_type}' to '{props[prop_name]['type']}' for '{prop_name}'")
                             else:
                                 # Non-dict properties default to STRING type
                                 props[prop_name] = {"type": "STRING"}
@@ -562,6 +697,59 @@ def calculate_input_tokens(
     return total_tokens
 
 # --- Core LLM Interaction Functions --- #
+
+def _convert_mapcomposite_to_dict(value):
+    """
+    Recursively convert MapComposite objects and other Google Proto objects to serializable dictionaries.
+    
+    Args:
+        value: The value to convert, which may be a MapComposite, list, dict, or primitive type
+        
+    Returns:
+        A JSON-serializable representation of the value
+    """
+    # Handle MapComposite objects
+    if hasattr(value, 'items') and callable(value.items):
+        # This is a MapComposite or similar dict-like object
+        result = {}
+        for key, val in value.items():
+            result[key] = _convert_mapcomposite_to_dict(val)  # Recursive conversion
+        return result
+    
+    # Handle lists (including ListComposite)
+    elif isinstance(value, list) or (hasattr(value, '__iter__') and not isinstance(value, (str, bytes))):
+        try:
+            return [_convert_mapcomposite_to_dict(item) for item in value]
+        except TypeError:
+            # If iteration fails, convert to string
+            return str(value)
+    
+    # Handle dictionaries
+    elif isinstance(value, dict):
+        result = {}
+        for key, val in value.items():
+            result[key] = _convert_mapcomposite_to_dict(val)
+        return result
+    
+    # Handle Google Proto objects and other complex objects
+    elif hasattr(value, '__dict__') or hasattr(value, '_pb') or str(type(value)).startswith('<google'):
+        # Try to convert to dict if it has dict-like behavior
+        if hasattr(value, 'items') and callable(value.items):
+            result = {}
+            for key, val in value.items():
+                result[key] = _convert_mapcomposite_to_dict(val)
+            return result
+        else:
+            # Fall back to string representation
+            return str(value)
+    
+    # Handle primitive types - test if JSON serializable
+    else:
+        try:
+            json.dumps(value)
+            return value
+        except (TypeError, OverflowError):
+            return str(value)
 
 def get_gemini_response(
     messages: List[Dict[str, Any]], 
@@ -916,6 +1104,9 @@ def get_gemini_response(
         response_content = None
         response_tool_calls = []
         
+        # Calculate token counts (needed for both success and error cases)
+        token_count_in = calculate_input_tokens(messages, "Gemini", model_name, tools)
+        
         # Check for function calls in the response parts with better error handling
         if response_parts:
             bound_logger.debug(f"Processing {len(response_parts)} parts from response")
@@ -941,43 +1132,37 @@ def get_gemini_response(
                         # More careful args handling with improved MapComposite support
                         if hasattr(fc, 'args'):
                             try:
+                                # Debug: log the raw fc.args before conversion
+                                bound_logger.debug(f"Function call args type: {type(fc.args)}, value: {fc.args}")
+                                
                                 # Handle MapComposite and similar objects more robustly
                                 if hasattr(fc.args, 'items') and callable(fc.args.items):
                                     # Convert MapComposite to plain dict with safe serialization
                                     safe_args = {}
                                     for key, value in fc.args.items():
-                                        # Convert any complex objects to serializable types
-                                        if hasattr(value, '__dict__') or hasattr(value, '_pb') or str(type(value)).startswith('<google'):
-                                            safe_args[key] = str(value)
-                                        elif hasattr(value, 'items') and callable(value.items):
-                                            # Handle nested MapComposite objects
-                                            safe_args[key] = dict(value.items())
-                                        else:
-                                            # Test if the value is JSON serializable
-                                            try:
-                                                json.dumps(value)
-                                                safe_args[key] = value
-                                            except (TypeError, OverflowError):
-                                                safe_args[key] = str(value)
+                                        # FIXED: Properly handle MapComposite objects recursively
+                                        safe_args[key] = _convert_mapcomposite_to_dict(value)
                                     args_str = json.dumps(safe_args)
+                                    bound_logger.debug(f"Converted MapComposite args: {args_str}")
                                 elif isinstance(fc.args, dict):
                                     # Already a dict, but check each value for serializability
                                     safe_args = {}
                                     for key, value in fc.args.items():
-                                        try:
-                                            json.dumps(value)
-                                            safe_args[key] = value
-                                        except (TypeError, OverflowError):
-                                            safe_args[key] = str(value)
+                                        safe_args[key] = _convert_mapcomposite_to_dict(value)
                                     args_str = json.dumps(safe_args)
+                                    bound_logger.debug(f"Converted dict args: {args_str}")
                                 else:
                                     # Not a dict or dict-like, convert to string
                                     args_str = json.dumps({"raw_args": str(fc.args)})
+                                    bound_logger.debug(f"Converted non-dict args: {args_str}")
                             except Exception as args_error:
                                 # If all else fails, create a safe fallback
                                 args_str = json.dumps({"serialization_error": str(args_error), "raw_args": str(fc.args)})
+                                bound_logger.error(f"Error converting function call args: {args_error}")
                         else:
+                            # FIXED: fc.args doesn't exist, set empty args
                             args_str = "{}"
+                            bound_logger.debug("Function call has no args attribute, using empty object")
                         
                         response_tool_calls.append({
                             "id": str(uuid.uuid4()), # Generate shorter ID (just UUID)
@@ -992,10 +1177,134 @@ def get_gemini_response(
                     bound_logger.error(f"Error processing response part {i}: {part_error}", exc_info=True)
                     # Continue with other parts
         else:
-            bound_logger.warning("No parts found in the Gemini response")
+            # ENHANCED ERROR DETECTION - No parts found is a critical error
+            bound_logger.error("CRITICAL: No parts found in Gemini response - investigating cause...")
+            
+            # Check for finish_reason indicating why response failed
+            finish_reasons = []
+            malformed_function_call_detected = False
+            
+            if hasattr(response, 'candidates') and response.candidates:
+                for i, candidate in enumerate(response.candidates):
+                    if hasattr(candidate, 'finish_reason'):
+                        finish_reason = str(candidate.finish_reason)
+                        finish_reasons.append(f"Candidate {i}: {finish_reason}")
+                        
+                        if 'MALFORMED_FUNCTION_CALL' in finish_reason:
+                            malformed_function_call_detected = True
+                            bound_logger.error(f"MALFORMED_FUNCTION_CALL detected in candidate {i}")
+                        elif 'SAFETY' in finish_reason:
+                            bound_logger.error(f"Safety filter triggered in candidate {i}")
+                        elif 'MAX_TOKENS' in finish_reason:
+                            bound_logger.error(f"Max tokens exceeded in candidate {i}")
+                        elif 'STOP' in finish_reason:
+                            bound_logger.debug(f"Normal stop condition in candidate {i}")
+                        else:
+                            bound_logger.error(f"Unknown finish reason: {finish_reason}")
+            
+            # Log comprehensive diagnostic information
+            diagnostic_info = {
+                "response_type": str(type(response)),
+                "response_attributes": dir(response),
+                "finish_reasons": finish_reasons,
+                "malformed_function_call": malformed_function_call_detected,
+                "has_candidates": hasattr(response, 'candidates'),
+                "candidate_count": len(response.candidates) if hasattr(response, 'candidates') and response.candidates else 0,
+                "tools_provided": len(tools) if tools else 0,
+                "tools_names": [getattr(t, 'name', 'unknown') for t in tools] if tools else [],
+            }
+            
+            # Add candidate details if available
+            if hasattr(response, 'candidates') and response.candidates:
+                diagnostic_info["candidate_details"] = []
+                for i, candidate in enumerate(response.candidates):
+                    candidate_info = {
+                        "index": i,
+                        "finish_reason": str(getattr(candidate, 'finish_reason', 'unknown')),
+                        "has_content": hasattr(candidate, 'content'),
+                        "content_parts_count": len(candidate.content.parts) if hasattr(candidate, 'content') and candidate.content and hasattr(candidate.content, 'parts') else 0
+                    }
+                    
+                    # Check safety ratings
+                    if hasattr(candidate, 'safety_ratings') and candidate.safety_ratings:
+                        candidate_info["safety_ratings"] = []
+                        for rating in candidate.safety_ratings:
+                            rating_info = {
+                                "category": str(getattr(rating, 'category', 'unknown')),
+                                "probability": str(getattr(rating, 'probability', 'unknown'))
+                            }
+                            candidate_info["safety_ratings"].append(rating_info)
+                    
+                    diagnostic_info["candidate_details"].append(candidate_info)
+            
+            # Log the comprehensive diagnostic info
+            bound_logger.bind(
+                diagnostic_data=diagnostic_info
+            ).error("Gemini response diagnostic information")
+            
+            # Specific error messages based on detected issues
+            if malformed_function_call_detected:
+                error_msg = "MALFORMED_FUNCTION_CALL: Gemini could not parse the function call arguments. This likely indicates a tool schema issue."
+                bound_logger.error(error_msg)
+                if tools:
+                    bound_logger.error(f"Problem likely with one of these tools: {[getattr(t, 'name', 'unknown') for t in tools]}")
+                    # Log the specific tool schemas for debugging
+                    for tool in tools:
+                        tool_name = getattr(tool, 'name', 'unknown')
+                        tool_params = getattr(tool, 'parameters', None)
+                        bound_logger.error(f"Tool '{tool_name}' schema: {str(tool_params)[:500]}...")
+                
+                # Return an error response for MALFORMED_FUNCTION_CALL
+                return {
+                    "error": "Function call schema error: Gemini detected malformed function call arguments. Please check tool parameter schemas.",
+                    "error_type": "MALFORMED_FUNCTION_CALL",
+                    "content": None,
+                    "tool_calls": [],
+                    "token_count_in": token_count_in,
+                    "token_count_out": 0,
+                    "diagnostic_info": diagnostic_info
+                }
+            
+            elif finish_reasons and any('SAFETY' in reason for reason in finish_reasons):
+                error_msg = "SAFETY: Gemini's safety filters blocked the response."
+                bound_logger.error(error_msg)
+                return {
+                    "error": "Safety filter triggered: Gemini blocked the response due to safety concerns.",
+                    "error_type": "SAFETY_FILTER",
+                    "content": None,
+                    "tool_calls": [],
+                    "token_count_in": token_count_in,
+                    "token_count_out": 0,
+                    "diagnostic_info": diagnostic_info
+                }
+            
+            elif finish_reasons and any('MAX_TOKENS' in reason for reason in finish_reasons):
+                error_msg = "MAX_TOKENS: Gemini response was truncated due to token limit."
+                bound_logger.error(error_msg)
+                return {
+                    "error": "Token limit exceeded: Gemini response was truncated.",
+                    "error_type": "MAX_TOKENS",
+                    "content": None,
+                    "tool_calls": [],
+                    "token_count_in": token_count_in,
+                    "token_count_out": 0,
+                    "diagnostic_info": diagnostic_info
+                }
+            
+            else:
+                error_msg = f"UNKNOWN: Gemini returned empty response for unknown reasons. Finish reasons: {finish_reasons}"
+                bound_logger.error(error_msg)
+                return {
+                    "error": f"Empty response from Gemini: {error_msg}",
+                    "error_type": "EMPTY_RESPONSE",
+                    "content": None,
+                    "tool_calls": [],
+                    "token_count_in": token_count_in,
+                    "token_count_out": 0,
+                    "diagnostic_info": diagnostic_info
+                }
         
-        # Calculate token counts
-        token_count_in = calculate_input_tokens(messages, "Gemini", model_name, tools)
+        # Calculate output token counts for successful responses
         token_count_out = count_tokens_gemini(response_content if response_content else "") if response_content else 0
         bound_logger.debug(f"Token counts - In: {token_count_in}, Out: {token_count_out}")
 

@@ -807,11 +807,11 @@ def create_unguided_mimic_workflow() -> List[NiFiWorkflowNode]:
 # Register the unguided mimic workflow
 unguided_mimic_workflow = WorkflowDefinition(
     name="unguided_mimic",
-    display_name="Unguided Mimic",
     description="Replicates the existing unguided LLM execution behavior using multi-node workflow",
+    create_workflow_func=create_unguided_mimic_workflow,
+    display_name="Unguided Mimic",
     category="Basic",
     phases=["Review", "Creation", "Modification", "Operation"],
-    factory=create_unguided_mimic_workflow,
     enabled=True
 )
 
