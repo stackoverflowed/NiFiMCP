@@ -429,8 +429,21 @@ async def execute_tool(
         
         # --- Extract serializable result from MCP format --- 
         final_result_to_serialize = None
+        
+        # Handle case where result is a tuple (TextContent + dict)
+        if isinstance(tool_result_mcp_format, tuple) and len(tool_result_mcp_format) == 2:
+            text_content_list, result_dict = tool_result_mcp_format
+            
+            # Extract the actual result from the dictionary
+            if isinstance(result_dict, dict) and 'result' in result_dict:
+                final_result_to_serialize = result_dict['result']
+                bound_logger.debug(f"Extracted result from tuple format: {final_result_to_serialize}")
+            else:
+                final_result_to_serialize = result_dict
+                bound_logger.debug(f"Using dictionary part of tuple: {final_result_to_serialize}")
+        
         # Check if the result is a list (potentially multiple TextContent objects)
-        if isinstance(tool_result_mcp_format, list):
+        elif isinstance(tool_result_mcp_format, list):
             parsed_list = []
             for item in tool_result_mcp_format:
                 if hasattr(item, 'type') and item.type == 'text' and hasattr(item, 'text'):
@@ -447,6 +460,7 @@ async def execute_tool(
                     bound_logger.warning(f"Unexpected item type {type(item)} in MCP result list for tool '{tool_name}'. Appending raw item.")
             final_result_to_serialize = parsed_list
             bound_logger.debug(f"Parsed list from MCP TextContent objects: {final_result_to_serialize}")
+        
         # Handle case where result is a single object (e.g., single TextContent)
         elif hasattr(tool_result_mcp_format, 'type') and tool_result_mcp_format.type == 'text' and hasattr(tool_result_mcp_format, 'text'):
              try:
@@ -457,6 +471,7 @@ async def execute_tool(
                  # If it's not JSON, maybe it's just plain text?
                  final_result_to_serialize = tool_result_mcp_format.text
                  bound_logger.warning(f"Single TextContent for tool '{tool_name}' was not valid JSON ({json_err}). Returning as plain text.")
+        
         # Handle other potential single result types (ImageContent, etc.) if needed
         else:
             # If the result wasn't a list or known single content type, assign it directly

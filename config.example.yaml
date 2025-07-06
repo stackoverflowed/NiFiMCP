@@ -17,19 +17,19 @@ nifi:
 llm:
   google:
     api_key: "" # Your Google API Key (e.g., AIza...)
-    models: ["gemini-1.5-pro-latest", "gemini-1.0-pro"] # Comma-separated list of allowed models
+    models: ["gemini-2.5-flash-lite-preview-06-17", "gemini-2.5-flash-preview-04-17", "gemini-2.5-flash", "gemini-2.5-pro"] # Comma-separated list of allowed models
   openai:
     api_key: "" # Your OpenAI API Key (e.g., sk-...)
-    models: ["gpt-4-turbo-preview", "gpt-3.5-turbo"] # Comma-separated list of allowed models
+    models: ["o4-mini","gpt-4.5-preview", "gpt-4.1", "gpt-4o", "o1", "o3", "gpt-4.1-mini", "gpt-4.1-nano", "gpt-4o-mini", "o1-mini", "o3-mini"] # Comma-separated list of allowed models
   perplexity:
     api_key: "" # Your Perplexity API Key (e.g., pplx-...)
     models: ["sonar-pro", "sonar", "sonar-reasoning-pro", "sonar-reasoning"] # Comma-separated list of allowed models
   anthropic:
     api_key: "" # Your Anthropic API Key (e.g., sk-ant-...)
-    models: ["claude-opus-4-20250514", "claude-sonnet-4-20250109", "claude-haiku-3-5-20241022"] # Comma-separated list of allowed models
+    models: ["claude-opus-4-20250514", "claude-sonnet-4-20250109", "claude-3-5-haiku-20241022"] # Comma-separated list of allowed models
   expert_help_model:
-    provider: "openai" # Choose from: openai, google, perplexity, anthropic
-    model: "gpt-4-turbo-preview" # Must be one of the models listed above for the chosen provider
+    provider: "perplexity" # Choose from: openai, google, perplexity, anthropic
+    model: "sonar-pro" # Must be one of the models listed above for the chosen provider
 
 mcp_features:
   auto_stop_enabled: true

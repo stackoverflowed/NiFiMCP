@@ -22,6 +22,8 @@ from .review import get_nifi_object_details, list_nifi_objects  # Import both fu
 from nifi_mcp_server.nifi_client import NiFiClient, NiFiAuthenticationError
 from mcp.server.fastmcp.exceptions import ToolError
 
+
+
 # --- Tool Definitions --- 
 
 def _requires_restart_for_property_change(processor_type: str, property_name: str, old_value: Any, new_value: Any) -> bool:
@@ -58,6 +60,81 @@ def _requires_restart_for_property_change(processor_type: str, property_name: st
     
     # Default: assume restart needed for safety
     return True
+
+async def _validate_and_resolve_update_properties(
+    processor_type: str,
+    properties: Dict[str, Any],
+    process_group_id: str,
+    nifi_client: NiFiClient,
+    logger,
+    user_request_id: str,
+    action_id: str
+) -> tuple[Dict[str, Any], list[str], list[str]]:
+    """
+    Validates and resolves service references in processor property updates.
+    
+    This function mirrors the validation and resolution logic from create_complete_nifi_flow
+    but is specifically optimized for property updates.
+    
+    Args:
+        processor_type: The type of processor being updated
+        properties: The properties to validate and resolve
+        process_group_id: The process group ID for service lookup
+        nifi_client: NiFi client instance
+        logger: Logger instance
+        user_request_id: Request ID for logging
+        action_id: Action ID for logging
+        
+    Returns:
+        tuple[resolved_properties, warnings, errors]
+    """
+    resolved_properties = properties.copy()
+    warnings = []
+    errors = []
+    
+    try:
+        # Build service map from process group
+        service_map = {}
+        service_type_map = {}  # Separate map for type checking
+        services = await nifi_client.list_controller_services(process_group_id, user_request_id=user_request_id, action_id=action_id)
+        for service in services:
+            service_name = service.get("component", {}).get("name", "")
+            service_id = service.get("id", "")
+            service_type = service.get("component", {}).get("type", "")
+            if service_name and service_id:
+                service_map[service_name] = service_id
+                service_type_map[service_name] = service_type
+        logger.info(f"Built service map with {len(service_map)} services: {list(service_map.keys())}")
+        
+        # Get processor property descriptors (using hardcoded approach like creation tools)
+        # For now, we'll use a simplified approach that doesn't require dynamic property descriptor lookup
+        # This matches the approach used in creation.py
+        property_descriptors = {}
+        
+        # Validate and resolve each property
+        for prop_name, prop_value in list(resolved_properties.items()):
+            if not isinstance(prop_value, str):
+                continue
+                
+            # Handle service references (simplified approach)
+            if _looks_like_service_reference(prop_value):
+                resolved_value, is_resolved = await _resolve_service_reference(
+                    prop_value, service_map, process_group_id, nifi_client,
+                    logger, user_request_id, action_id
+                )
+                
+                if is_resolved:
+                    if resolved_value != prop_value:
+                        resolved_properties[prop_name] = resolved_value
+                        warnings.append(f"Resolved service reference '{prop_name}': '{prop_value}' → '{resolved_value}'")
+                else:
+                    errors.append(f"Could not resolve service reference '{prop_name}': '{prop_value}'")
+                
+    except Exception as e:
+        logger.error(f"Error validating properties: {e}", exc_info=True)
+        errors.append(f"Property validation failed: {e}")
+        
+    return resolved_properties, warnings, errors
 
 # DEPRECATED: Use update_nifi_processors_properties instead
 # This function is kept for backward compatibility but will be removed
@@ -101,6 +178,9 @@ async def _update_nifi_processor_properties_legacy(
          raise ToolError("Request logger context is not set.")
          
     # Authentication handled by factory
+    from ..request_context import current_user_request_id, current_action_id
+    user_request_id = current_user_request_id.get() or "-"
+    action_id = current_action_id.get() or "-"
 
     if not processor_config_properties:
         error_msg = "The 'processor_config_properties' argument cannot be empty. Fetch current config first."
@@ -190,17 +270,50 @@ async def _update_nifi_processor_properties_legacy(
         if not current_revision:
              raise ToolError(f"Could not retrieve revision for processor {processor_id}.")
              
+        # Get processor type for validation
+        processor_type = component_precheck.get("type")
+        if not processor_type:
+            raise ToolError(f"Could not determine processor type for {processor_id}")
+            
+        # Get process group ID for service resolution
+        process_group_id = component_precheck.get("parentGroupId")
+        if not process_group_id:
+            raise ToolError(f"Could not determine process group for processor {processor_id}")
+            
+        # Validate and resolve properties
+        resolved_properties, warnings, errors = await _validate_and_resolve_update_properties(
+            processor_type=processor_type,
+            properties=processor_config_properties,
+            process_group_id=process_group_id,
+            nifi_client=nifi_client,
+            logger=local_logger,
+            user_request_id=user_request_id,
+            action_id=action_id
+        )
+        
+        # Handle validation errors
+        if errors:
+            error_msg = f"Property validation failed: {'; '.join(errors)}"
+            local_logger.error(error_msg)
+            return {
+                "status": "error",
+                "message": error_msg,
+                "validation_errors": errors,
+                "entity": None
+            }
+            
+        # Proceed with update using resolved properties
         nifi_update_req = {
             "operation": "update_processor_config",
             "processor_id": processor_id,
             "update_type": "properties",
-            "update_data": processor_config_properties
+            "update_data": resolved_properties
         }
         local_logger.bind(interface="nifi", direction="request", data=nifi_update_req).debug("Calling NiFi API")
         updated_entity = await nifi_client.update_processor_config(
             processor_id=processor_id,
             update_type="properties",
-            update_data=processor_config_properties
+            update_data=resolved_properties
         )
         filtered_updated_entity = filter_created_processor_data(updated_entity)
         local_logger.bind(interface="nifi", direction="response", data=filtered_updated_entity).debug("Received from NiFi API")
@@ -374,6 +487,79 @@ async def _update_nifi_processor_properties_legacy(
         return {"status": "error", "message": f"An unexpected error occurred during update: {e}", "entity": None}
 
 
+async def _validate_and_resolve_controller_service_properties(
+    service_type: str,
+    properties: Dict[str, Any],
+    process_group_id: str,
+    nifi_client: NiFiClient,
+    logger,
+    user_request_id: str,
+    action_id: str
+) -> tuple[Dict[str, Any], list[str], list[str]]:
+    """
+    Validates and resolves service references in controller service property updates.
+    
+    Similar to _validate_and_resolve_update_properties but specialized for controller services.
+    
+    Args:
+        service_type: The type of controller service being updated
+        properties: The properties to validate and resolve
+        process_group_id: The process group ID for service lookup
+        nifi_client: NiFi client instance
+        logger: Logger instance
+        user_request_id: Request ID for logging
+        action_id: Action ID for logging
+        
+    Returns:
+        tuple[resolved_properties, warnings, errors]
+    """
+    resolved_properties = properties.copy()
+    warnings = []
+    errors = []
+    
+    try:
+        # Build service map from process group
+        service_map = {}
+        service_type_map = {}  # Add this line
+        services = await nifi_client.list_controller_services(process_group_id, user_request_id=user_request_id, action_id=action_id)
+        for service in services:
+            service_name = service.get("component", {}).get("name", "")
+            service_id = service.get("id", "")
+            service_type = service.get("component", {}).get("type", "")
+            if service_name and service_id:
+                service_map[service_name] = service_id 
+                service_type_map[service_name] = service_type  
+        logger.info(f"Built service map with {len(service_map)} services: {list(service_map.keys())}")
+        
+        # Get service property descriptors (using simplified approach like processors)
+        # For now, we'll use a simplified approach that doesn't require dynamic property descriptor lookup
+        property_descriptors = {}
+        
+        # Validate and resolve each property
+        for prop_name, prop_value in list(resolved_properties.items()):
+            if not isinstance(prop_value, str):
+                continue
+                
+            # Handle service references (simplified approach)
+            if _looks_like_service_reference(prop_value):
+                resolved_value, is_resolved = await _resolve_service_reference(
+                    prop_value, service_map, process_group_id, nifi_client,
+                    logger, user_request_id, action_id
+                )
+                
+                if is_resolved:
+                    if resolved_value != prop_value:
+                        resolved_properties[prop_name] = resolved_value
+                        warnings.append(f"Resolved service reference '{prop_name}': '{prop_value}' → '{resolved_value}'")
+                else:
+                    errors.append(f"Could not resolve service reference '{prop_name}': '{prop_value}'")
+                
+    except Exception as e:
+        logger.error(f"Error validating properties: {e}", exc_info=True)
+        errors.append(f"Property validation failed: {e}")
+        
+    return resolved_properties, warnings, errors
+
 @mcp.tool()
 @tool_phases(["Modify"])
 async def update_controller_service_properties(
@@ -468,15 +654,48 @@ async def update_controller_service_properties(
         if not current_revision:
              raise ToolError(f"Could not retrieve revision for controller service {controller_service_id}.")
              
+        # Get service type for validation
+        service_type = component_precheck.get("type")
+        if not service_type:
+            raise ToolError(f"Could not determine service type for {controller_service_id}")
+            
+        # Get process group ID for service resolution
+        process_group_id = component_precheck.get("parentGroupId")
+        if not process_group_id:
+            raise ToolError(f"Could not determine process group for service {controller_service_id}")
+            
+        # Validate and resolve properties
+        resolved_properties, warnings, errors = await _validate_and_resolve_controller_service_properties(
+            service_type=service_type,
+            properties=controller_service_properties,
+            process_group_id=process_group_id,
+            nifi_client=nifi_client,
+            logger=local_logger,
+            user_request_id=user_request_id,
+            action_id=action_id
+        )
+        
+        # Handle validation errors
+        if errors:
+            error_msg = f"Property validation failed: {'; '.join(errors)}"
+            local_logger.error(error_msg)
+            return {
+                "status": "error",
+                "message": error_msg,
+                "validation_errors": errors,
+                "entity": None
+            }
+            
+        # Proceed with update using resolved properties
         nifi_update_req = {
             "operation": "update_controller_service_properties",
             "controller_service_id": controller_service_id,
-            "properties": controller_service_properties
+            "properties": resolved_properties
         }
         local_logger.bind(interface="nifi", direction="request", data=nifi_update_req).debug("Calling NiFi API")
         updated_entity = await nifi_client.update_controller_service_properties(
             controller_service_id=controller_service_id,
-            properties=controller_service_properties,
+            properties=resolved_properties,
             user_request_id=user_request_id,
             action_id=action_id
         )
@@ -586,6 +805,10 @@ async def update_controller_service_properties(
                 "restart_status": restart_status,
                 "entity": filtered_updated_entity
             }
+
+        # Add warnings to response if any
+        if warnings:
+            property_update_status["warnings"] = warnings
 
     except ValueError as e:
         local_logger.warning(f"Error updating controller service properties: {e}")
@@ -1837,3 +2060,109 @@ async def update_nifi_processors_properties(
     local_logger.info(f"Batch property updates completed: {len(successful_updates)} successful, {len(failed_updates)} failed, {len(warning_updates)} warnings")
     
     return results
+
+
+
+def _looks_like_service_reference(value: str) -> bool:
+    """Check if a property value looks like a service reference."""
+    if not isinstance(value, str):
+        return False
+    # @ServiceName pattern or UUID pattern
+    return value.startswith("@") or _is_valid_uuid(value)
+
+def _is_valid_uuid(uuid_string: str) -> bool:
+    """Check if a string is a valid UUID."""
+    try:
+        import uuid
+        uuid.UUID(uuid_string)
+        return True
+    except ValueError:
+        return False
+
+async def _resolve_service_reference(
+    reference: str, 
+    service_map: Dict[str, str], 
+    process_group_id: str, 
+    nifi_client: NiFiClient,
+    logger,
+    user_request_id: str,
+    action_id: str
+) -> tuple[str, bool]:
+    """
+    Enhanced service reference resolution that handles multiple patterns.
+    
+    Supports:
+    - Direct UUID: "855ec3ad-0197-1000-0937-3067b9c6f54c" → returns as-is
+    - @ServiceName: "@HttpContextMap" → resolves to service ID  
+    - ServiceName: "HttpContextMap" → resolves to service ID (fallback)
+    - Fuzzy matching: "HttpContext" → finds best match
+    """
+    if not isinstance(reference, str) or not reference.strip():
+        return reference, False
+    
+    reference = reference.strip()
+    
+    # Pattern 1: Direct UUID (already resolved)
+    if _is_valid_uuid(reference):
+        logger.debug(f"Direct UUID reference: {reference}")
+        return reference, True
+    
+    # Pattern 2: @ServiceName syntax
+    if reference.startswith("@"):
+        service_name = reference[1:]
+        if service_name in service_map:
+            resolved_id = service_map[service_name]
+            logger.debug(f"Resolved @{service_name} → {resolved_id}")
+            return resolved_id, True
+        else:
+            logger.warning(f"Service '@{service_name}' not found in current flow services")
+            reference = service_name
+    
+    # Pattern 3: Direct service name (fallback for backward compatibility)
+    if reference in service_map:
+        resolved_id = service_map[reference]
+        logger.debug(f"Resolved service name '{reference}' → {resolved_id}")
+        return resolved_id, True
+    
+    # Pattern 4: Process group service lookup (for existing services)
+    try:
+        logger.debug(f"Looking up service '{reference}' in process group {process_group_id}")
+        services = await nifi_client.list_controller_services(
+            process_group_id=process_group_id,
+            user_request_id=user_request_id,
+            action_id=action_id
+        )
+        
+        # Exact name match
+        exact_matches = [s for s in services if s.get("component", {}).get("name") == reference]
+        if len(exact_matches) == 1:
+            resolved_id = exact_matches[0]["id"]
+            logger.info(f"Found exact match for service '{reference}' → {resolved_id}")
+            return resolved_id, True
+        elif len(exact_matches) > 1:
+            logger.warning(f"Multiple services found with name '{reference}' in process group")
+            return reference, False
+        
+        # Fuzzy matching (case-insensitive partial match)
+        fuzzy_matches = [
+            s for s in services 
+            if reference.lower() in s.get("component", {}).get("name", "").lower()
+        ]
+        if len(fuzzy_matches) == 1:
+            resolved_id = fuzzy_matches[0]["id"]
+            service_name = fuzzy_matches[0].get("component", {}).get("name", "")
+            logger.info(f"Fuzzy match: '{reference}' → '{service_name}' ({resolved_id})")
+            return resolved_id, True
+        elif len(fuzzy_matches) > 1:
+            match_names = [s.get("component", {}).get("name", "") for s in fuzzy_matches]
+            logger.warning(f"Multiple fuzzy matches for '{reference}': {match_names}")
+            return reference, False
+
+    except Exception as e:
+        logger.warning(f"Error looking up service '{reference}' in process group: {e}")
+    
+    # Pattern 5: No resolution possible
+    logger.warning(f"Could not resolve service reference '{reference}'")
+    return reference, False
+
+

@@ -1,3 +1,6 @@
+The following is an example of an actual conversation with an LLM (o4-mini) to build a new flow based on a spec.  The process starts with inserting the following flow spec (including sections 1 - 5) into the "Objective" textbox at the top of the chat session.  This is now sent as part of the system prompt for each request to ensure the LLM never forgets what it is building.  After that we start the conversation by asking the LLM to "please proceed with the objective".  Also note that in this example the user helped the LLM setup controllers.  More recent updates to the product have added these tools so the LLM can now these tasks without any user intervention.
+
+
 ## Overall Objective:
 Inside the processGroupId=6c0405d8-0197-1000-1edb-6b54e0a73e91 we are building the following flow to meet the requirement:
 
@@ -104,19 +107,19 @@ Your approach should be:
 please proceed with the objective
 
 **Assistant:**
-Here’s the proposed plan for building the flow inside Process Group 6c0405d8-0197-1000-1edb-6b54e0a73e91. Please review and let me know if you’d like any adjustments before we start creating components.
+Here's the proposed plan for building the flow inside Process Group 6c0405d8-0197-1000-1edb-6b54e0a73e91. Please review and let me know if you'd like any adjustments before we start creating components.
 
 1. Controllers  
    None required if we use ExecuteScript for all JSON parsing, validation, decision logic, transformation, UUID generation, and error handling.  
-   (If you prefer a record-based approach, we’d need a JsonTreeReader and JsonRecordSetWriter – please let me know.)
+   (If you prefer a record-based approach, we'd need a JsonTreeReader and JsonRecordSetWriter – please let me know.)
 
 2. Processor Layout  
    • HandleHttpRequest  
      – Listens for incoming HTTP POSTs with JSON payload  
-     – Relationship: “success” → LogAttribute (raw input)  
+     – Relationship: "success" → LogAttribute (raw input)  
    • LogAttribute (raw input)  
      – Logs incoming JSON and attributes for auditing  
-     – Relationship “success” → ExecuteScript  
+     – Relationship "success" → ExecuteScript  
    • ExecuteScript (e.g., Groovy or Jython)  
      – Parses JSON from content  
      – Validates required fields (`userId`, non-empty `order.items`, `order.shipping.address`)  
@@ -124,10 +127,10 @@ Here’s the proposed plan for building the flow inside Process Group 6c0405d8-0
      – Applies shipping fee if `order.shipping.method == "express"`  
      – Calculates total, generates UUID for `orderId`, builds response JSON  
      – On validation failure builds error JSON + sets `http.status.code=400`; on success sets `http.status.code=200`  
-     – Relationships: “success” (script handled everything) / “failure” (unexpected script error)  
+     – Relationships: "success" (script handled everything) / "failure" (unexpected script error)  
    • LogAttribute (response)  
      – Logs outgoing JSON response and status code for auditing  
-     – Relationship “success” → HandleHttpResponse  
+     – Relationship "success" → HandleHttpResponse  
    • HandleHttpResponse  
      – Sends the response back to the original HTTP caller using the `http.request.uuid` correlation attribute  
 
@@ -140,13 +143,13 @@ Here’s the proposed plan for building the flow inside Process Group 6c0405d8-0
 
 4. Error Handling & Edge Cases  
    - Script emits proper HTTP status codes and error messages for missing/invalid fields or empty items.  
-   - Any unhandled script exception routes to the “failure” relationship; you can choose how to alert or queue those.
+   - Any unhandled script exception routes to the "failure" relationship; you can choose how to alert or queue those.
 
 5. Testing  
-   - Once built, we’ll test with your sample JSON and verify you get the expected 200 response with the calculated totals.  
+   - Once built, we'll test with your sample JSON and verify you get the expected 200 response with the calculated totals.  
    - Test missing/invalid fields to confirm 4xx error responses.
 
-Please confirm or suggest changes—once approved, I’ll begin creating the processors and wiring up the flow.
+Please confirm or suggest changes—once approved, I'll begin creating the processors and wiring up the flow.
 
 **User:**
 please validate this using the tool get_expert_help, then confirm which controllers you need me to set up
@@ -154,20 +157,20 @@ please validate this using the tool get_expert_help, then confirm which controll
 **Assistant:** ⚙️ Calling tool(s): `get_expert_help`...
 
 **Assistant:**
-I attempted to get external expert validation but ran into an internal error. In the meantime, here’s my own expert review:
+I attempted to get external expert validation but ran into an internal error. In the meantime, here's my own expert review:
 
 1. Script vs. Record-Based  
    - ExecuteScript is fine for a single self-contained script, but can become hard to maintain as logic grows.  
-   - A Record-based approach (HandleHttpRequest → ValidateRecord → UpdateRecord → LogAttribute → HandleHttpResponse) scales better, separates concerns, and leverages NiFi’s built-in JSON handling.  
+   - A Record-based approach (HandleHttpRequest → ValidateRecord → UpdateRecord → LogAttribute → HandleHttpResponse) scales better, separates concerns, and leverages NiFi's built-in JSON handling.  
 
 2. Recommended Controller Services if you go Record-based  
    • JsonTreeReader (Record Reader) – parses the incoming JSON into Record objects  
    • JsonRecordSetWriter (Record Writer) – serializes your output Record back to JSON  
    • (Optional) ValidateRecord – you may also enable a Schema Registry (AvroSchemaRegistry) if you want strict schema validation rather than script code  
 
-3. If you stick with ExecuteScript, you don’t need any additional controller services beyond NiFi’s default scripting engines.  
+3. If you stick with ExecuteScript, you don't need any additional controller services beyond NiFi's default scripting engines.  
 
-Please let me know which approach you’d like to take (script vs. record), and if record-based, I’ll assume you’ve enabled JsonTreeReader and JsonRecordSetWriter and proceed to create the flow.
+Please let me know which approach you'd like to take (script vs. record), and if record-based, I'll assume you've enabled JsonTreeReader and JsonRecordSetWriter and proceed to create the flow.
 
 **User:**
 I think the problem is fixed.  Could you run your design and the requirement past the expert again please
@@ -197,28 +200,28 @@ If you choose record-based, you need these controller services:
 • JsonRecordSetWriter  
 • (Optional) AvroSchemaRegistry
 
-Please confirm which approach you’d like—script-only (no controllers needed) or record-based (please enable the above services). Once confirmed, I’ll proceed to create the processors.  
+Please confirm which approach you'd like—script-only (no controllers needed) or record-based (please enable the above services). Once confirmed, I'll proceed to create the processors.  
 TASK COMPLETE
 
 **User:**
 lets go with script only, but won't you need http mapping controllers?
 
 **Assistant:**
-You’re right—any flow using HandleHttpRequest and HandleHttpResponse needs an HTTP Context Map controller service to correlate requests and responses. For a script-only approach you should have:
+You're right—any flow using HandleHttpRequest and HandleHttpResponse needs an HTTP Context Map controller service to correlate requests and responses. For a script-only approach you should have:
 
 • StandardHTTPContextMap  
   – Requires a DistributedMapCacheServer (for storage)  
   – And a DistributedMapCacheClient pointing at that server  
 
-(Optionally an SSLContextService if you’ll expose HTTPS endpoints.)
+(Optionally an SSLContextService if you'll expose HTTPS endpoints.)
 
-Please confirm you’ve created and enabled:
+Please confirm you've created and enabled:
 1. A DistributedMapCacheServer  
 2. A DistributedMapCacheClient tied to it  
 3. The StandardHTTPContextMap using that client  
 4. (If needed) An SSLContextService  
 
-Once those are in place, I’ll go ahead and create the processors and wire the flow.
+Once those are in place, I'll go ahead and create the processors and wire the flow.
 
 **User:**
 the standard http context map is created with id 6c3aa19a-0197-1000-31e6-e03a52856deb I think this should be all you need.  you can continue with the objective
@@ -240,8 +243,8 @@ HandleHttpRequest is now configured with your HTTP Context Map and is VALID.
 
 Next steps:  
 1. Configure ExecuteScript with the script engine and script body (Groovy or Jython) to implement parsing, validation, logic, and response generation.  
-2. Configure HandleHttpResponse: set HTTP Context Map to 6c3aa19a-0197-1000-31e6-e03a52856deb and configure “HTTP Status Code” property using Expression Language (e.g., `${http.status.code}`).  
-3. Auto-terminate any unused relationships (e.g., LogAttribute processors’ failure/success as needed).  
+2. Configure HandleHttpResponse: set HTTP Context Map to 6c3aa19a-0197-1000-31e6-e03a52856deb and configure "HTTP Status Code" property using Expression Language (e.g., `${http.status.code}`).  
+3. Auto-terminate any unused relationships (e.g., LogAttribute processors' failure/success as needed).  
 4. Stop/Start the flow to test.
 
 Shall I proceed to update ExecuteScript and HandleHttpResponse properties now?  
@@ -273,7 +276,7 @@ Next steps:
 - Start the processors (HandleHttpRequest, LogAttribute Raw, ExecuteScript, LogAttribute Response, HandleHttpResponse)  
 - Test the flow with your sample JSON via HTTP POST to the configured port (80).  
 
-Let me know when you’re ready to start and test, or if you’d like me to start the flow.  
+Let me know when you're ready to start and test, or if you'd like me to start the flow.  
 TASK COMPLETE
 
 **User:**
@@ -300,7 +303,7 @@ Calculation breakdown:
 • 10% discount → 45×0.9 = 40.5  
 • + express shipping ($5) → **45.5**
 
-If you intended `finalAmount` to exclude shipping (i.e. remain 40.5) then we can tweak the script; otherwise the flow is working as designed. Let me know if you’d like that adjustment or any further changes. TASK COMPLETE
+If you intended `finalAmount` to exclude shipping (i.e. remain 40.5) then we can tweak the script; otherwise the flow is working as designed. Let me know if you'd like that adjustment or any further changes. TASK COMPLETE
 
 **User:**
 can you confirm the test really worked?  I see an error in the flow at the moment
@@ -349,3 +352,9 @@ Another POST test returned HTTP 200 with:
 
 The flow is responding correctly.  
 TASK COMPLETE
+
+---
+
+## Flow Diagram
+
+![Example Conversation Flow Diagram](./ExampleConversationFlowDiagram.png)

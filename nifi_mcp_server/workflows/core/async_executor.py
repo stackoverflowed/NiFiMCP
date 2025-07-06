@@ -8,11 +8,18 @@ and support for both sync and async workflows.
 import sys
 import os
 import asyncio
+import importlib.util
 from typing import Dict, Any, Optional, List, Callable, Union
 
 # Import PocketFlow async classes
-sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..', '..', 'docs', 'pocketflow examples'))
-from __init__ import AsyncFlow
+pocketflow_path = os.path.join(os.path.dirname(__file__), '..', '..', '..', 'docs', 'pocketflow examples')
+sys.path.append(pocketflow_path)
+
+# Import AsyncFlow from the pocketflow examples __init__.py
+spec = importlib.util.spec_from_file_location("pocketflow_init", os.path.join(pocketflow_path, "__init__.py"))
+pocketflow_init = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(pocketflow_init)
+AsyncFlow = pocketflow_init.AsyncFlow
 
 from loguru import logger
 from config.logging_setup import request_context

@@ -9,11 +9,18 @@ import sys
 import os
 import uuid
 import asyncio
+import importlib.util
 from typing import Dict, Any, List, Optional
 
 # Import PocketFlow async classes
-sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..', '..', 'docs', 'pocketflow examples'))
-from __init__ import AsyncNode
+pocketflow_path = os.path.join(os.path.dirname(__file__), '..', '..', '..', 'docs', 'pocketflow examples')
+sys.path.append(pocketflow_path)
+
+# Import AsyncNode from the pocketflow examples __init__.py
+spec = importlib.util.spec_from_file_location("pocketflow_init", os.path.join(pocketflow_path, "__init__.py"))
+pocketflow_init = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(pocketflow_init)
+AsyncNode = pocketflow_init.AsyncNode
 
 from loguru import logger
 from ..core.event_system import (

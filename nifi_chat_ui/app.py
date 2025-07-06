@@ -1861,26 +1861,21 @@ def run_execution_loop(provider: str, model_name: str, base_sys_prompt: str, use
             # Note: formatted_tools was prepared BEFORE the pruning loop
             response_data = None
             with st.spinner(f"Thinking... (Step {loop_count}/{max_iterations}) / Tokens: ~{current_tokens if 'current_tokens' in locals() else 'N/A'}"):
-                try:
-                    current_loop_logger.info(f"Calling LLM ({provider} - {model_name})...")
-                    response_data = get_llm_response(
-                        messages=llm_context_messages, 
-                        system_prompt=effective_system_prompt,
-                        tools=formatted_tools,
-                        provider=provider,
-                        model_name=model_name,
-                        user_request_id=user_req_id
-                    )
-                    if response_data is None:
-                         st.error("LLM response was empty.")
-                         current_loop_logger.error("LLM response data was None.")
-                         break
-                    else:
-                        current_loop_logger.info(f"Received response from LLM ({provider}).")
-                except Exception as e:
-                    st.error(f"Error calling LLM API: {e}")
-                    current_loop_logger.error(f"Error calling LLM API ({provider}): {e}", exc_info=True)
-                    break
+                current_loop_logger.info(f"Calling LLM ({provider} - {model_name})...")
+                response_data = get_llm_response(
+                    messages=llm_context_messages, 
+                    system_prompt=effective_system_prompt,
+                    tools=formatted_tools,
+                    provider=provider,
+                    model_name=model_name,
+                    user_request_id=user_req_id
+                )
+                if response_data is None:
+                     st.error("LLM response was empty.")
+                     current_loop_logger.error("LLM response data was None.")
+                     break
+                else:
+                    current_loop_logger.info(f"Received response from LLM ({provider}).")
             # ---------------
             
             # --- Process LLM Response --- 
