@@ -45,9 +45,8 @@ class LLMResponse:
 class LLMProvider(ABC):
     """Abstract base class for all LLM providers."""
     
-    def __init__(self, api_key: str, model_name: str):
+    def __init__(self, api_key: str):
         self.api_key = api_key
-        self.model_name = model_name
         self.logger = logger.bind(provider=self.__class__.__name__)
     
     @abstractmethod
@@ -55,6 +54,7 @@ class LLMProvider(ABC):
         self, 
         messages: List[Dict[str, Any]], 
         system_prompt: str, 
+        model_name: str,
         tools: Optional[List[Any]] = None,
         user_request_id: Optional[str] = None,
         action_id: Optional[str] = None
@@ -65,6 +65,7 @@ class LLMProvider(ABC):
         Args:
             messages: List of message dictionaries in OpenAI format
             system_prompt: System prompt to use
+            model_name: Model name to use for this call
             tools: Optional list of tools to make available
             user_request_id: Optional user request ID for logging
             action_id: Optional action ID for logging

@@ -28,20 +28,14 @@ class GeminiClient(LLMProvider):
     """Gemini LLM Provider implementation using Google ADK for MCP integration."""
     
     def __init__(self, config: Dict[str, Any]):
-        # Handle both nested and flat config structures
         if "gemini" in config and isinstance(config["gemini"], dict):
-            # Nested structure: {'gemini': {'api_key': 'key', 'models': [...]}}
             gemini_config = config["gemini"]
             api_key = gemini_config.get("api_key")
-            model_name = gemini_config.get("models", ["gemini-1.5-pro"])[0]
             self.available_models = gemini_config.get("models", ["gemini-1.5-pro", "gemini-1.5-flash"])
         else:
-            # Flat structure: {'GOOGLE_API_KEY': 'key', 'GEMINI_MODELS': [...]}
             api_key = config.get("GOOGLE_API_KEY")
-            model_name = config.get("GEMINI_DEFAULT_MODEL", "gemini-1.5-pro")
             self.available_models = config.get("GEMINI_MODELS", ["gemini-1.5-pro", "gemini-1.5-flash"])
-        
-        super().__init__(api_key, model_name)
+        super().__init__(api_key)
         
         if not api_key:
             raise ValueError("GOOGLE_API_KEY is required for Gemini")
@@ -74,6 +68,7 @@ class GeminiClient(LLMProvider):
         self,
         messages: List[Dict[str, Any]],
         system_prompt: str,
+        model_name: str,
         tools: Optional[List[Any]] = None,
         user_request_id: Optional[str] = None,
         action_id: Optional[str] = None
@@ -83,10 +78,10 @@ class GeminiClient(LLMProvider):
         
         try:
             if self.adk_agent and ADK_AVAILABLE:
-                return self._send_with_adk(messages, system_prompt, bound_logger)
+                return self._send_with_adk(messages, system_prompt, model_name, bound_logger)
             else:
                 # Fallback to manual implementation if ADK is not available
-                return self._send_with_manual_implementation(messages, system_prompt, tools, bound_logger)
+                return self._send_with_manual_implementation(messages, system_prompt, model_name, tools, bound_logger)
                 
         except Exception as e:
             bound_logger.error(f"Gemini API error: {e}", exc_info=True)
@@ -99,7 +94,7 @@ class GeminiClient(LLMProvider):
                 error=error_message
             )
     
-    def _send_with_adk(self, messages: List[Dict[str, Any]], system_prompt: str, bound_logger) -> LLMResponse:
+    def _send_with_adk(self, messages: List[Dict[str, Any]], system_prompt: str, model_name: str, bound_logger) -> LLMResponse:
         """Send message using Google ADK for proper MCP integration."""
         try:
             # Convert messages to ADK format
@@ -109,7 +104,7 @@ class GeminiClient(LLMProvider):
             self.adk_agent.instruction = system_prompt
             
             # Run the agent
-            bound_logger.info(f"Sending message to ADK agent with model: {self.model_name}")
+            bound_logger.info(f"Sending message to ADK agent with model: {model_name}")
             response = self.adk_agent.run(adk_messages)
             
             # Parse ADK response
@@ -118,7 +113,7 @@ class GeminiClient(LLMProvider):
             
             # Calculate token counts
             token_count_in = self.token_counter.calculate_input_tokens(
-                messages, "gemini", self.model_name, tools=None
+                messages, "gemini", model_name, tools=None
             )
             token_count_out = self.token_counter.count_tokens_gemini(content or "")
             
@@ -133,7 +128,7 @@ class GeminiClient(LLMProvider):
             bound_logger.error(f"ADK execution error: {e}", exc_info=True)
             raise
     
-    def _send_with_manual_implementation(self, messages: List[Dict[str, Any]], system_prompt: str, tools: Optional[List[Any]], bound_logger) -> LLMResponse:
+    def _send_with_manual_implementation(self, messages: List[Dict[str, Any]], system_prompt: str, model_name: str, tools: Optional[List[Any]], bound_logger) -> LLMResponse:
         """Fallback to manual implementation with enhanced error diagnostics."""
         bound_logger.warning("Using manual Gemini implementation (ADK not available)")
         
@@ -149,13 +144,13 @@ class GeminiClient(LLMProvider):
         
         # Create model instance
         model_instance = genai.GenerativeModel(
-            self.model_name,
+            model_name,
             system_instruction=system_prompt
         )
         
         # Calculate input tokens for both success and error cases
         token_count_in = self.token_counter.calculate_input_tokens(
-            messages, "gemini", self.model_name, tools
+            messages, "gemini", model_name, tools
         )
         
         # Initialize function_declarations in broader scope for error handling
@@ -184,7 +179,7 @@ class GeminiClient(LLMProvider):
             # LLM Debug Logging - Log the request being sent to Gemini
             llm_request_data = {
                 "provider": "gemini",
-                "model": self.model_name,
+                "model": model_name,
                 "messages": messages,
                 "tools": [{"name": getattr(t, 'name', 'unknown'), "description": getattr(t, 'description', 'N/A')} for t in function_declarations] if function_declarations else None
             }
@@ -232,9 +227,10 @@ class GeminiClient(LLMProvider):
                 "tool_calls_count": len(parsed_response.tool_calls) if parsed_response.tool_calls else 0,
                 "token_count_in": parsed_response.token_count_in,
                 "token_count_out": parsed_response.token_count_out,
-                "error": parsed_response.error
+                "error": parsed_response.error,
+                "full_response": parsed_response.content if parsed_response.content else None
             }
-            bound_logger.bind(interface="llm", direction="response", data=llm_response_data).debug("Received from Gemini LLM")
+            bound_logger.bind(interface="llm", direction="response", data=llm_response_data).debug("llm-response")
             
             return parsed_response
             
@@ -471,26 +467,43 @@ class GeminiClient(LLMProvider):
             if tool_params:
                 schema_issues = []
                 
-                # Check for empty or missing required fields
-                if not tool_params.get('properties'):
-                    schema_issues.append("No properties defined")
-                
-                # Check for complex nested objects that Gemini might struggle with
-                properties = tool_params.get('properties', {})
-                for prop_name, prop_def in properties.items():
-                    if isinstance(prop_def, dict):
-                        prop_type = prop_def.get('type_') or prop_def.get('type')
-                        
-                        if prop_type == 'OBJECT' and not prop_def.get('properties'):
-                            schema_issues.append(f"Property '{prop_name}' is OBJECT type but lacks properties definition")
-                        elif prop_type == 'ARRAY':
-                            items = prop_def.get('items', {})
-                            if isinstance(items, dict) and (items.get('type_') == 'OBJECT' or items.get('type') == 'object') and not items.get('properties'):
-                                schema_issues.append(f"Property '{prop_name}' array items lack properties definition")
-                        
-                        # Check for missing required type field
-                        if not prop_type:
-                            schema_issues.append(f"Property '{prop_name}' missing type definition")
+                # Handle protobuf objects properly - they don't have .get() method
+                # Convert to dict-like access for analysis
+                try:
+                    # Check for empty or missing required fields
+                    properties = None
+                    if hasattr(tool_params, 'properties'):
+                        properties = tool_params.properties
+                    elif isinstance(tool_params, dict):
+                        properties = tool_params.get('properties')
+                    
+                    if not properties:
+                        schema_issues.append("No properties defined")
+                    else:
+                        # Check for complex nested objects that Gemini might struggle with
+                        if isinstance(properties, dict):
+                            # Regular dict access
+                            for prop_name, prop_def in properties.items():
+                                if isinstance(prop_def, dict):
+                                    prop_type = prop_def.get('type_') or prop_def.get('type')
+                                    
+                                    if prop_type == 'OBJECT' and not prop_def.get('properties'):
+                                        schema_issues.append(f"Property '{prop_name}' is OBJECT type but lacks properties definition")
+                                    elif prop_type == 'ARRAY':
+                                        items = prop_def.get('items', {})
+                                        if isinstance(items, dict) and (items.get('type_') == 'OBJECT' or items.get('type') == 'object') and not items.get('properties'):
+                                            schema_issues.append(f"Property '{prop_name}' array items lack properties definition")
+                                    
+                                    # Check for missing required type field
+                                    if not prop_type:
+                                        schema_issues.append(f"Property '{prop_name}' missing type definition")
+                        else:
+                            # Protobuf-like object - safer to just note it exists
+                            bound_logger.debug(f"Tool '{tool_name}' has protobuf-style properties object")
+                    
+                except Exception as e:
+                    bound_logger.error(f"Error analyzing schema for tool '{tool_name}': {e}")
+                    schema_issues.append(f"Schema analysis failed: {e}")
                 
                 if schema_issues:
                     bound_logger.error(f"Potential schema issues in '{tool_name}': {', '.join(schema_issues)}")

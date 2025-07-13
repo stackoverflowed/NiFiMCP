@@ -18,7 +18,6 @@ class AnthropicClient(LLMProvider):
     """Anthropic LLM Provider implementation."""
     
     def __init__(self, config: Dict[str, Any]):
-        # Handle both nested and flat config structures
         if "anthropic" in config:
             anthropic_config = config["anthropic"]
             api_key = anthropic_config.get("api_key")
@@ -26,9 +25,7 @@ class AnthropicClient(LLMProvider):
         else:
             api_key = config.get("ANTHROPIC_API_KEY")
             self.available_models = config.get("ANTHROPIC_MODELS", ["claude-3-opus-20240229", "claude-3-sonnet-20240229"])
-        
-        model_name = self.available_models[0] if self.available_models else "claude-3-opus-20240229"
-        super().__init__(api_key, model_name)
+        super().__init__(api_key)
         self.client = anthropic.Anthropic(api_key=api_key)
         self.token_counter = TokenCounter()
         self.logger = logger.bind(provider="Anthropic")
@@ -37,6 +34,7 @@ class AnthropicClient(LLMProvider):
         self,
         messages: List[Dict[str, Any]],
         system_prompt: str,
+        model_name: str,
         tools: Optional[List[Any]] = None,
         user_request_id: Optional[str] = None,
         action_id: Optional[str] = None
@@ -52,7 +50,7 @@ class AnthropicClient(LLMProvider):
         
         try:
             response = self.client.messages.create(
-                model=self.model_name,
+                model=model_name,
                 max_tokens=4096,
                 system=system_prompt,
                 messages=anthropic_messages,

@@ -198,6 +198,17 @@ async def _update_nifi_processor_properties_legacy(
         processor_config_properties = processor_config_properties["properties"]
         local_logger.warning(f"Detected nested 'properties' key in input for processor {processor_id}. Correcting structure.")
 
+    # --- STRIP QUOTES FROM PROPERTY NAMES ---
+    if isinstance(processor_config_properties, dict):
+        cleaned_properties = {}
+        for k, v in processor_config_properties.items():
+            if isinstance(k, str):
+                cleaned_key = k.strip('"\'')
+            else:
+                cleaned_key = k
+            cleaned_properties[cleaned_key] = v
+        processor_config_properties = cleaned_properties
+
     local_logger = local_logger.bind(processor_id=processor_id)
     local_logger.info(f"Executing update_nifi_processor_properties with properties: {processor_config_properties}")
     try:
@@ -261,11 +272,13 @@ async def _update_nifi_processor_properties_legacy(
                 except Exception as e:
                     local_logger.error(f"[Auto-Stop] Failed to stop processor: {e}", exc_info=True)
                     local_logger.bind(interface="nifi", direction="response", data={"error": str(e)}).debug("Received error from NiFi API")
-                    return {"status": "error", "message": f"Failed to auto-stop processor for update: {e}", "entity": None}
+                    name = component_precheck.get("name") if 'component_precheck' in locals() and component_precheck else None
+                    return {"status": "error", "message": f"Failed to auto-stop processor for update: {e}", "entity": None, "name": name if name else None}
             else:
                 error_msg = f"Processor '{component_precheck.get('name', processor_id)}' is RUNNING. Stop it before updating properties or enable Auto-Stop."
                 local_logger.warning(error_msg)
-                return {"status": "error", "message": error_msg, "entity": None}
+                name = component_precheck.get("name") if 'component_precheck' in locals() and component_precheck else None
+                return {"status": "error", "message": error_msg, "entity": None, "name": name if name else None}
         
         if not current_revision:
              raise ToolError(f"Could not retrieve revision for processor {processor_id}.")
@@ -295,11 +308,13 @@ async def _update_nifi_processor_properties_legacy(
         if errors:
             error_msg = f"Property validation failed: {'; '.join(errors)}"
             local_logger.error(error_msg)
+            name = component_precheck.get("name") if component_precheck else None
             return {
                 "status": "error",
                 "message": error_msg,
                 "validation_errors": errors,
-                "entity": None
+                "entity": None,
+                "name": name if name else None
             }
             
         # Proceed with update using resolved properties
@@ -476,15 +491,18 @@ async def _update_nifi_processor_properties_legacy(
     except ValueError as e:
         local_logger.warning(f"Error updating processor properties: {e}")
         local_logger.bind(interface="nifi", direction="response", data={"error": str(e)}).debug("Received error from NiFi API")
-        return {"status": "error", "message": f"Error updating properties: {e}", "entity": None}
+        name = component_precheck.get("name") if 'component_precheck' in locals() and component_precheck else None
+        return {"status": "error", "message": f"Error updating properties: {e}", "entity": None, "name": name if name else None}
     except (NiFiAuthenticationError, ConnectionError, ToolError) as e: # Include ToolError
         local_logger.error(f"API/Tool error updating processor properties: {e}", exc_info=False)
         local_logger.bind(interface="nifi", direction="response", data={"error": str(e)}).debug("Received error from NiFi API")
-        return {"status": "error", "message": f"Failed to update properties: {e}", "entity": None}
+        name = component_precheck.get("name") if 'component_precheck' in locals() and component_precheck else None
+        return {"status": "error", "message": f"Failed to update properties: {e}", "entity": None, "name": name if name else None}
     except Exception as e:
         local_logger.error(f"Unexpected error updating processor properties: {e}", exc_info=True)
         local_logger.bind(interface="nifi", direction="response", data={"error": str(e)}).debug("Received error from NiFi API")
-        return {"status": "error", "message": f"An unexpected error occurred during update: {e}", "entity": None}
+        name = component_precheck.get("name") if 'component_precheck' in locals() and component_precheck else None
+        return {"status": "error", "message": f"An unexpected error occurred during update: {e}", "entity": None, "name": name if name else None}
 
 
 async def _validate_and_resolve_controller_service_properties(
@@ -559,270 +577,6 @@ async def _validate_and_resolve_controller_service_properties(
         errors.append(f"Property validation failed: {e}")
         
     return resolved_properties, warnings, errors
-
-@mcp.tool()
-@tool_phases(["Modify"])
-async def update_controller_service_properties(
-    controller_service_id: str,
-    controller_service_properties: Dict[str, Any]
-) -> Dict:
-    """
-    Updates a controller service's configuration properties by replacing the existing property dictionary.
-    
-    Automatically disables enabled controller services, then performs the update.
-    If the controller service was originally enabled and the update is valid, automatically re-enables it.
-
-    Args:
-        controller_service_id: The UUID of the controller service to update.
-        controller_service_properties: A complete dictionary representing the desired final state of all properties. Cannot be empty.
-
-    Returns:
-        A dictionary with enhanced status information including property update and restart status.
-        Possible status values: "success", "partial_success", "warning", "error"
-    """
-    # Get client and logger from context
-    nifi_client: Optional[NiFiClient] = current_nifi_client.get()
-    local_logger = current_request_logger.get() or logger
-    if not nifi_client:
-        raise ToolError("NiFi client context is not set. This tool requires the X-Nifi-Server-Id header.")
-    if not local_logger:
-         raise ToolError("Request logger context is not set.")
-         
-    # Authentication handled by factory
-    from ..request_context import current_user_request_id, current_action_id
-    user_request_id = current_user_request_id.get() or "-"
-    action_id = current_action_id.get() or "-"
-
-    if not controller_service_properties:
-        error_msg = "The 'controller_service_properties' argument cannot be empty. Fetch current config first."
-        local_logger.warning(f"Validation failed for update_controller_service_properties (ID={controller_service_id}): {error_msg}")
-        raise ToolError(error_msg)
-
-    if not isinstance(controller_service_properties, dict):
-         raise ToolError(f"Invalid 'controller_service_properties' type. Expected dict, got {type(controller_service_properties)}.")
-
-    local_logger = local_logger.bind(controller_service_id=controller_service_id)
-    local_logger.info(f"Executing update_controller_service_properties with properties: {controller_service_properties}")
-    
-    try:
-        local_logger.info(f"Fetching current details for controller service {controller_service_id} before update.")
-        nifi_get_req = {"operation": "get_controller_service_details", "controller_service_id": controller_service_id}
-        local_logger.bind(interface="nifi", direction="request", data=nifi_get_req).debug("Calling NiFi API")
-        current_entity = await nifi_client.get_controller_service_details(controller_service_id, user_request_id=user_request_id, action_id=action_id)
-        component_precheck = current_entity.get("component", {})
-        original_state = component_precheck.get("state")  # Capture original state (ENABLED/DISABLED)
-        current_revision = current_entity.get("revision")
-        precheck_resp = {"id": controller_service_id, "state": original_state, "version": current_revision.get('version') if current_revision else None}
-        local_logger.bind(interface="nifi", direction="response", data=precheck_resp).debug("Received from NiFi API (pre-check)")
-        
-        local_logger.info(f"Controller service original state: {original_state}")
-        
-        # --- AUTO-DISABLE LOGIC ---
-        if original_state == "ENABLED":
-            local_logger.info(f"Controller service '{component_precheck.get('name', controller_service_id)}' is ENABLED. Auto-disabling for property update.")
-            
-            try:
-                nifi_request_data = {"operation": "disable_controller_service", "controller_service_id": controller_service_id}
-                local_logger.bind(interface="nifi", direction="request", data=nifi_request_data).debug("Calling NiFi API")
-                await nifi_client.disable_controller_service(controller_service_id, user_request_id=user_request_id, action_id=action_id)
-                local_logger.bind(interface="nifi", direction="response", data={"status": "success"}).debug("Received from NiFi API")
-                
-                # Wait for controller service to fully disable
-                max_wait_seconds = 15
-                for attempt in range(max_wait_seconds):
-                    updated_details = await nifi_client.get_controller_service_details(controller_service_id, user_request_id=user_request_id, action_id=action_id)
-                    current_state = updated_details.get("component", {}).get("state")
-                    if current_state == "DISABLED":
-                        local_logger.info(f"[Auto-Disable] Confirmed controller service {controller_service_id} is disabled")
-                        # Update our references with the latest details
-                        current_entity = updated_details
-                        component_precheck = current_entity.get("component", {})
-                        current_revision = current_entity.get("revision")
-                        break
-                    
-                    if attempt == max_wait_seconds - 1:
-                        raise ToolError(f"Controller service {controller_service_id} did not disable after {max_wait_seconds} seconds")
-                    
-                    local_logger.info(f"[Auto-Disable] Waiting for controller service to disable (attempt {attempt + 1}/{max_wait_seconds})")
-                    await asyncio.sleep(1)
-
-            except Exception as e:
-                local_logger.error(f"[Auto-Disable] Failed to disable controller service: {e}", exc_info=True)
-                local_logger.bind(interface="nifi", direction="response", data={"error": str(e)}).debug("Received error from NiFi API")
-                return {"status": "error", "message": f"Failed to auto-disable controller service for update: {e}", "entity": None}
-        
-        if not current_revision:
-             raise ToolError(f"Could not retrieve revision for controller service {controller_service_id}.")
-             
-        # Get service type for validation
-        service_type = component_precheck.get("type")
-        if not service_type:
-            raise ToolError(f"Could not determine service type for {controller_service_id}")
-            
-        # Get process group ID for service resolution
-        process_group_id = component_precheck.get("parentGroupId")
-        if not process_group_id:
-            raise ToolError(f"Could not determine process group for service {controller_service_id}")
-            
-        # Validate and resolve properties
-        resolved_properties, warnings, errors = await _validate_and_resolve_controller_service_properties(
-            service_type=service_type,
-            properties=controller_service_properties,
-            process_group_id=process_group_id,
-            nifi_client=nifi_client,
-            logger=local_logger,
-            user_request_id=user_request_id,
-            action_id=action_id
-        )
-        
-        # Handle validation errors
-        if errors:
-            error_msg = f"Property validation failed: {'; '.join(errors)}"
-            local_logger.error(error_msg)
-            return {
-                "status": "error",
-                "message": error_msg,
-                "validation_errors": errors,
-                "entity": None
-            }
-            
-        # Proceed with update using resolved properties
-        nifi_update_req = {
-            "operation": "update_controller_service_properties",
-            "controller_service_id": controller_service_id,
-            "properties": resolved_properties
-        }
-        local_logger.bind(interface="nifi", direction="request", data=nifi_update_req).debug("Calling NiFi API")
-        updated_entity = await nifi_client.update_controller_service_properties(
-            controller_service_id=controller_service_id,
-            properties=resolved_properties,
-            user_request_id=user_request_id,
-            action_id=action_id
-        )
-        filtered_updated_entity = filter_controller_service_data(updated_entity)
-        local_logger.bind(interface="nifi", direction="response", data=filtered_updated_entity).debug("Received from NiFi API")
-
-        local_logger.info(f"Successfully updated properties for controller service {controller_service_id}")
-
-        component = updated_entity.get("component", {})
-        validation_status = component.get("validationStatus", "UNKNOWN")
-        validation_errors = component.get("validationErrors", [])
-        name = component.get("name", controller_service_id)
-
-        # Initialize status tracking
-        property_update_status = {"status": "success"}
-        restart_status = {"status": "not_attempted", "reason": "controller service was not originally enabled"}
-        
-        # --- AUTO-ENABLE LOGIC ---
-        if original_state == "ENABLED" and validation_status == "VALID":
-            local_logger.info(f"[Auto-Enable] Controller service was originally enabled and validation is VALID. Attempting re-enable.")
-            restart_status = {"status": "attempting"}
-            
-            try:
-                # Enable the controller service
-                nifi_enable_req = {"operation": "enable_controller_service", "controller_service_id": controller_service_id}
-                local_logger.bind(interface="nifi", direction="request", data=nifi_enable_req).debug("Calling NiFi API")
-                await nifi_client.enable_controller_service(controller_service_id, user_request_id=user_request_id, action_id=action_id)
-                local_logger.bind(interface="nifi", direction="response", data={"status": "success"}).debug("Received from NiFi API")
-                
-                # Wait for controller service to fully enable
-                max_wait_seconds = 15
-                for attempt in range(max_wait_seconds):
-                    reenabled_details = await nifi_client.get_controller_service_details(controller_service_id, user_request_id=user_request_id, action_id=action_id)
-                    current_state = reenabled_details.get("component", {}).get("state")
-                    if current_state == "ENABLED":
-                        local_logger.info(f"[Auto-Enable] Confirmed controller service {controller_service_id} is enabled")
-                        # Update the entity with the latest details
-                        updated_entity = reenabled_details
-                        filtered_updated_entity = filter_controller_service_data(updated_entity)
-                        restart_status = {"status": "success", "final_state": "ENABLED"}
-                        break
-                    
-                    if attempt == max_wait_seconds - 1:
-                        restart_status = {
-                            "status": "timeout",
-                            "reason": f"Controller service did not enable after {max_wait_seconds} seconds",
-                            "current_state": current_state
-                        }
-                        break
-                    
-                    local_logger.info(f"[Auto-Enable] Waiting for controller service to enable (attempt {attempt + 1}/{max_wait_seconds})")
-                    await asyncio.sleep(1)
-
-            except Exception as e:
-                local_logger.error(f"[Auto-Enable] Failed to re-enable controller service: {e}", exc_info=True)
-                restart_status = {
-                    "status": "failed",
-                    "reason": f"Enable operation failed: {e}",
-                    "error_type": type(e).__name__
-                }
-        elif original_state == "ENABLED" and validation_status != "VALID":
-            restart_status = {
-                "status": "skipped",
-                "reason": f"Validation status is {validation_status}, cannot auto-enable",
-                "validation_errors": validation_errors
-            }
-            local_logger.warning(f"[Auto-Enable] Skipping auto-enable due to validation status: {validation_status}")
-
-        # Return appropriate response based on status
-        if restart_status["status"] == "success":
-            return {
-                "status": "success",
-                "message": f"Controller service '{name}' properties updated and re-enabled successfully.",
-                "property_update": property_update_status,
-                "restart_status": restart_status,
-                "entity": filtered_updated_entity
-            }
-        elif restart_status["status"] == "skipped":
-            return {
-                "status": "warning",
-                "message": f"Controller service '{name}' properties updated but left disabled due to validation errors.",
-                "property_update": property_update_status,
-                "restart_status": restart_status,
-                "entity": filtered_updated_entity,
-                "user_action_required": "Review validation errors and manually enable when resolved."
-            }
-        elif restart_status["status"] in ["failed", "timeout"]:
-            # Property update succeeded but enable failed
-            user_action = "Please manually enable the controller service if desired."
-            if restart_status["status"] == "timeout":
-                user_action = f"Controller service may still be enabling (current state: {restart_status.get('current_state', 'unknown')}). Check service status."
-                
-            return {
-                "status": "partial_success",
-                "message": f"Controller service '{name}' properties updated successfully, but re-enable failed: {restart_status['reason']}.",
-                "property_update": property_update_status,
-                "restart_status": restart_status,
-                "entity": filtered_updated_entity,
-                "user_action_required": user_action
-            }
-        else:
-            # Property update succeeded, no re-enable needed or attempted
-            return {
-                "status": "success",
-                "message": f"Controller service '{name}' properties updated successfully.",
-                "property_update": property_update_status,
-                "restart_status": restart_status,
-                "entity": filtered_updated_entity
-            }
-
-        # Add warnings to response if any
-        if warnings:
-            property_update_status["warnings"] = warnings
-
-    except ValueError as e:
-        local_logger.warning(f"Error updating controller service properties: {e}")
-        local_logger.bind(interface="nifi", direction="response", data={"error": str(e)}).debug("Received error from NiFi API")
-        return {"status": "error", "message": f"Error updating properties: {e}", "entity": None}
-    except (NiFiAuthenticationError, ConnectionError, ToolError) as e:
-        local_logger.error(f"API/Tool error updating controller service properties: {e}", exc_info=False)
-        local_logger.bind(interface="nifi", direction="response", data={"error": str(e)}).debug("Received error from NiFi API")
-        return {"status": "error", "message": f"Failed to update properties: {e}", "entity": None}
-    except Exception as e:
-        local_logger.error(f"Unexpected error updating controller service properties: {e}", exc_info=True)
-        local_logger.bind(interface="nifi", direction="response", data={"error": str(e)}).debug("Received error from NiFi API")
-        return {"status": "error", "message": f"An unexpected error occurred during update: {e}", "entity": None}
-
 
 @mcp.tool()
 @tool_phases(["Modify"])
@@ -2019,6 +1773,23 @@ async def update_nifi_processors_properties(
     
     results = []
     
+    # STRIP QUOTES FROM PROPERTY NAMES IN BATCH UPDATES
+    cleaned_updates = []
+    for update in updates:
+        properties = update.get("properties", {})
+        if isinstance(properties, dict):
+            cleaned_properties = {}
+            for k, v in properties.items():
+                if isinstance(k, str):
+                    cleaned_key = k.strip('"\'')
+                else:
+                    cleaned_key = k
+                cleaned_properties[cleaned_key] = v
+            update = update.copy()
+            update["properties"] = cleaned_properties
+        cleaned_updates.append(update)
+    updates = cleaned_updates
+    
     for i, update in enumerate(updates):
         processor_id = update["processor_id"]
         properties = update["properties"]
@@ -2033,12 +1804,14 @@ async def update_nifi_processors_properties(
                 processor_id=processor_id,
                 processor_config_properties=properties
             )
-            
             # Add metadata to the result
             result["processor_id"] = processor_id
-            result["processor_name"] = processor_name
+            # Use the real processor name from the result if available
+            if "name" in result and result["name"]:
+                result["processor_name"] = result["name"]
+            else:
+                result["processor_name"] = processor_name
             result["request_index"] = i
-            
             results.append(result)
             
         except Exception as e:

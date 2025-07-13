@@ -25,8 +25,7 @@ class PerplexityClient(LLMProvider):
             api_key = config.get("PERPLEXITY_API_KEY")
             self.available_models = config.get("PERPLEXITY_MODELS", ["pplx-70b-chat", "pplx-7b-chat"])
         
-        model_name = self.available_models[0] if self.available_models else "pplx-70b-chat"
-        super().__init__(api_key, model_name)
+        super().__init__(api_key)
         self.client = OpenAI(api_key=api_key, base_url="https://api.perplexity.ai")
         self.token_counter = TokenCounter()
         self.logger = logger.bind(provider="Perplexity")
@@ -35,6 +34,7 @@ class PerplexityClient(LLMProvider):
         self,
         messages: List[Dict[str, Any]],
         system_prompt: str,
+        model_name: str,
         tools: Optional[List[Any]] = None,
         user_request_id: Optional[str] = None,
         action_id: Optional[str] = None
@@ -73,7 +73,7 @@ Please keep this in mind when asking questions. I'll provide helpful guidance an
         
         try:
             response = self.client.chat.completions.create(
-                model=self.model_name,
+                model=model_name,
                 messages=perplexity_messages,
                 # Don't send tools to Perplexity
             )

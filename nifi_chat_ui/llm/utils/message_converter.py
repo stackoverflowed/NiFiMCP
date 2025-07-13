@@ -294,7 +294,7 @@ class MessageConverter:
         Returns:
             Dictionary with content and tool_calls in OpenAI format
         """
-        content = None
+        content_parts = []
         tool_calls = []
         
         logger.debug(f"Converting {len(response_parts)} Gemini response parts to OpenAI format")
@@ -307,8 +307,52 @@ class MessageConverter:
             
             # Check for text content
             if hasattr(part, 'text') and part.text:
-                content = part.text
-                logger.debug(f"Found text content: {content[:100]}...")
+                text_content = part.text
+                logger.debug(f"Found text content: {text_content[:100]}...")
+                
+                # Check for repeated content within the same text part
+                # This can happen when Gemini generates repeated responses
+                if text_content:
+                    # Simple heuristic: if the text contains the same sentence repeated multiple times,
+                    # try to extract just one instance
+                    lines = text_content.split('\n')
+                    if len(lines) > 1:
+                        # Check if we have repeated lines
+                        unique_lines = []
+                        seen_lines = set()
+                        for line in lines:
+                            line_stripped = line.strip()
+                            if line_stripped and line_stripped not in seen_lines:
+                                unique_lines.append(line)
+                                seen_lines.add(line_stripped)
+                            elif line_stripped:
+                                # Found repeated line - log it
+                                logger.warning(f"Detected repeated line in Gemini response: {line_stripped[:100]}...")
+                        
+                        # If we found repeated lines, use the deduplicated version
+                        if len(unique_lines) < len(lines):
+                            text_content = '\n'.join(unique_lines)
+                            logger.info(f"Deduplicated response content: {len(lines)} lines -> {len(unique_lines)} lines")
+                    
+                    # Check for repeated sentences within the text
+                    sentences = text_content.split('. ')
+                    if len(sentences) > 1:
+                        unique_sentences = []
+                        seen_sentences = set()
+                        for sentence in sentences:
+                            sentence_stripped = sentence.strip().rstrip('.')
+                            if sentence_stripped and sentence_stripped not in seen_sentences:
+                                unique_sentences.append(sentence)
+                                seen_sentences.add(sentence_stripped)
+                            elif sentence_stripped:
+                                logger.warning(f"Detected repeated sentence in Gemini response: {sentence_stripped[:100]}...")
+                        
+                        # If we found repeated sentences, use the deduplicated version
+                        if len(unique_sentences) < len(sentences):
+                            text_content = '. '.join(unique_sentences)
+                            logger.info(f"Deduplicated response content: {len(sentences)} sentences -> {len(unique_sentences)} sentences")
+                    
+                    content_parts.append(text_content)
             
             # Check for function calls
             if hasattr(part, 'function_call') and part.function_call:
@@ -344,9 +388,19 @@ class MessageConverter:
                 else:
                     logger.debug(f"Part {i} does not have function_call attribute")
         
-        logger.debug(f"Converted to: content={content is not None}, tool_calls={len(tool_calls)}")
+        # Combine all content parts
+        combined_content = '\n'.join(content_parts) if content_parts else None
+        
+        # Additional check for repeated content across combined parts
+        if combined_content and len(content_parts) > 1:
+            # Check if all parts are identical (another form of repetition)
+            if all(part == content_parts[0] for part in content_parts):
+                combined_content = content_parts[0]
+                logger.info(f"Detected identical content parts, using single instance instead of {len(content_parts)} repetitions")
+        
+        logger.debug(f"Converted to: content={combined_content is not None}, tool_calls={len(tool_calls)}")
         
         return {
-            "content": content,
+            "content": combined_content,
             "tool_calls": tool_calls if tool_calls else None
         } 

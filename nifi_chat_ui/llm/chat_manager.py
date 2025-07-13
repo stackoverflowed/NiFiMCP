@@ -58,44 +58,29 @@ class ChatManager:
         user_request_id: Optional[str] = None,
         action_id: Optional[str] = None,
         selected_nifi_server_id: Optional[str] = None,
-        tools: Optional[List[Dict[str, Any]]] = None  # Add tools parameter
+        tools: Optional[List[Dict[str, Any]]] = "auto"  # Use "auto" as default to distinguish from None
     ) -> Dict[str, Any]:
         """
         Get response from specified LLM provider.
         
         Args:
-            messages: List of message dictionaries in OpenAI format
-            system_prompt: System prompt to use
-            provider: LLM provider name (openai, gemini, anthropic, perplexity)
+            messages: Chat messages
+            system_prompt: System prompt
+            provider: LLM provider name
             model_name: Model name for the provider
-            user_request_id: Optional user request ID for logging
-            action_id: Optional action ID for logging
-            
-        Returns:
-            Dictionary with response data in standardized format
+            user_request_id: Optional user request ID
+            action_id: Optional action ID
+            selected_nifi_server_id: Optional NiFi server ID
+            tools: Tools to use. "auto" = fetch from MCP, None = no tools, List = use provided tools
         """
-        bound_logger = self.logger.bind(
-            user_request_id=user_request_id, 
-            action_id=action_id,
-            provider=provider,
-            model=model_name
-        )
-        
-        # Check if provider is available
-        if provider not in self.providers:
-            error_msg = f"Provider '{provider}' not available. Available providers: {list(self.providers.keys())}"
-            bound_logger.error(error_msg)
-            return {"error": error_msg}
-        
-        provider_instance = self.providers[provider]
-        
-        # Validate model
-        if not provider_instance.validate_model(model_name):
-            error_msg = f"Model '{model_name}' not available for provider '{provider}'"
-            bound_logger.error(error_msg)
-            return {"error": error_msg}
+        bound_logger = self.logger.bind(user_request_id=user_request_id, action_id=action_id)
         
         try:
+            # Get provider instance
+            provider_instance = self.providers.get(provider)
+            if not provider_instance:
+                raise ValueError(f"Provider {provider} not available")
+            
             # Check if provider supports tools
             if not provider_instance.supports_tools():
                 bound_logger.info(f"Provider {provider} doesn't support tools - running in Q&A mode")
@@ -104,20 +89,30 @@ class ChatManager:
                 qa_note = f"\n\n**ℹ️ Q&A Mode**: You're using {provider.title()} which operates in Q&A mode only. I can provide guidance and explanations, but cannot execute NiFi operations directly. For full tool support, try OpenAI or Anthropic models."
                 system_prompt += qa_note
             else:
-                # Use passed tools if available, otherwise fetch from MCP
-                if tools is not None:
-                    bound_logger.info(f"Using pre-filtered tools ({len(tools)} tools)")
-                else:
+                # Handle tools parameter correctly
+                if tools == "auto":
+                    # Default behavior: fetch from MCP
                     bound_logger.info("No pre-filtered tools provided, fetching from MCP")
                     # Get tools from MCP with provider-specific schema validation
                     tools = self.mcp_client.get_tools_for_provider(provider, user_request_id, selected_nifi_server_id)
                     
                     if not tools:
                         bound_logger.warning("No tools available from MCP server")
+                elif tools is None:
+                    # Explicitly set to None - don't fetch tools
+                    bound_logger.info("Tools explicitly set to None - no tools will be used")
+                    tools = None
+                elif isinstance(tools, list):
+                    # Pre-filtered tools provided
+                    bound_logger.info(f"Using pre-filtered tools ({len(tools)} tools)")
+                else:
+                    # Invalid tools parameter
+                    bound_logger.warning(f"Invalid tools parameter: {type(tools)}, defaulting to no tools")
+                    tools = None
             
-            # Send message to provider
+            # Send message to provider, always pass model_name
             response = provider_instance.send_message(
-                messages, system_prompt, tools, user_request_id, action_id
+                messages, system_prompt, model_name, tools, user_request_id, action_id
             )
             
             # Convert to dictionary format for compatibility
@@ -125,18 +120,9 @@ class ChatManager:
             
             bound_logger.info(f"Successfully got response from {provider}")
             return result
-            
         except Exception as e:
-            # Use provider-specific error handling
-            error_handler = LLMProviderFactory.get_provider_config(provider).get('error_handler')
-            if error_handler and hasattr(LLMErrorHandler, error_handler):
-                error_method = getattr(LLMErrorHandler, error_handler)
-                user_friendly_error = error_method(e)
-            else:
-                user_friendly_error = LLMErrorHandler.handle_error(e, provider)
-            
-            bound_logger.error(f"Error getting response from {provider}: {e}")
-            return {"error": user_friendly_error}
+            bound_logger.error(f"Error getting LLM response: {e}", exc_info=True)
+            return {"error": str(e)}
     
     def get_available_providers(self) -> List[str]:
         """Get list of available providers."""
