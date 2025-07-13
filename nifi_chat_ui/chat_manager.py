@@ -1394,10 +1394,34 @@ def get_gemini_response(
                 if tools:
                     bound_logger.error(f"Problem likely with one of these tools: {[getattr(t, 'name', 'unknown') for t in tools]}")
                     # Log the specific tool schemas for debugging
-                    for tool in tools:
+                    for i, tool in enumerate(tools):
                         tool_name = getattr(tool, 'name', 'unknown')
                         tool_params = getattr(tool, 'parameters', None)
-                        bound_logger.error(f"Tool '{tool_name}' schema: {str(tool_params)[:500]}...")
+                        bound_logger.error(f"Tool {i+1}/{len(tools)} '{tool_name}' schema: {str(tool_params)[:500]}...")
+                        
+                        # Check for common Gemini schema issues
+                        if tool_params:
+                            schema_issues = []
+                            # Check for empty or missing required fields
+                            if not tool_params.get('properties'):
+                                schema_issues.append("No properties defined")
+                            
+                            # Check for complex nested objects that Gemini might struggle with
+                            properties = tool_params.get('properties', {})
+                            for prop_name, prop_def in properties.items():
+                                if isinstance(prop_def, dict):
+                                    prop_type = prop_def.get('type_')
+                                    if prop_type == 'OBJECT' and not prop_def.get('properties'):
+                                        schema_issues.append(f"Property '{prop_name}' is OBJECT type but lacks properties definition")
+                                    elif prop_type == 'ARRAY':
+                                        items = prop_def.get('items', {})
+                                        if isinstance(items, dict) and items.get('type_') == 'OBJECT' and not items.get('properties'):
+                                            schema_issues.append(f"Property '{prop_name}' array items lack properties definition")
+                            
+                            if schema_issues:
+                                bound_logger.error(f"Potential schema issues in '{tool_name}': {', '.join(schema_issues)}")
+                        else:
+                            bound_logger.error(f"Tool '{tool_name}' has no parameters schema!")
                 
                 # Return an error response for MALFORMED_FUNCTION_CALL
                 return {

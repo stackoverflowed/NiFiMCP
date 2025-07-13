@@ -12,9 +12,60 @@ from loguru import logger
 
 from ..nodes.nifi_node import NiFiWorkflowNode
 from ..registry import WorkflowDefinition, register_workflow
-from nifi_chat_ui.chat_manager import get_llm_response, get_formatted_tool_definitions
+from nifi_chat_ui.llm.chat_manager import ChatManager
+from nifi_chat_ui.llm.mcp.client import MCPClient
 from nifi_chat_ui.mcp_handler import get_available_tools, execute_mcp_tool
 from config.logging_setup import request_context
+
+# Global ChatManager instance for workflow
+_workflow_chat_manager = None
+_workflow_mcp_client = None
+
+def get_workflow_chat_manager() -> ChatManager:
+    """Get or create the ChatManager instance for workflows."""
+    global _workflow_chat_manager
+    
+    if _workflow_chat_manager is None:
+        # Import config
+        import sys
+        import os
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        parent_dir = os.path.dirname(os.path.dirname(os.path.dirname(current_dir)))  # Go up to NiFiMCP root
+        if parent_dir not in sys.path:
+            sys.path.insert(0, parent_dir)
+        
+        from config import settings as config
+        
+        # Use the existing config system
+        config_dict = {
+            'openai': {
+                'api_key': config.OPENAI_API_KEY,
+                'models': config.OPENAI_MODELS
+            },
+            'gemini': {
+                'api_key': config.GOOGLE_API_KEY,
+                'models': config.GEMINI_MODELS
+            },
+            'anthropic': {
+                'api_key': config.ANTHROPIC_API_KEY,
+                'models': config.ANTHROPIC_MODELS
+            },
+            'perplexity': {
+                'api_key': config.PERPLEXITY_API_KEY,
+                'models': config.PERPLEXITY_MODELS
+            }
+        }
+        
+        _workflow_chat_manager = ChatManager(config_dict)
+    
+    return _workflow_chat_manager
+
+def get_workflow_mcp_client() -> MCPClient:
+    """Get or create the MCPClient instance for workflows."""
+    global _workflow_mcp_client
+    if _workflow_mcp_client is None:
+        _workflow_mcp_client = MCPClient()
+    return _workflow_mcp_client
 
 
 class InitializeExecutionNode(NiFiWorkflowNode):
@@ -132,21 +183,13 @@ class InitializeExecutionNode(NiFiWorkflowNode):
                 selected_nifi_server_id=nifi_server_id
             )
             
-            # Get formatted tools for LLM using the actual provider from execution state
-            provider = execution_state.get("provider", "openai")  # Use actual provider
-            formatted_tools = get_formatted_tool_definitions(
-                provider=provider,
-                raw_tools=tools,
-                user_request_id=execution_state.get("user_request_id")
-            )
+            # Return raw tools - ChatManager will handle formatting
+            if tools is None:
+                self.bound_logger.warning("Tool retrieval returned None, using empty list")
+                tools = []
             
-            # Handle case where formatting returns None (e.g., Anthropic not available)
-            if formatted_tools is None:
-                self.bound_logger.warning(f"Tool formatting returned None for provider {provider}, using empty list")
-                formatted_tools = []
-            
-            self.bound_logger.info(f"Prepared {len(formatted_tools)} tools")
-            return formatted_tools
+            self.bound_logger.info(f"Prepared {len(tools)} raw tools (ChatManager will format them)")
+            return tools
             
         except Exception as e:
             self.bound_logger.error(f"Error preparing tools: {e}")
@@ -164,14 +207,16 @@ class InitializeExecutionNode(NiFiWorkflowNode):
             # Extract non-system messages for the LLM call
             non_system_messages = [msg for msg in messages if msg.get("role") != "system"]
             
-            response_data = get_llm_response(
+            # Use new modular ChatManager
+            chat_manager = get_workflow_chat_manager()
+            response_data = chat_manager.get_llm_response(
                 messages=non_system_messages,
                 system_prompt=system_prompt,
-                tools=tools,
                 provider=provider,
                 model_name=model_name,
                 user_request_id=user_request_id,
-                action_id=action_id  # Pass workflow context action ID
+                action_id=action_id,
+                tools=tools
             )
             
             return response_data
@@ -566,21 +611,11 @@ class LLMIterationNode(NiFiWorkflowNode):
                 self.bound_logger.warning("No raw tools available")
                 return []
                 
-            formatted_tools = get_formatted_tool_definitions(
-                provider=provider,
-                raw_tools=raw_tools_list,
-                user_request_id=user_request_id
-            )
+            # Return raw tools - ChatManager will handle formatting
+            if raw_tools_list:
+                self.bound_logger.debug(f"Tools prepared: {len(raw_tools_list)} raw tools (ChatManager will format them)")
             
-            # Handle case where formatting returns None
-            if formatted_tools is None:
-                self.bound_logger.warning(f"Tool formatting returned None for provider {provider}, using empty list")
-                formatted_tools = []
-            
-            if formatted_tools:
-                self.bound_logger.debug(f"Tools prepared for {provider} ({len(formatted_tools)} tools)")
-            
-            return formatted_tools
+            return raw_tools_list
             
         except Exception as e:
             self.bound_logger.error(f"Error preparing tools: {e}", exc_info=True)
@@ -597,14 +632,16 @@ class LLMIterationNode(NiFiWorkflowNode):
             
             self.bound_logger.info(f"Calling LLM ({provider} - {model_name}) with action ID: {action_id}")
             
-            response_data = get_llm_response(
+            # Use new modular ChatManager
+            chat_manager = get_workflow_chat_manager()
+            response_data = chat_manager.get_llm_response(
                 messages=messages,
                 system_prompt=system_prompt,
-                tools=tools,
                 provider=provider,
                 model_name=model_name,
                 user_request_id=user_req_id,
-                action_id=action_id  # Pass workflow context action ID
+                action_id=action_id,
+                tools=tools
             )
             
             if response_data is None:

@@ -57,7 +57,8 @@ class ChatManager:
         model_name: str,
         user_request_id: Optional[str] = None,
         action_id: Optional[str] = None,
-        selected_nifi_server_id: Optional[str] = None
+        selected_nifi_server_id: Optional[str] = None,
+        tools: Optional[List[Dict[str, Any]]] = None  # Add tools parameter
     ) -> Dict[str, Any]:
         """
         Get response from specified LLM provider.
@@ -103,11 +104,16 @@ class ChatManager:
                 qa_note = f"\n\n**ℹ️ Q&A Mode**: You're using {provider.title()} which operates in Q&A mode only. I can provide guidance and explanations, but cannot execute NiFi operations directly. For full tool support, try OpenAI or Anthropic models."
                 system_prompt += qa_note
             else:
-                # Get tools from MCP with provider-specific schema validation
-                tools = self.mcp_client.get_tools_for_provider(provider, user_request_id, selected_nifi_server_id)
-                
-                if not tools:
-                    bound_logger.warning("No tools available from MCP server")
+                # Use passed tools if available, otherwise fetch from MCP
+                if tools is not None:
+                    bound_logger.info(f"Using pre-filtered tools ({len(tools)} tools)")
+                else:
+                    bound_logger.info("No pre-filtered tools provided, fetching from MCP")
+                    # Get tools from MCP with provider-specific schema validation
+                    tools = self.mcp_client.get_tools_for_provider(provider, user_request_id, selected_nifi_server_id)
+                    
+                    if not tools:
+                        bound_logger.warning("No tools available from MCP server")
             
             # Send message to provider
             response = provider_instance.send_message(

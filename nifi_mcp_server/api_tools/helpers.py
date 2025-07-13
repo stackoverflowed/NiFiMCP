@@ -85,22 +85,36 @@ def _format_controller_service_type_summary(service_type_data: Dict) -> Dict:
     }
 
 @mcp.tool()
-@tool_phases(["Build", "Modify"])
-async def lookup_nifi_processor_type(
-    processor_name: str,
+@tool_phases(["Review","Build", "Modify"])
+async def lookup_nifi_processor_types(
+    processor_names: List[str],
     bundle_artifact_filter: str | None = None
-) -> Union[List[Dict], Dict]:
+) -> List[Dict]:
     """
-    Looks up available NiFi processor types by display name, returning key details including the full class name.
+    Looks up available NiFi processor types by display names, returning key details including the full class name.
+    
+    This tool efficiently handles multiple processor name lookups in a single request,
+    ideal for building complex flows that require multiple processor types.
 
     Args:
-        processor_name: The display name (e.g., 'GenerateFlowFile'). Case-insensitive.
+        processor_names: List of processor display names (e.g., ['GenerateFlowFile', 'LogAttribute']). Case-insensitive.
         bundle_artifact_filter: Optional. Filters by bundle artifact (e.g., 'nifi-standard-nar'). Case-insensitive.
+        
+    Example:
+    ```python
+    processor_names = [
+        "GenerateFlowFile",
+        "LogAttribute", 
+        "InvokeHTTP",
+        "UpdateAttribute"
+    ]
+    ```
 
     Returns:
-        - If one match: A dictionary with details.
-        - If multiple matches: A list of matching dictionaries.
-        - If no matches: An empty list.
+        List of dictionaries, each containing:
+        - query: The original processor name that was searched
+        - matches: List of matching processor types (empty if no matches)
+        - match_count: Number of matches found
     """
     # Get client and logger from context
     nifi_client: Optional[NiFiClient] = current_nifi_client.get()
@@ -109,11 +123,16 @@ async def lookup_nifi_processor_type(
         raise ToolError("NiFi client context is not set. This tool requires the X-Nifi-Server-Id header.")
     if not local_logger:
          raise ToolError("Request logger context is not set.")
+    
+    if not processor_names:
+        raise ToolError("The 'processor_names' list cannot be empty.")
+    if not isinstance(processor_names, list):
+        raise ToolError("Invalid 'processor_names' type. Expected a list of strings.")
          
     # Authentication handled by factory
-    local_logger = local_logger.bind(processor_name=processor_name, bundle_artifact_filter=bundle_artifact_filter)
+    local_logger = local_logger.bind(processor_names=processor_names, bundle_artifact_filter=bundle_artifact_filter)
     
-    local_logger.info(f"Looking up processor type details for name: '{processor_name}'")
+    local_logger.info(f"Looking up processor type details for {len(processor_names)} processor names")
     try:
         nifi_req = {"operation": "get_processor_types"}
         local_logger.bind(interface="nifi", direction="request", data=nifi_req).debug("Calling NiFi API")
@@ -121,41 +140,55 @@ async def lookup_nifi_processor_type(
         nifi_resp = {"processor_type_count": len(all_types)}
         local_logger.bind(interface="nifi", direction="response", data=nifi_resp).debug("Received from NiFi API")
 
-        matches = []
-        search_name_lower = processor_name.lower()
         filter_artifact_lower = bundle_artifact_filter.lower() if bundle_artifact_filter else None
-
-        for proc_type in all_types:
-            # Extract relevant fields, ensuring they are strings and lowercased
-            title = proc_type.get("title", "").lower()
-            type_str = proc_type.get("type", "").lower()
-            description = proc_type.get("description", "").lower()
-            tags = [tag.lower() for tag in proc_type.get("tags", [])] # Lowercase all tags
-
-            # Check if the search term is present in any relevant field
-            name_match_found = (
-                search_name_lower in title or
-                search_name_lower in type_str or
-                search_name_lower in description or
-                any(search_name_lower in tag for tag in tags)
-            )
-
-            if name_match_found:
-                # Apply bundle artifact filter if specified
-                if filter_artifact_lower:
-                    bundle = proc_type.get("bundle", {})
-                    artifact = bundle.get("artifact", "").lower()
-                    if artifact == filter_artifact_lower: # Check lowercase artifact
-                        matches.append(_format_processor_type_summary(proc_type))
-                else:
-                    matches.append(_format_processor_type_summary(proc_type))
-
-        local_logger.info(f"Found {len(matches)} match(es) for '{processor_name}'")
+        results = []
         
-        if len(matches) == 1:
-            return matches[0]
-        else:
-            return matches
+        # Process each processor name in the request
+        for processor_name in processor_names:
+            processor_name = str(processor_name).strip()
+            if not processor_name:
+                continue
+                
+            matches = []
+            search_name_lower = processor_name.lower()
+
+            for proc_type in all_types:
+                # Extract relevant fields, ensuring they are strings and lowercased
+                title = proc_type.get("title", "").lower()
+                type_str = proc_type.get("type", "").lower()
+                description = proc_type.get("description", "").lower()
+                tags = [tag.lower() for tag in proc_type.get("tags", [])] # Lowercase all tags
+
+                # Check if the search term is present in any relevant field
+                name_match_found = (
+                    search_name_lower in title or
+                    search_name_lower in type_str or
+                    search_name_lower in description or
+                    any(search_name_lower in tag for tag in tags)
+                )
+
+                if name_match_found:
+                    # Apply bundle artifact filter if specified
+                    if filter_artifact_lower:
+                        bundle = proc_type.get("bundle", {})
+                        artifact = bundle.get("artifact", "").lower()
+                        if artifact == filter_artifact_lower: # Check lowercase artifact
+                            matches.append(_format_processor_type_summary(proc_type))
+                    else:
+                        matches.append(_format_processor_type_summary(proc_type))
+
+            # Add result for this processor name
+            result = {
+                "query": processor_name,
+                "matches": matches,
+                "match_count": len(matches)
+            }
+            results.append(result)
+            local_logger.debug(f"Found {len(matches)} match(es) for '{processor_name}'")
+
+        total_matches = sum(r["match_count"] for r in results)
+        local_logger.info(f"Completed lookup for {len(processor_names)} processor names, {total_matches} total matches found")
+        return results
         
     except (NiFiAuthenticationError, ConnectionError, ToolError) as e:
         local_logger.error(f"API/Tool error looking up processor types: {e}", exc_info=False)

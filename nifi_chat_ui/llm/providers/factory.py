@@ -123,6 +123,19 @@ class LLMProviderFactory:
                     logger.debug(f"Found API key for {provider_name} in nested config")
                     return True
             
+            # Special case for Gemini which uses GOOGLE_API_KEY in nested config
+            if provider_name.lower() == "gemini":
+                # Check nested structure first
+                if "gemini" in config:
+                    gemini_config = config["gemini"]
+                    if isinstance(gemini_config, dict) and gemini_config.get('api_key'):
+                        logger.debug(f"Found API key for gemini in nested config")
+                        return True
+                # Check flat structure as fallback
+                if "GOOGLE_API_KEY" in config and config["GOOGLE_API_KEY"]:
+                    logger.debug(f"Found GOOGLE_API_KEY for gemini in flat config")
+                    return True
+            
             # Also check for flat structure (e.g., config['OPENAI_API_KEY'])
             api_key_field = f"{provider_name.upper()}_API_KEY"
             logger.debug(f"Checking for API key field: {api_key_field}")
@@ -131,12 +144,6 @@ class LLMProviderFactory:
             if api_key_field in config and config[api_key_field]:
                 logger.debug(f"Found API key for {provider_name} in flat config")
                 return True
-            
-            # Special case for Gemini which uses GOOGLE_API_KEY
-            if provider_name.lower() == "gemini":
-                if "GOOGLE_API_KEY" in config and config["GOOGLE_API_KEY"]:
-                    logger.debug(f"Found GOOGLE_API_KEY for gemini in flat config")
-                    return True
             
             logger.warning(f"Missing required API key for {provider_name}")
             return False

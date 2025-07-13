@@ -30,7 +30,8 @@ from ..core.event_system import (
     emit_message_added,
     EventTypes
 )
-from nifi_chat_ui.chat_manager import get_llm_response, get_formatted_tool_definitions
+from nifi_chat_ui.llm.chat_manager import ChatManager
+from nifi_chat_ui.llm.mcp.client import MCPClient
 from nifi_chat_ui.mcp_handler import get_available_tools, execute_mcp_tool
 
 
@@ -48,6 +49,54 @@ class AsyncNiFiWorkflowNode(AsyncNode):
         self.bound_logger = logger
         self.workflow_logger = logger  # For consistency with sync nodes
         self.event_emitter = get_event_emitter()
+        
+        # Initialize ChatManager for new modular architecture
+        self._chat_manager = None
+        self._mcp_client = None
+    
+    def get_chat_manager(self) -> ChatManager:
+        """Get or create the ChatManager instance."""
+        if self._chat_manager is None:
+            # Import config
+            import sys
+            import os
+            current_dir = os.path.dirname(os.path.abspath(__file__))
+            parent_dir = os.path.dirname(os.path.dirname(os.path.dirname(current_dir)))  # Go up to NiFiMCP root
+            if parent_dir not in sys.path:
+                sys.path.insert(0, parent_dir)
+            
+            from config import settings as config
+            
+            # Use the existing config system
+            config_dict = {
+                'openai': {
+                    'api_key': config.OPENAI_API_KEY,
+                    'models': config.OPENAI_MODELS
+                },
+                'gemini': {
+                    'api_key': config.GOOGLE_API_KEY,
+                    'models': config.GEMINI_MODELS
+                },
+                'anthropic': {
+                    'api_key': config.ANTHROPIC_API_KEY,
+                    'models': config.ANTHROPIC_MODELS
+                },
+                'perplexity': {
+                    'api_key': config.PERPLEXITY_API_KEY,
+                    'models': config.PERPLEXITY_MODELS
+                }
+            }
+            
+            self._chat_manager = ChatManager(config_dict)
+            self.bound_logger.info("Initialized new modular ChatManager for workflow")
+        
+        return self._chat_manager
+    
+    def get_mcp_client(self) -> MCPClient:
+        """Get or create the MCPClient instance."""
+        if self._mcp_client is None:
+            self._mcp_client = MCPClient()
+        return self._mcp_client
     
     async def prep_async(self, shared: Dict[str, Any]) -> Dict[str, Any]:
         """Prepare the node execution context."""
@@ -91,14 +140,15 @@ class AsyncNiFiWorkflowNode(AsyncNode):
             
             # Define the sync function to call in executor
             def call_sync_llm():
-                return get_llm_response(
+                chat_manager = self.get_chat_manager()
+                return chat_manager.get_llm_response(
                     messages=non_system_messages,
                     system_prompt=system_prompt,
-                    tools=tools,
                     provider=provider,
                     model_name=model_name,
                     user_request_id=user_request_id,
-                    action_id=action_id
+                    action_id=action_id,
+                    tools=tools
                 )
             
             # Run in thread pool to avoid blocking
@@ -267,26 +317,18 @@ class AsyncNiFiWorkflowNode(AsyncNode):
                 self.bound_logger.warning("No NiFi server ID provided, skipping tools")
                 return []
             
-            # Get available tools
+            # Get available tools (raw tools - ChatManager will handle formatting)
             tools = get_available_tools(
                 phase="All",  # Use "All" for unguided mode
                 selected_nifi_server_id=nifi_server_id
             )
             
-            # Get formatted tools for LLM
-            provider = execution_state.get("provider", "openai")
-            formatted_tools = get_formatted_tool_definitions(
-                provider=provider,
-                raw_tools=tools,
-                user_request_id=execution_state.get("user_request_id")
-            )
+            if tools is None:
+                self.bound_logger.warning("Tool retrieval returned None")
+                tools = []
             
-            if formatted_tools is None:
-                self.bound_logger.warning(f"Tool formatting returned None for provider {provider}")
-                formatted_tools = []
-            
-            self.bound_logger.info(f"Prepared {len(formatted_tools)} tools")
-            return formatted_tools
+            self.bound_logger.info(f"Prepared {len(tools)} raw tools (ChatManager will format them)")
+            return tools
             
         except Exception as e:
             self.bound_logger.error(f"Error preparing tools: {e}")

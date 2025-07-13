@@ -11,6 +11,49 @@ from typing import List, Dict, Any, Optional
 from loguru import logger
 
 
+def _convert_protobuf_to_dict(obj):
+    """
+    Convert protobuf objects to Python dictionaries/lists for JSON serialization.
+    
+    Handles MapComposite, RepeatedComposite, and other protobuf types that 
+    Gemini generates in function call arguments.
+    """
+    # Handle MapComposite objects (like dictionaries)
+    if hasattr(obj, 'items') and callable(obj.items):
+        return {str(key): _convert_protobuf_to_dict(value) for key, value in obj.items()}
+    
+    # Handle RepeatedComposite objects (like lists/arrays)
+    elif hasattr(obj, '__iter__') and not isinstance(obj, (str, bytes, dict)):
+        try:
+            return [_convert_protobuf_to_dict(item) for item in obj]
+        except TypeError:
+            # If iteration fails, convert to string
+            return str(obj)
+    
+    # Handle regular dictionaries
+    elif isinstance(obj, dict):
+        return {str(key): _convert_protobuf_to_dict(value) for key, value in obj.items()}
+    
+    # Handle regular lists
+    elif isinstance(obj, list):
+        return [_convert_protobuf_to_dict(item) for item in obj]
+    
+    # Handle primitive types (int, str, bool, float, None)
+    elif obj is None or isinstance(obj, (int, str, bool, float)):
+        return obj
+    
+    # Handle protobuf enums and other complex objects
+    elif hasattr(obj, 'name'):
+        return str(obj.name)
+    elif hasattr(obj, 'value'):
+        return obj.value
+    
+    # Fallback: convert to string
+    else:
+        logger.debug(f"Converting unknown protobuf type {type(obj)} to string: {obj}")
+        return str(obj)
+
+
 class MessageConverter:
     """Convert messages between different LLM provider formats."""
     
@@ -254,27 +297,34 @@ class MessageConverter:
         content = None
         tool_calls = []
         
-        for part in response_parts:
+        logger.debug(f"Converting {len(response_parts)} Gemini response parts to OpenAI format")
+        
+        for i, part in enumerate(response_parts):
+            # Debug logging to see what we're getting
+            part_type = type(part).__name__
+            part_attrs = [attr for attr in dir(part) if not attr.startswith('_')]
+            logger.debug(f"Part {i}: type={part_type}, attributes={part_attrs}")
+            
+            # Check for text content
             if hasattr(part, 'text') and part.text:
                 content = part.text
+                logger.debug(f"Found text content: {content[:100]}...")
             
+            # Check for function calls
             if hasattr(part, 'function_call') and part.function_call:
                 fc = part.function_call
+                logger.debug(f"Found function call: {fc.name}")
                 
                 # Convert Gemini FunctionCall to OpenAI format
                 try:
                     if hasattr(fc, 'args'):
-                        # Handle MapComposite and similar objects
-                        if hasattr(fc.args, 'items') and callable(fc.args.items):
-                            args = dict(fc.args.items())
-                        elif isinstance(fc.args, dict):
-                            args = fc.args
-                        else:
-                            args = {"raw_args": str(fc.args)}
+                        # Handle protobuf objects (MapComposite, RepeatedComposite, etc.)
+                        args = _convert_protobuf_to_dict(fc.args)
                     else:
                         args = {}
                     
                     args_str = json.dumps(args)
+                    logger.debug(f"Function call args: {args_str}")
                 except Exception as e:
                     logger.error(f"Error converting function call args: {e}")
                     args_str = "{}"
@@ -287,6 +337,14 @@ class MessageConverter:
                         "arguments": args_str
                     }
                 })
+            else:
+                # Log what attributes the part has if it doesn't have function_call
+                if hasattr(part, 'function_call'):
+                    logger.debug(f"Part {i} has function_call attribute but it's {part.function_call}")
+                else:
+                    logger.debug(f"Part {i} does not have function_call attribute")
+        
+        logger.debug(f"Converted to: content={content is not None}, tool_calls={len(tool_calls)}")
         
         return {
             "content": content,

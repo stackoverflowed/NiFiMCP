@@ -114,24 +114,44 @@ class LLMErrorHandler:
     
     @staticmethod
     def extract_gemini_error(exception: Exception) -> str:
-        """Extract user-friendly error from Gemini API exceptions."""
+        """Extract user-friendly error from Gemini API exceptions with enhanced diagnostics."""
         error_str = str(exception)
         
-        # Check for Gemini-specific error patterns
+        # Check for Gemini-specific error patterns with more detailed messages
         if 'MALFORMED_FUNCTION_CALL' in error_str:
-            return "Function call schema error. Please check tool parameter schemas."
+            return ("Function call schema error: Gemini detected malformed function call arguments. "
+                   "This usually indicates an issue with tool parameter schemas. Check the logs for "
+                   "detailed schema analysis that identifies the problematic tool and specific issues.")
         elif 'SAFETY' in error_str:
-            return "Safety filter triggered. Please rephrase your request."
+            return ("Safety filter triggered: Gemini blocked the response due to safety concerns. "
+                   "Try rephrasing your request to avoid triggering content filters.")
         elif 'MAX_TOKENS' in error_str:
-            return "Token limit exceeded. Please try a shorter prompt."
+            return ("Token limit exceeded: Gemini response was truncated due to reaching the maximum "
+                   "token limit. Try using a shorter prompt or breaking the request into smaller parts.")
         elif 'finish_reason' in error_str:
-            # Handle Gemini finish reasons
+            # Handle Gemini finish reasons with more context
             if 'MALFORMED_FUNCTION_CALL' in error_str:
-                return "Function call schema error. Please check tool parameter schemas."
+                return ("Function call schema error: Gemini could not parse the function call arguments. "
+                       "Check the logs for detailed schema validation that identifies specific issues "
+                       "with tool definitions (missing properties, incorrect types, etc.).")
             elif 'SAFETY' in error_str:
-                return "Safety filter triggered. Please rephrase your request."
+                return ("Safety filter triggered: Content was blocked by Gemini's safety filters. "
+                       "Rephrase your request to avoid triggering safety mechanisms.")
             elif 'MAX_TOKENS' in error_str:
-                return "Token limit exceeded. Please try a shorter prompt."
+                return ("Token limit exceeded: Response was truncated. Consider reducing prompt length "
+                       "or simplifying the request.")
+        
+        # Check for API-level errors
+        if 'rate limit' in error_str.lower() or 'quota' in error_str.lower():
+            return ("Rate limit or quota exceeded: Too many requests to Gemini API. "
+                   "Please wait a moment and try again.")
+        elif 'api key' in error_str.lower() or 'authentication' in error_str.lower():
+            return ("Authentication failed: Please check your Google API key configuration.")
+        elif 'model not found' in error_str.lower():
+            return ("Model not found: The specified Gemini model is not available. "
+                   "Please check the model name or try a different model.")
+        elif 'network' in error_str.lower() or 'connection' in error_str.lower():
+            return ("Network error: Failed to connect to Gemini API. Check your internet connection.")
         
         return LLMErrorHandler.handle_error(exception, "Gemini")
     

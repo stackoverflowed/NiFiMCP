@@ -122,11 +122,14 @@ class ToolFormatter:
                 continue
             
             try:
+                # Clean up the schema for Gemini - remove additionalProperties
+                cleaned_schema = ToolFormatter._clean_schema_for_gemini(parameters_schema)
+                
                 # Create Gemini FunctionDeclaration object
                 function_declaration = genai_types.FunctionDeclaration(
                     name=name,
                     description=description,
-                    parameters=parameters_schema or {"type": "object", "properties": {}}
+                    parameters=cleaned_schema
                 )
                 gemini_tools.append(function_declaration)
                 logger.debug(f"Created Gemini FunctionDeclaration for: {name}")
@@ -136,4 +139,34 @@ class ToolFormatter:
                 continue
         
         logger.info(f"Formatted {len(gemini_tools)} tools for Gemini")
-        return gemini_tools 
+        return gemini_tools
+    
+    @staticmethod
+    def _clean_schema_for_gemini(schema: Dict[str, Any]) -> Dict[str, Any]:
+        """Clean up schema for Gemini by removing unsupported fields."""
+        if not isinstance(schema, dict):
+            return {"type": "object", "properties": {}}
+        
+        # Make a deep copy to avoid modifying the original
+        import copy
+        cleaned = copy.deepcopy(schema)
+        
+        # Remove additionalProperties at all levels
+        def remove_additional_properties(obj):
+            if isinstance(obj, dict):
+                obj.pop("additionalProperties", None)
+                for key, value in obj.items():
+                    remove_additional_properties(value)
+            elif isinstance(obj, list):
+                for item in obj:
+                    remove_additional_properties(item)
+        
+        remove_additional_properties(cleaned)
+        
+        # Ensure we have a valid schema structure
+        if not cleaned.get("type"):
+            cleaned["type"] = "object"
+        if not cleaned.get("properties"):
+            cleaned["properties"] = {}
+        
+        return cleaned 
