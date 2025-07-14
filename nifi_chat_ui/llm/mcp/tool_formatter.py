@@ -143,7 +143,16 @@ class ToolFormatter:
     
     @staticmethod
     def _clean_schema_for_gemini(schema: Dict[str, Any]) -> Dict[str, Any]:
-        """Clean up schema for Gemini by removing unsupported fields."""
+        """
+        Clean up schema for Gemini by removing unsupported fields.
+        
+        Gemini uses Protocol Buffer schemas which don't support:
+        - additionalProperties
+        - title fields
+        - default values
+        - anyOf unions
+        - Complex nested structures
+        """
         if not isinstance(schema, dict):
             return {"type": "object", "properties": {}}
         
@@ -151,17 +160,64 @@ class ToolFormatter:
         import copy
         cleaned = copy.deepcopy(schema)
         
-        # Remove additionalProperties at all levels
-        def remove_additional_properties(obj):
+        def clean_recursive(obj):
             if isinstance(obj, dict):
+                # Remove Protocol Buffer incompatible fields
                 obj.pop("additionalProperties", None)
+                obj.pop("title", None)
+                obj.pop("default", None)
+                
+                # Handle anyOf patterns - convert to the first non-null type
+                if "anyOf" in obj:
+                    any_of_types = obj["anyOf"]
+                    # Find the first non-null type
+                    main_type = None
+                    for type_def in any_of_types:
+                        if isinstance(type_def, dict) and type_def.get("type") != "null":
+                            main_type = type_def
+                            break
+                    
+                    if main_type:
+                        # Replace anyOf with the main type
+                        obj.pop("anyOf")
+                        obj.update(main_type)
+                        # Remove any incompatible fields that might have been copied
+                        obj.pop("default", None)
+                        obj.pop("additionalProperties", None)
+                        obj.pop("title", None)
+                    else:
+                        # If only null types, make it a string (fallback)
+                        obj.pop("anyOf")
+                        obj["type"] = "string"
+                
+                # Recursively clean nested objects
                 for key, value in obj.items():
-                    remove_additional_properties(value)
+                    clean_recursive(value)
+                    
             elif isinstance(obj, list):
                 for item in obj:
-                    remove_additional_properties(item)
+                    clean_recursive(item)
         
-        remove_additional_properties(cleaned)
+        clean_recursive(cleaned)
+        
+        # Validate that no incompatible fields remain
+        def validate_gemini_compatibility(obj, path=""):
+            if isinstance(obj, dict):
+                incompatible_fields = []
+                for field in ["additionalProperties", "title", "default", "anyOf"]:
+                    if field in obj:
+                        incompatible_fields.append(field)
+                
+                if incompatible_fields:
+                    logger.warning(f"Gemini-incompatible fields found at {path}: {incompatible_fields}")
+                
+                for key, value in obj.items():
+                    validate_gemini_compatibility(value, f"{path}.{key}" if path else key)
+            elif isinstance(obj, list):
+                for i, item in enumerate(obj):
+                    validate_gemini_compatibility(item, f"{path}[{i}]")
+        
+        validate_gemini_compatibility(cleaned)
         
         # Ensure we have a valid schema structure
         if not cleaned.get("type"):

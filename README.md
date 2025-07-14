@@ -14,6 +14,12 @@ It's ability to read and document existing flows is very good.  It's ability to 
 
 For the latest updates and release notes, see the [GitHub Releases page](https://github.com/ms82119/NiFiMCP/releases).
 
+## Roadmap
+
+My future plan is to work on improving the tool's accuracy and efficiency (reducing the number of tokens needed to acheive the goal).  To do this I will focus on introducing guided workflows which can provide more granular control over the steps and quality, which may also lead to the ability to use less powerful and cheaper LLM's while improving the results.  I feel creating new flows and documenting large flows will particularly benefit from this.
+
+After this I will consider looking into support for more models.  I will say that the Gemini support has been harder than expected due to its protobuf usage, and has slowed my progress along the roadmap, so for this reason I am going to hold off adding other models for now.
+
 ## Setup Instructions
 
 **Note:** These instructions should also be followed after pulling a new version as there may be new package requirements.

@@ -104,6 +104,18 @@ async def _create_nifi_processor_single(
     validated_properties = properties or {}
     warnings = []
     
+    # --- STRIP QUOTES FROM PROPERTY NAMES ---
+    if properties and isinstance(properties, dict):
+        cleaned_properties = {}
+        for k, v in properties.items():
+            if isinstance(k, str):
+                cleaned_key = k.strip('"\'')
+            else:
+                cleaned_key = k
+            cleaned_properties[cleaned_key] = v
+        properties = cleaned_properties
+        validated_properties = properties
+    
     if properties:
         local_logger.info("Applying enhanced property validation and service reference resolution...")
         
@@ -555,6 +567,17 @@ async def create_nifi_controller_service(
     local_logger = local_logger.bind(process_group_id=process_group_id)
     local_logger.info(f"Executing create_controller_service: Type='{service_type}', Name='{name}'")
 
+    # --- STRIP QUOTES FROM PROPERTY NAMES ---
+    if properties and isinstance(properties, dict):
+        cleaned_properties = {}
+        for k, v in properties.items():
+            if isinstance(k, str):
+                cleaned_key = k.strip('"\'')
+            else:
+                cleaned_key = k
+            cleaned_properties[cleaned_key] = v
+        properties = cleaned_properties
+
     try:
         nifi_request_data = {
             "operation": "create_controller_service", 
@@ -784,13 +807,25 @@ async def create_nifi_processors(
             })
             continue
         
+        # --- STRIP QUOTES FROM PROPERTY NAMES ---
+        properties = proc.get("properties")
+        if properties and isinstance(properties, dict):
+            cleaned_properties = {}
+            for k, v in properties.items():
+                if isinstance(k, str):
+                    cleaned_key = k.strip('"\'')
+                else:
+                    cleaned_key = k
+                cleaned_properties[cleaned_key] = v
+            properties = cleaned_properties
+        
         result = await _create_nifi_processor_single(
             processor_type=processor_type,
             name=name,
             position_x=position_x,
             position_y=position_y,
             process_group_id=proc.get("process_group_id", process_group_id),  # Use top-level default with per-record override
-            properties=proc.get("properties")
+            properties=properties
         )
         results.append(result)
     return results
@@ -999,11 +1034,23 @@ async def create_controller_services(
             })
             continue
         
+        # --- STRIP QUOTES FROM PROPERTY NAMES ---
+        properties = cs.get("properties")
+        if properties and isinstance(properties, dict):
+            cleaned_properties = {}
+            for k, v in properties.items():
+                if isinstance(k, str):
+                    cleaned_key = k.strip('"\'')
+                else:
+                    cleaned_key = k
+                cleaned_properties[cleaned_key] = v
+            properties = cleaned_properties
+        
         result = await _create_controller_service_single(
             service_type=service_type,
             name=name,
             process_group_id=process_group_id,
-            properties=cs.get("properties")
+            properties=properties
         )
         results.append(result)
     
@@ -1203,6 +1250,17 @@ async def create_nifi_flow(
                 pos_y = position_dict.get("y")
                 # Get properties (might be nested or top-level depending on LLM mood)
                 properties = proc_def.get("properties", {}) 
+                
+                # --- STRIP QUOTES FROM PROPERTY NAMES ---
+                if properties and isinstance(properties, dict):
+                    cleaned_properties = {}
+                    for k, v in properties.items():
+                        if isinstance(k, str):
+                            cleaned_key = k.strip('"\'')
+                        else:
+                            cleaned_key = k
+                        cleaned_properties[cleaned_key] = v
+                    properties = cleaned_properties
 
                 if not proc_name:
                     results.append({"status": "error", "message": "Processor definition missing 'name'.", "definition": proc_def})
@@ -1570,6 +1628,17 @@ async def create_complete_nifi_flow(
             service_type = cs_def.get("service_type") or cs_def.get("class")
             properties = cs_def.get("properties", {})
             
+            # --- STRIP QUOTES FROM PROPERTY NAMES ---
+            if properties and isinstance(properties, dict):
+                cleaned_properties = {}
+                for k, v in properties.items():
+                    if isinstance(k, str):
+                        cleaned_key = k.strip('"\'')
+                    else:
+                        cleaned_key = k
+                    cleaned_properties[cleaned_key] = v
+                properties = cleaned_properties
+            
             if not all([name, service_type]):
                 error_result = {
                     "status": "error",
@@ -1679,6 +1748,17 @@ async def create_complete_nifi_flow(
             processor_type = proc_def.get("processor_type") or proc_def.get("class")
             position = proc_def.get("position", {})
             properties = proc_def.get("properties", {}).copy()  # Copy to avoid mutating original
+            
+            # --- STRIP QUOTES FROM PROPERTY NAMES ---
+            if properties and isinstance(properties, dict):
+                cleaned_properties = {}
+                for k, v in properties.items():
+                    if isinstance(k, str):
+                        cleaned_key = k.strip('"\'')
+                    else:
+                        cleaned_key = k
+                    cleaned_properties[cleaned_key] = v
+                properties = cleaned_properties
             
             if not all([name, processor_type, position.get("x") is not None, position.get("y") is not None]):
                 error_result = {
