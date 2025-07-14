@@ -8,4 +8,6 @@ build/
 nifimcp.egg-info/
 nifi_chat_ui/system_prompt copy.md
 config.yaml
-docs/
+docs/archived/
+docs/plans/
+docs/libdocs/

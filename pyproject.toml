@@ -24,6 +24,7 @@ dependencies = [
     "pytest>=8.0.0",
     "anyio>=4.0.0",
     "pocketflow>=0.0.2",
+    "google-adk>=1.5.0",
 ]
 
 [tool.setuptools]

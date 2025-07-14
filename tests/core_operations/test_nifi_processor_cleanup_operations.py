@@ -126,7 +126,7 @@ async def test_auto_stop_delete_running_processor(
         client=async_client,
         base_url=base_url,
         tool_name="create_nifi_processors",
-        arguments={"processors": [create_args]},
+        arguments={"processors": [create_args], "process_group_id": test_pg_with_processors.get("pg_id")},
         headers=mcp_headers,
         custom_logger=global_logger
     )

@@ -53,6 +53,8 @@ class WorkflowNode(Node, ABC):
         return logger.bind(
             user_request_id=ctx.get("user_request_id", "-"),
             action_id=ctx.get("action_id", "-"),
+            workflow_id=ctx.get("workflow_id", "-"),
+            step_id=ctx.get("step_id", "-"),
             workflow_name=getattr(self, 'workflow_name', 'unknown'),
             node_name=self.name,
             component="workflow_node"
@@ -65,6 +67,8 @@ class WorkflowNode(Node, ABC):
         return logger.bind(
             user_request_id=ctx.get("user_request_id", "-"),
             action_id=ctx.get("action_id", "-"),
+            workflow_id=ctx.get("workflow_id", "-"),
+            step_id=ctx.get("step_id", "-"),
             workflow_name=getattr(self, 'workflow_name', 'unknown'),
             node_name=self.name,
             interface="workflow"
@@ -79,8 +83,12 @@ class WorkflowNode(Node, ABC):
     
     def _increment_action_count(self):
         """Increment action count and check limits."""
+        # Check limit before incrementing
+        if self._action_count >= self._max_actions:
+            raise WorkflowActionLimitError(
+                f"Action limit ({self._max_actions}) reached for node '{self.name}'"
+            )
         self._action_count += 1
-        self._check_action_limit()
         
     def prep(self, shared: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -88,7 +96,23 @@ class WorkflowNode(Node, ABC):
         
         Override this method to customize context preparation for your workflow node.
         """
+        # Set step_id in request context for logging
+        current_context = request_context.get()
+        current_context["step_id"] = self.name
+        request_context.set(current_context)
+        
         self.bound_logger.info(f"Preparing workflow node: {self.name}")
+        
+        # Log workflow prep with interface logger middleware structure
+        self.workflow_logger.bind(
+            direction="prep",
+            data={
+                "node_name": self.name,
+                "shared_keys": list(shared.keys()) if shared else [],
+                "shared_values": {k: str(v)[:100] for k, v in (shared or {}).items()},  # Truncate values for logging
+                "workflow_name": getattr(self, 'workflow_name', 'unknown')
+            }
+        ).info("workflow-prep")
         
         # Update progress if tracker is available
         if self.progress_tracker:
@@ -119,6 +143,27 @@ class WorkflowNode(Node, ABC):
         Override this method to customize result handling and state updates.
         """
         self.bound_logger.info(f"Post-processing workflow node: {self.name}")
+        
+        # Log workflow post with interface logger middleware structure
+        exec_res_summary = {}
+        if isinstance(exec_res, dict):
+            exec_res_summary = {
+                "status": exec_res.get("status", "unknown"),
+                "message_count": len(exec_res.get("final_messages", [])),
+                "has_messages": "final_messages" in exec_res,
+                "keys": list(exec_res.keys())
+            }
+        
+        self.workflow_logger.bind(
+            direction="post",
+            data={
+                "node_name": self.name,
+                "exec_result_type": type(exec_res).__name__,
+                "exec_result_summary": exec_res_summary,
+                "action_count": self._action_count,
+                "workflow_name": getattr(self, 'workflow_name', 'unknown')
+            }
+        ).info("workflow-post")
         
         # Update progress if tracker is available
         if self.progress_tracker:

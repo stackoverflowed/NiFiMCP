@@ -342,16 +342,239 @@ def get_formatted_tool_definitions(
                 continue
                 
             # Clean up parameters schema for Gemini
+            bound_logger.debug(f"🔍 Starting schema cleaning for tool '{name}'")
             cleaned_schema = parameters_schema.copy() if parameters_schema else {}
+            corrections_applied = []  # Track corrections for this tool
             if isinstance(cleaned_schema, dict):
                 # Always set top-level type to OBJECT if it has properties
                 if "properties" in cleaned_schema:
                     cleaned_schema["type"] = "OBJECT"
                 
+                # Helper function for intelligent type inference
+                def _infer_property_type(prop_name, prop_schema):
+                    """
+                    Intelligently infer the property type based on name, description, and other hints.
+                    
+                    Args:
+                        prop_name: The name of the property
+                        prop_schema: The property schema dictionary
+                        
+                    Returns:
+                        The inferred type as a string (uppercase for Gemini)
+                    """
+                    prop_name_lower = prop_name.lower()
+                    description = prop_schema.get("description", "").lower()
+                    
+                    # Numeric types based on field names
+                    if any(keyword in prop_name_lower for keyword in [
+                        "timeout", "limit", "count", "size", "max", "min", "port", "seconds",
+                        "minutes", "hours", "days", "bytes", "kb", "mb", "gb", "id", "num",
+                        "number", "index", "position", "width", "height", "x", "y", "z"
+                    ]):
+                        # Check if description suggests integer or float
+                        if any(keyword in description for keyword in ["integer", "whole", "count"]):
+                            return "INTEGER"
+                        else:
+                            return "NUMBER"
+                    
+                    # Boolean types
+                    if any(keyword in prop_name_lower for keyword in [
+                        "is_", "has_", "can_", "should_", "enabled", "disabled", "active", 
+                        "inactive", "include", "exclude", "allow", "deny", "required", "optional"
+                    ]):
+                        return "BOOLEAN"
+                    
+                    # Object types based on description
+                    if any(keyword in description for keyword in [
+                        "dictionary", "object", "map", "properties", "configuration", "config",
+                        "settings", "options", "parameters", "attrs", "attributes"
+                    ]):
+                        return "OBJECT"
+                    
+                    # Array types based on description
+                    if any(keyword in description for keyword in [
+                        "list", "array", "collection", "items", "elements", "values", "names",
+                        "ids", "uuids", "entries"
+                    ]):
+                        return "ARRAY"
+                    
+                    # Default to STRING for everything else
+                    return "STRING"
+                
+                # Add debug logging wrapper
+                def _infer_property_type_with_logging(prop_name, prop_schema):
+                    inferred_type = _infer_property_type(prop_name, prop_schema)
+                    bound_logger.debug(f"Inferred type for '{prop_name}': {inferred_type} (based on description: '{prop_schema.get('description', '')[:50]}...')")
+                    return inferred_type
+                
+                # Force type correction for known problematic fields
+                def _force_type_correction(prop_name, existing_type, prop_schema):
+                    """
+                    Force correct types for known problematic fields, overriding incorrect types from MCP server.
+                    
+                    Args:
+                        prop_name: The property name
+                        existing_type: The current type (lowercase)
+                        prop_schema: The property schema
+                        
+                    Returns:
+                        The corrected type (uppercase for Gemini)
+                    """
+                    prop_name_lower = prop_name.lower()
+                    description = prop_schema.get("description", "").lower()
+                    
+                    # CRITICAL: Don't change types for fields that have enums - they must be STRING
+                    if "enum" in prop_schema:
+                        bound_logger.debug(f"Preserving STRING type for '{prop_name}' (has enum values)")
+                        return "STRING"
+                    
+                    # Don't change types for common enum fields even if enum isn't explicit
+                    enum_fields = ["object_type", "search_scope", "target_type", "filter_object_type", "service_type", "processor_type"]
+                    if prop_name_lower in enum_fields:
+                        bound_logger.debug(f"Preserving STRING type for '{prop_name}' (likely enum field)")
+                        return "STRING"
+                    
+                    # SPECIFIC FIELD CORRECTIONS based on error logs:
+                    # Fix specific problematic fields that are incorrectly typed by MCP server
+                    specific_corrections = {
+                        # Fields that should be STRING but are incorrectly typed as OBJECT/NUMBER
+                        "object_id": "STRING",
+                        "query": "STRING", 
+                        "filter_process_group_id": "STRING",
+                        "process_group_id": "STRING",
+                        "processor_id": "STRING",
+                        "connection_id": "STRING",
+                        "target_id": "STRING",
+                        "source_id": "STRING",
+                        "service_id": "STRING",
+                        "port_id": "STRING",
+                        "controller_service_id": "STRING",
+                        "parent_process_group_id": "STRING",
+                        "starting_processor_id": "STRING",
+                        "url": "STRING",
+                        "name": "STRING",
+                        "bundle_artifact_filter": "STRING",
+                        "processor_name": "STRING",
+                        "service_name": "STRING",
+                        "question": "STRING",
+                        
+                        # Fields that should be NUMBER but might be incorrectly typed
+                        "timeout_seconds": "NUMBER",
+                        "polling_timeout": "NUMBER",
+                        "bulletin_limit": "INTEGER",
+                        "max_content_bytes": "INTEGER",
+                        "event_id": "INTEGER",
+                        "position_x": "INTEGER",
+                        "position_y": "INTEGER",
+                        "width": "INTEGER",
+                        "height": "INTEGER",
+                        
+                        # Fields that should be BOOLEAN
+                        "include_bulletins": "BOOLEAN",
+                        "include_suggestions": "BOOLEAN",
+                        "recursive": "BOOLEAN",
+                        "enabled": "BOOLEAN",
+                        "disabled": "BOOLEAN",
+                        "active": "BOOLEAN",
+                        "required": "BOOLEAN",
+                        "optional": "BOOLEAN",
+                        
+                        # Fields that should be OBJECT (configuration/properties)
+                        "properties": "OBJECT",
+                        "config": "OBJECT",
+                        "configuration": "OBJECT",
+                        "settings": "OBJECT",
+                        "options": "OBJECT",
+                        "parameters": "OBJECT",
+                        "headers": "OBJECT",
+                        "payload": "OBJECT",
+                        
+                        # Fields that should be ARRAY
+                        "operations": "ARRAY",
+                        "objects": "ARRAY",
+                        "updates": "ARRAY",
+                        "processors": "ARRAY",
+                        "ports": "ARRAY",
+                        "connections": "ARRAY",
+                        "controller_services": "ARRAY",
+                        "nifi_objects": "ARRAY",
+                        "relationships": "ARRAY",
+                        "auto_terminated_relationships": "ARRAY",
+                        "property_names_to_delete": "ARRAY",
+                    }
+                    
+                    # Check if this field needs specific correction
+                    if prop_name_lower in specific_corrections:
+                        corrected_type = specific_corrections[prop_name_lower]
+                        bound_logger.debug(f"🔍 SPECIFIC MAPPING for '{prop_name}': should be '{corrected_type}', currently '{existing_type.upper()}'")
+                        if corrected_type != existing_type.upper():
+                            bound_logger.debug(f"🎯 SPECIFIC CORRECTION for '{prop_name}': {existing_type.upper()} → {corrected_type}")
+                            # CRITICAL FIX: If we're setting to ARRAY, also add items field to the prop_schema
+                            if corrected_type == "ARRAY" and "items" not in prop_schema:
+                                if prop_name_lower in ["operations", "objects", "updates", "processors", "ports", "connections", "controller_services", "nifi_objects"]:
+                                    prop_schema["items"] = {"type": "OBJECT"}
+                                elif prop_name_lower in ["relationships", "auto_terminated_relationships", "property_names_to_delete"]:
+                                    prop_schema["items"] = {"type": "STRING"}
+                                else:
+                                    prop_schema["items"] = {"type": "OBJECT"}
+                                bound_logger.info(f"🔧 ARRAY ITEMS FIX: Added items field for '{prop_name}': {prop_schema['items']}")
+                            return corrected_type
+                        else:
+                            # Type is already correct, preserve it
+                            bound_logger.debug(f"✅ PRESERVING correct type for '{prop_name}': {existing_type.upper()}")
+                            return existing_type.upper()
+                    
+                    # Fallback to pattern-based corrections (only if not in specific corrections)
+                    # Force numeric types for known timeout/numeric fields that are incorrectly typed as string
+                    if existing_type == "string" and any(keyword in prop_name_lower for keyword in [
+                        "timeout", "limit", "count", "size", "max", "min", "seconds",
+                        "minutes", "hours", "days", "bytes", "port", "position", "width", "height", "x", "y", "z"
+                    ]):
+                        # Check description for more specific type hints
+                        if any(keyword in description for keyword in ["integer", "whole", "count"]):
+                            return "INTEGER"
+                        else:
+                            return "NUMBER"
+                    
+                    # Force boolean types for known boolean fields incorrectly typed as string
+                    if existing_type == "string" and any(keyword in prop_name_lower for keyword in [
+                        "include", "exclude", "enabled", "disabled", "active", "required", "optional"
+                    ]):
+                        return "BOOLEAN"
+                    
+                    # Force object types for properties/config fields incorrectly typed as string
+                    if existing_type == "string" and (
+                        prop_name_lower in ["properties", "config", "configuration", "settings", "options", "parameters", "headers"] or
+                        any(keyword in description for keyword in ["dictionary", "object", "map", "properties"])
+                    ):
+                        return "OBJECT"
+                    
+                    # Force array types for known list fields incorrectly typed as string
+                    if existing_type == "string" and any(keyword in description for keyword in [
+                        "list", "array", "collection", "items", "elements"
+                    ]):
+                        # CRITICAL FIX: If we're setting to ARRAY, also add items field to the prop_schema
+                        if "items" not in prop_schema:
+                            if prop_name_lower in ["operations", "objects", "updates", "processors", "ports", "connections", "controller_services", "nifi_objects"]:
+                                prop_schema["items"] = {"type": "OBJECT"}
+                            elif prop_name_lower in ["relationships", "auto_terminated_relationships", "property_names_to_delete"]:
+                                prop_schema["items"] = {"type": "STRING"}
+                            else:
+                                prop_schema["items"] = {"type": "OBJECT"}
+                            bound_logger.info(f"🔧 ARRAY ITEMS FIX: Added items field for '{prop_name}': {prop_schema['items']}")
+                        return "ARRAY"
+                    
+                    # Return the existing type (uppercase) if no correction needed
+                    return existing_type.upper()
+                
                 # Recursively clean properties and array items
                 def clean_gemini_schema(schema_node):
                     if not isinstance(schema_node, dict):
                         return schema_node
+
+                    # Debug: Check if _prop_name is present
+                    prop_name = schema_node.get("_prop_name", "unknown")
+                    bound_logger.debug(f"🔍 CLEAN SCHEMA: Processing schema for '{prop_name}', type: {schema_node.get('type', 'no-type')}")
 
                     # Remove problematic fields
                     schema_node.pop("additionalProperties", None)
@@ -364,18 +587,42 @@ def get_formatted_tool_definitions(
                         for prop_name, prop_value in list(props.items()): # Use list for safe iteration
                             if isinstance(prop_value, dict):
                                 # Clean nested schema
-                                props[prop_name] = clean_gemini_schema(prop_value.copy())
-                                # Ensure type is specified
+                                prop_value_copy = prop_value.copy()
+                                prop_value_copy["_prop_name"] = prop_name  # Pass property name for array items logic
+                                bound_logger.debug(f"🔍 PROP NAME PASS: Passing '{prop_name}' to clean_gemini_schema")
+                                props[prop_name] = clean_gemini_schema(prop_value_copy)
+                                # Ensure type is specified with intelligent inference and correction
                                 if "type" not in props[prop_name]:
                                     if "properties" in props[prop_name]:
                                         props[prop_name]["type"] = "OBJECT"
+                                        bound_logger.debug(f"Set type to OBJECT for '{prop_name}' (has properties)")
                                     elif "items" in props[prop_name]:
                                         props[prop_name]["type"] = "ARRAY"
+                                        bound_logger.debug(f"Set type to ARRAY for '{prop_name}' (has items)")
                                     else:
-                                        props[prop_name]["type"] = "STRING"
-                                # Convert type to uppercase for Gemini
+                                        # Smart type inference based on field name and description
+                                        inferred_type = _infer_property_type_with_logging(prop_name, props[prop_name])
+                                        props[prop_name]["type"] = inferred_type
+                                else:
+                                    # FORCE type correction for known problematic fields
+                                    existing_type = props[prop_name]["type"].lower()
+                                    bound_logger.debug(f"🔍 Checking correction for '{prop_name}': existing_type='{existing_type}', has_enum={'enum' in props[prop_name]}")
+                                    corrected_type = _force_type_correction(prop_name, existing_type, props[prop_name])
+                                    bound_logger.debug(f"🔍 Correction result for '{prop_name}': {existing_type.upper()} → {corrected_type}")
+                                    
+                                    if corrected_type != existing_type.upper():
+                                        correction_msg = f"'{prop_name}': {existing_type.upper()} → {corrected_type}"
+                                        corrections_applied.append(correction_msg)
+                                        bound_logger.info(f"🔧 SCHEMA CORRECTION: {correction_msg}")
+                                        props[prop_name]["type"] = corrected_type
+                                    else:
+                                        bound_logger.debug(f"✅ Type '{props[prop_name]['type']}' preserved for '{prop_name}' (no correction needed)")
+                                # Convert type to uppercase for Gemini (final step)
                                 if "type" in props[prop_name]:
+                                    original_type = props[prop_name]["type"]
                                     props[prop_name]["type"] = props[prop_name]["type"].upper()
+                                    if original_type != props[prop_name]["type"]:
+                                        bound_logger.debug(f"📝 Final type formatting: '{original_type}' → '{props[prop_name]['type']}' for '{prop_name}'")
                             else:
                                 # Non-dict properties default to STRING type
                                 props[prop_name] = {"type": "STRING"}
@@ -386,6 +633,28 @@ def get_formatted_tool_definitions(
                         if isinstance(schema_node["items"], dict):
                             schema_node["items"] = clean_gemini_schema(schema_node["items"].copy())
                     
+                    # CRITICAL FIX: Ensure ARRAY types have required items field
+                    if schema_node.get("type") == "ARRAY" and "items" not in schema_node:
+                        # Add default items specification based on field name
+                        prop_name = schema_node.get("_prop_name", "unknown")
+                        bound_logger.info(f"🔧 ARRAY ITEMS FIX: Found ARRAY field '{prop_name}' without items field")
+                        if prop_name in ["operations", "objects", "updates", "processors", "ports", "connections", "controller_services", "nifi_objects"]:
+                            schema_node["items"] = {"type": "OBJECT"}
+                            bound_logger.info(f"🔧 ARRAY ITEMS FIX: Added OBJECT items for '{prop_name}'")
+                        elif prop_name in ["relationships", "auto_terminated_relationships", "property_names_to_delete"]:
+                            schema_node["items"] = {"type": "STRING"}
+                            bound_logger.info(f"🔧 ARRAY ITEMS FIX: Added STRING items for '{prop_name}'")
+                        else:
+                            # Generic default
+                            schema_node["items"] = {"type": "OBJECT"}
+                            bound_logger.info(f"🔧 ARRAY ITEMS FIX: Added default OBJECT items for '{prop_name}'")
+                        bound_logger.info(f"🔧 ARRAY ITEMS FIX: Final schema for '{prop_name}': {schema_node}")
+                    elif schema_node.get("type") == "ARRAY" and "items" in schema_node:
+                        prop_name = schema_node.get("_prop_name", "unknown")
+                        bound_logger.debug(f"✅ ARRAY field '{prop_name}' already has items field: {schema_node['items']}")
+                    elif schema_node.get("type") == "ARRAY":
+                        bound_logger.warning(f"⚠️ ARRAY field found but no _prop_name available: {schema_node}")
+                    
                     # Ensure type is uppercase for Gemini
                     if "type" in schema_node:
                         schema_node["type"] = schema_node["type"].upper()
@@ -393,11 +662,22 @@ def get_formatted_tool_definitions(
                         # If no type and no complex structure, default to STRING
                         schema_node["type"] = "STRING"
                     
+                    # Clean up temporary fields
+                    schema_node.pop("_prop_name", None)
+                    
                     return schema_node
 
                 cleaned_schema = clean_gemini_schema(cleaned_schema)
                 # Use a different variable name to avoid confusion if cleaning returns None unexpectedly
                 schema_to_use = cleaned_schema if cleaned_schema is not None else {"type": "OBJECT", "properties": {}}
+
+            # Log summary of corrections applied to this tool
+            if corrections_applied:
+                bound_logger.info(f"📋 Tool '{name}' schema corrections summary: {len(corrections_applied)} corrections applied")
+                for correction in corrections_applied:
+                    bound_logger.info(f"   - {correction}")
+            else:
+                bound_logger.debug(f"✅ Tool '{name}' schema required no corrections")
 
             # Create FunctionDeclaration with the fully cleaned schema
             try:
@@ -420,7 +700,7 @@ def get_formatted_tool_definitions(
             st.warning("No valid tool declarations could be formatted for Gemini.") # Keep UI warning
             return None
         
-        bound_logger.debug(f"Formatted {len(all_declarations)} tools for Gemini.")
+        bound_logger.info(f"🎯 Successfully formatted {len(all_declarations)} tools for Gemini with schema corrections applied.")
         return all_declarations
     else:
         bound_logger.error(f"Unsupported LLM provider for tool formatting: {provider}")
@@ -562,6 +842,59 @@ def calculate_input_tokens(
     return total_tokens
 
 # --- Core LLM Interaction Functions --- #
+
+def _convert_mapcomposite_to_dict(value):
+    """
+    Recursively convert MapComposite objects and other Google Proto objects to serializable dictionaries.
+    
+    Args:
+        value: The value to convert, which may be a MapComposite, list, dict, or primitive type
+        
+    Returns:
+        A JSON-serializable representation of the value
+    """
+    # Handle MapComposite objects
+    if hasattr(value, 'items') and callable(value.items):
+        # This is a MapComposite or similar dict-like object
+        result = {}
+        for key, val in value.items():
+            result[key] = _convert_mapcomposite_to_dict(val)  # Recursive conversion
+        return result
+    
+    # Handle lists (including ListComposite)
+    elif isinstance(value, list) or (hasattr(value, '__iter__') and not isinstance(value, (str, bytes))):
+        try:
+            return [_convert_mapcomposite_to_dict(item) for item in value]
+        except TypeError:
+            # If iteration fails, convert to string
+            return str(value)
+    
+    # Handle dictionaries
+    elif isinstance(value, dict):
+        result = {}
+        for key, val in value.items():
+            result[key] = _convert_mapcomposite_to_dict(val)
+        return result
+    
+    # Handle Google Proto objects and other complex objects
+    elif hasattr(value, '__dict__') or hasattr(value, '_pb') or str(type(value)).startswith('<google'):
+        # Try to convert to dict if it has dict-like behavior
+        if hasattr(value, 'items') and callable(value.items):
+            result = {}
+            for key, val in value.items():
+                result[key] = _convert_mapcomposite_to_dict(val)
+            return result
+        else:
+            # Fall back to string representation
+            return str(value)
+    
+    # Handle primitive types - test if JSON serializable
+    else:
+        try:
+            json.dumps(value)
+            return value
+        except (TypeError, OverflowError):
+            return str(value)
 
 def get_gemini_response(
     messages: List[Dict[str, Any]], 
@@ -916,6 +1249,9 @@ def get_gemini_response(
         response_content = None
         response_tool_calls = []
         
+        # Calculate token counts (needed for both success and error cases)
+        token_count_in = calculate_input_tokens(messages, "Gemini", model_name, tools)
+        
         # Check for function calls in the response parts with better error handling
         if response_parts:
             bound_logger.debug(f"Processing {len(response_parts)} parts from response")
@@ -941,43 +1277,37 @@ def get_gemini_response(
                         # More careful args handling with improved MapComposite support
                         if hasattr(fc, 'args'):
                             try:
+                                # Debug: log the raw fc.args before conversion
+                                bound_logger.debug(f"Function call args type: {type(fc.args)}, value: {fc.args}")
+                                
                                 # Handle MapComposite and similar objects more robustly
                                 if hasattr(fc.args, 'items') and callable(fc.args.items):
                                     # Convert MapComposite to plain dict with safe serialization
                                     safe_args = {}
                                     for key, value in fc.args.items():
-                                        # Convert any complex objects to serializable types
-                                        if hasattr(value, '__dict__') or hasattr(value, '_pb') or str(type(value)).startswith('<google'):
-                                            safe_args[key] = str(value)
-                                        elif hasattr(value, 'items') and callable(value.items):
-                                            # Handle nested MapComposite objects
-                                            safe_args[key] = dict(value.items())
-                                        else:
-                                            # Test if the value is JSON serializable
-                                            try:
-                                                json.dumps(value)
-                                                safe_args[key] = value
-                                            except (TypeError, OverflowError):
-                                                safe_args[key] = str(value)
+                                        # FIXED: Properly handle MapComposite objects recursively
+                                        safe_args[key] = _convert_mapcomposite_to_dict(value)
                                     args_str = json.dumps(safe_args)
+                                    bound_logger.debug(f"Converted MapComposite args: {args_str}")
                                 elif isinstance(fc.args, dict):
                                     # Already a dict, but check each value for serializability
                                     safe_args = {}
                                     for key, value in fc.args.items():
-                                        try:
-                                            json.dumps(value)
-                                            safe_args[key] = value
-                                        except (TypeError, OverflowError):
-                                            safe_args[key] = str(value)
+                                        safe_args[key] = _convert_mapcomposite_to_dict(value)
                                     args_str = json.dumps(safe_args)
+                                    bound_logger.debug(f"Converted dict args: {args_str}")
                                 else:
                                     # Not a dict or dict-like, convert to string
                                     args_str = json.dumps({"raw_args": str(fc.args)})
+                                    bound_logger.debug(f"Converted non-dict args: {args_str}")
                             except Exception as args_error:
                                 # If all else fails, create a safe fallback
                                 args_str = json.dumps({"serialization_error": str(args_error), "raw_args": str(fc.args)})
+                                bound_logger.error(f"Error converting function call args: {args_error}")
                         else:
+                            # FIXED: fc.args doesn't exist, set empty args
                             args_str = "{}"
+                            bound_logger.debug("Function call has no args attribute, using empty object")
                         
                         response_tool_calls.append({
                             "id": str(uuid.uuid4()), # Generate shorter ID (just UUID)
@@ -992,10 +1322,158 @@ def get_gemini_response(
                     bound_logger.error(f"Error processing response part {i}: {part_error}", exc_info=True)
                     # Continue with other parts
         else:
-            bound_logger.warning("No parts found in the Gemini response")
+            # ENHANCED ERROR DETECTION - No parts found is a critical error
+            bound_logger.error("CRITICAL: No parts found in Gemini response - investigating cause...")
+            
+            # Check for finish_reason indicating why response failed
+            finish_reasons = []
+            malformed_function_call_detected = False
+            
+            if hasattr(response, 'candidates') and response.candidates:
+                for i, candidate in enumerate(response.candidates):
+                    if hasattr(candidate, 'finish_reason'):
+                        finish_reason = str(candidate.finish_reason)
+                        finish_reasons.append(f"Candidate {i}: {finish_reason}")
+                        
+                        if 'MALFORMED_FUNCTION_CALL' in finish_reason:
+                            malformed_function_call_detected = True
+                            bound_logger.error(f"MALFORMED_FUNCTION_CALL detected in candidate {i}")
+                        elif 'SAFETY' in finish_reason:
+                            bound_logger.error(f"Safety filter triggered in candidate {i}")
+                        elif 'MAX_TOKENS' in finish_reason:
+                            bound_logger.error(f"Max tokens exceeded in candidate {i}")
+                        elif 'STOP' in finish_reason:
+                            bound_logger.debug(f"Normal stop condition in candidate {i}")
+                        else:
+                            bound_logger.error(f"Unknown finish reason: {finish_reason}")
+            
+            # Log comprehensive diagnostic information
+            diagnostic_info = {
+                "response_type": str(type(response)),
+                "response_attributes": dir(response),
+                "finish_reasons": finish_reasons,
+                "malformed_function_call": malformed_function_call_detected,
+                "has_candidates": hasattr(response, 'candidates'),
+                "candidate_count": len(response.candidates) if hasattr(response, 'candidates') and response.candidates else 0,
+                "tools_provided": len(tools) if tools else 0,
+                "tools_names": [getattr(t, 'name', 'unknown') for t in tools] if tools else [],
+            }
+            
+            # Add candidate details if available
+            if hasattr(response, 'candidates') and response.candidates:
+                diagnostic_info["candidate_details"] = []
+                for i, candidate in enumerate(response.candidates):
+                    candidate_info = {
+                        "index": i,
+                        "finish_reason": str(getattr(candidate, 'finish_reason', 'unknown')),
+                        "has_content": hasattr(candidate, 'content'),
+                        "content_parts_count": len(candidate.content.parts) if hasattr(candidate, 'content') and candidate.content and hasattr(candidate.content, 'parts') else 0
+                    }
+                    
+                    # Check safety ratings
+                    if hasattr(candidate, 'safety_ratings') and candidate.safety_ratings:
+                        candidate_info["safety_ratings"] = []
+                        for rating in candidate.safety_ratings:
+                            rating_info = {
+                                "category": str(getattr(rating, 'category', 'unknown')),
+                                "probability": str(getattr(rating, 'probability', 'unknown'))
+                            }
+                            candidate_info["safety_ratings"].append(rating_info)
+                    
+                    diagnostic_info["candidate_details"].append(candidate_info)
+            
+            # Log the comprehensive diagnostic info
+            bound_logger.bind(
+                diagnostic_data=diagnostic_info
+            ).error("Gemini response diagnostic information")
+            
+            # Specific error messages based on detected issues
+            if malformed_function_call_detected:
+                error_msg = "MALFORMED_FUNCTION_CALL: Gemini could not parse the function call arguments. This likely indicates a tool schema issue."
+                bound_logger.error(error_msg)
+                if tools:
+                    bound_logger.error(f"Problem likely with one of these tools: {[getattr(t, 'name', 'unknown') for t in tools]}")
+                    # Log the specific tool schemas for debugging
+                    for i, tool in enumerate(tools):
+                        tool_name = getattr(tool, 'name', 'unknown')
+                        tool_params = getattr(tool, 'parameters', None)
+                        bound_logger.error(f"Tool {i+1}/{len(tools)} '{tool_name}' schema: {str(tool_params)[:500]}...")
+                        
+                        # Check for common Gemini schema issues
+                        if tool_params:
+                            schema_issues = []
+                            # Check for empty or missing required fields
+                            if not tool_params.get('properties'):
+                                schema_issues.append("No properties defined")
+                            
+                            # Check for complex nested objects that Gemini might struggle with
+                            properties = tool_params.get('properties', {})
+                            for prop_name, prop_def in properties.items():
+                                if isinstance(prop_def, dict):
+                                    prop_type = prop_def.get('type_')
+                                    if prop_type == 'OBJECT' and not prop_def.get('properties'):
+                                        schema_issues.append(f"Property '{prop_name}' is OBJECT type but lacks properties definition")
+                                    elif prop_type == 'ARRAY':
+                                        items = prop_def.get('items', {})
+                                        if isinstance(items, dict) and items.get('type_') == 'OBJECT' and not items.get('properties'):
+                                            schema_issues.append(f"Property '{prop_name}' array items lack properties definition")
+                            
+                            if schema_issues:
+                                bound_logger.error(f"Potential schema issues in '{tool_name}': {', '.join(schema_issues)}")
+                        else:
+                            bound_logger.error(f"Tool '{tool_name}' has no parameters schema!")
+                
+                # Return an error response for MALFORMED_FUNCTION_CALL
+                return {
+                    "error": "Function call schema error: Gemini detected malformed function call arguments. Please check tool parameter schemas.",
+                    "error_type": "MALFORMED_FUNCTION_CALL",
+                    "content": None,
+                    "tool_calls": [],
+                    "token_count_in": token_count_in,
+                    "token_count_out": 0,
+                    "diagnostic_info": diagnostic_info
+                }
+            
+            elif finish_reasons and any('SAFETY' in reason for reason in finish_reasons):
+                error_msg = "SAFETY: Gemini's safety filters blocked the response."
+                bound_logger.error(error_msg)
+                return {
+                    "error": "Safety filter triggered: Gemini blocked the response due to safety concerns.",
+                    "error_type": "SAFETY_FILTER",
+                    "content": None,
+                    "tool_calls": [],
+                    "token_count_in": token_count_in,
+                    "token_count_out": 0,
+                    "diagnostic_info": diagnostic_info
+                }
+            
+            elif finish_reasons and any('MAX_TOKENS' in reason for reason in finish_reasons):
+                error_msg = "MAX_TOKENS: Gemini response was truncated due to token limit."
+                bound_logger.error(error_msg)
+                return {
+                    "error": "Token limit exceeded: Gemini response was truncated.",
+                    "error_type": "MAX_TOKENS",
+                    "content": None,
+                    "tool_calls": [],
+                    "token_count_in": token_count_in,
+                    "token_count_out": 0,
+                    "diagnostic_info": diagnostic_info
+                }
+            
+            else:
+                error_msg = f"UNKNOWN: Gemini returned empty response for unknown reasons. Finish reasons: {finish_reasons}"
+                bound_logger.error(error_msg)
+                return {
+                    "error": f"Empty response from Gemini: {error_msg}",
+                    "error_type": "EMPTY_RESPONSE",
+                    "content": None,
+                    "tool_calls": [],
+                    "token_count_in": token_count_in,
+                    "token_count_out": 0,
+                    "diagnostic_info": diagnostic_info
+                }
         
-        # Calculate token counts
-        token_count_in = calculate_input_tokens(messages, "Gemini", model_name, tools)
+        # Calculate output token counts for successful responses
         token_count_out = count_tokens_gemini(response_content if response_content else "") if response_content else 0
         bound_logger.debug(f"Token counts - In: {token_count_in}, Out: {token_count_out}")
 
@@ -1727,94 +2205,128 @@ def get_anthropic_response(
         # Log the type of the exception for better debugging
         bound_logger.error(f"Caught exception of type: {type(e).__name__}, message: {str(e)}")
         
-        # Enhanced error message extraction for Anthropic API
-        error_details = str(e)
-        user_friendly_message = error_details
+        # Simple error logging
+        bound_logger.error(f"Anthropic API error: {str(e)}")
         
-        # Try to extract Anthropic-specific error details
-        if hasattr(e, '__class__') and e.__class__.__name__ == 'RateLimitError':
-            # For rate limit errors, extract the actual message
-            if hasattr(e, 'message') and e.message:
-                user_friendly_message = e.message
-            # Also try to parse if the error contains JSON-like structure
-            try:
-                import re
-                # Look for rate limit specific information in the error string
-                if 'rate limit' in error_details.lower():
-                    # Extract the full rate limit message
-                    match = re.search(r"'message': '([^']*)'", error_details)
-                    if match:
-                        user_friendly_message = match.group(1)
-                    else:
-                        # Fallback to extracting from the general error structure
-                        match = re.search(r"Error code: \d+ - (.+)", error_details)
-                        if match:
-                            try:
-                                import ast
-                                error_dict = ast.literal_eval(match.group(1))
-                                if isinstance(error_dict, dict) and 'error' in error_dict:
-                                    inner_error = error_dict['error']
-                                    if isinstance(inner_error, dict) and 'message' in inner_error:
-                                        user_friendly_message = inner_error['message']
-                            except:
-                                pass
-            except Exception as parse_e:
-                bound_logger.warning(f"Could not parse Anthropic error structure: {parse_e}")
+        # Use the centralized error handling function
+        user_friendly_message = extract_user_friendly_error(e, "anthropic")
         
-        # Try other common Anthropic error attributes
-        elif hasattr(e, 'message') and e.message:
-            user_friendly_message = e.message
-        elif hasattr(e, 'body') and e.body:
-            try:
-                # If body is a dict or JSON-like, extract the message
-                body = e.body
-                if isinstance(body, dict):
-                    error_info = body.get('error', {})
-                    if isinstance(error_info, dict) and 'message' in error_info:
-                        user_friendly_message = error_info['message']
-                    elif 'message' in body:
-                        user_friendly_message = body['message']
-                else:
-                    # Try to parse as JSON string
-                    try:
-                        import json
-                        body_dict = json.loads(body)
-                        error_info = body_dict.get('error', {})
-                        if isinstance(error_info, dict) and 'message' in error_info:
-                            user_friendly_message = error_info['message']
-                        elif 'message' in body_dict:
-                            user_friendly_message = body_dict['message']
-                    except:
-                        pass
-            except Exception as body_parse_e:
-                bound_logger.warning(f"Could not parse Anthropic error body: {body_parse_e}")
-        
-        # If we still have a generic error, try to extract from response object
-        if user_friendly_message == error_details and hasattr(e, 'response'):
-            try:
-                response_content = e.response.text
-                error_details = f"{str(e)} - Response: {response_content[:500]}"
-                # Try to parse the response as JSON for better error extraction
-                try:
-                    import json
-                    response_json = json.loads(response_content)
-                    if isinstance(response_json, dict) and 'error' in response_json:
-                        error_info = response_json['error']
-                        if isinstance(error_info, dict) and 'message' in error_info:
-                            user_friendly_message = error_info['message']
-                except:
-                    pass
-            except Exception as inner_e:
-                bound_logger.warning(f"Could not extract response details from exception: {inner_e}")
-        
-        # Log the full technical error details for debugging
-        bound_logger.error(f"Error during Anthropic API call: {error_details}", exc_info=True)
-        
-        # Show user-friendly message in UI
-        st.error(f"Anthropic API Error: {user_friendly_message}")
+        # Log the error details for debugging
+        bound_logger.error(f"Error during Anthropic API call: {user_friendly_message}", exc_info=True)
         
         # Return the user-friendly error message
         return {"error": user_friendly_message}
+
+def extract_user_friendly_error(exception: Exception, provider: str) -> str:
+    """
+    Extract user-friendly error messages from LLM API exceptions.
+    
+    Args:
+        exception: The caught exception
+        provider: The LLM provider name for context-specific handling
+        
+    Returns:
+        A user-friendly error message
+    """
+    error_str = str(exception)
+    
+    # Provider-specific error handling
+    if provider.lower() == "anthropic":
+        # Anthropic has structured error information in e.body
+        if hasattr(exception, 'body') and isinstance(exception.body, dict):
+            try:
+                if 'error' in exception.body and isinstance(exception.body['error'], dict):
+                    error_info = exception.body['error']
+                    error_type = error_info.get('type', 'unknown_error')
+                    error_message = error_info.get('message', 'Unknown error')
+                    
+                    # Map common Anthropic error types
+                    if error_type == 'rate_limit_error':
+                        return "Rate limit exceeded. Please try again later or reduce the prompt length."
+                    elif error_type == 'not_found_error':
+                        if 'model:' in error_message:
+                            model_name = error_message.split('model:')[-1].strip()
+                            return f"Model '{model_name}' not found. Please check the model name or try a different model."
+                        else:
+                            return f"Resource not found: {error_message}"
+                    elif error_type == 'authentication_error':
+                        return "Authentication failed. Please check your API key."
+                    elif error_type == 'permission_error':
+                        return "Permission denied. Please check your API key permissions."
+                    elif error_type == 'invalid_request_error':
+                        return f"Invalid request: {error_message}"
+                    elif error_type == 'server_error':
+                        return "Anthropic server error. Please try again later."
+                    else:
+                        return f"Anthropic API error ({error_type}): {error_message}"
+            except Exception:
+                pass
+    
+    elif provider.lower() == "openai":
+        # OpenAI error handling
+        if hasattr(exception, 'response'):
+            try:
+                response_content = exception.response.text
+                # Try to parse OpenAI error response
+                try:
+                    response_json = json.loads(response_content)
+                    if isinstance(response_json, dict) and 'error' in response_json:
+                        error_info = response_json['error']
+                        if isinstance(error_info, dict):
+                            error_type = error_info.get('type', 'unknown_error')
+                            error_message = error_info.get('message', 'Unknown error')
+                            
+                            # Map common OpenAI error types
+                            if error_type == 'rate_limit_exceeded':
+                                return "Rate limit exceeded. Please try again later."
+                            elif error_type == 'model_not_found':
+                                return f"Model not found: {error_message}"
+                            elif error_type == 'invalid_api_key':
+                                return "Invalid API key. Please check your OpenAI API key."
+                            elif error_type == 'insufficient_quota':
+                                return "Insufficient quota. Please check your OpenAI account billing."
+                            else:
+                                return f"OpenAI API error ({error_type}): {error_message}"
+                except:
+                    pass
+            except Exception:
+                pass
+    
+    elif provider.lower() == "perplexity":
+        # Perplexity error handling (OpenAI-compatible)
+        if hasattr(exception, 'body') and exception.body:
+            try:
+                body = exception.body
+                if isinstance(body, dict) and 'error' in body:
+                    error_info = body['error']
+                    if isinstance(error_info, dict):
+                        error_type = error_info.get('type', 'unknown_error')
+                        error_message = error_info.get('message', 'Unknown error')
+                        
+                        # Map common Perplexity error types
+                        if error_type == 'rate_limit_exceeded':
+                            return "Rate limit exceeded. Please try again later."
+                        elif error_type == 'model_not_found':
+                            return f"Model not found: {error_message}"
+                        else:
+                            return f"Perplexity API error ({error_type}): {error_message}"
+            except Exception:
+                pass
+    
+    # Generic error handling for all providers
+    error_lower = error_str.lower()
+    if 'rate limit' in error_lower or 'rate_limit' in error_lower:
+        return "Rate limit exceeded. Please try again later or reduce the prompt length."
+    elif 'not found' in error_lower or 'model not found' in error_lower:
+        return "Model not found. Please check the model name or try a different model."
+    elif 'authentication' in error_lower or 'api key' in error_lower:
+        return "Authentication failed. Please check your API key."
+    elif 'permission' in error_lower:
+        return "Permission denied. Please check your API key permissions."
+    elif 'quota' in error_lower:
+        return "Quota exceeded. Please check your account billing."
+    else:
+        return f"{provider.title()} API error: {error_str}"
 
 def get_llm_response(
     messages: List[Dict[str, Any]], 
@@ -1822,11 +2334,13 @@ def get_llm_response(
     tools: List[Dict[str, Any]] | None, 
     provider: str, 
     model_name: str,
-    user_request_id: str | None = None
+    user_request_id: str | None = None,
+    action_id: str | None = None
 ) -> Dict[str, Any]:
     """Generic LLM response dispatcher that routes to the appropriate provider."""
-    # Generate action ID for this specific LLM call
-    action_id = str(uuid.uuid4())
+    # Use provided action ID or generate a new one for this specific LLM call
+    if action_id is None:
+        action_id = str(uuid.uuid4())
     bound_logger = logger.bind(user_request_id=user_request_id, action_id=action_id)
     
     # Normalize provider name

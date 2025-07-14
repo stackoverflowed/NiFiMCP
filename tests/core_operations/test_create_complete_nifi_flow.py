@@ -707,9 +707,9 @@ async def test_create_complete_nifi_flow_efficiency_comparison(async_client, bas
                 "name": "IndividualProcessor",
                 "position_x": 800,
                 "position_y": 200,
-                "process_group_id": test_pg_id,
                 "properties": {"Log Level": "info"}
-            }]
+            }],
+            "process_group_id": test_pg_id
         },
         headers=mcp_headers,
         custom_logger=logger

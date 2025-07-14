@@ -104,6 +104,18 @@ async def _create_nifi_processor_single(
     validated_properties = properties or {}
     warnings = []
     
+    # --- STRIP QUOTES FROM PROPERTY NAMES ---
+    if properties and isinstance(properties, dict):
+        cleaned_properties = {}
+        for k, v in properties.items():
+            if isinstance(k, str):
+                cleaned_key = k.strip('"\'')
+            else:
+                cleaned_key = k
+            cleaned_properties[cleaned_key] = v
+        properties = cleaned_properties
+        validated_properties = properties
+    
     if properties:
         local_logger.info("Applying enhanced property validation and service reference resolution...")
         
@@ -144,7 +156,7 @@ async def _create_nifi_processor_single(
             warnings.extend(prop_warnings)
             
             if prop_errors:
-                error_msg = f"Property validation failed for processor '{name}': {'; '.join(prop_errors)}"
+                error_msg = f"Property validation failed for processor '{name}' (type: {processor_type}): {'; '.join(prop_errors)}"
                 local_logger.error(error_msg)
                 return {"status": "error", "message": error_msg, "entity": None}
                 
@@ -178,40 +190,48 @@ async def _create_nifi_processor_single(
         validation_status = component.get("validationStatus", "UNKNOWN")
         validation_errors = component.get("validationErrors", [])
         
-        # Include property validation warnings in response
+        # Filter out relationship-related warnings to reduce noise
+        filtered_warnings = []
+        for warning in warnings:
+            if not any(phrase in warning.lower() for phrase in [
+                "relationship", "auto-terminated", "termination", "connection"
+            ]):
+                filtered_warnings.append(warning)
+        
+        # Include property validation warnings in response (filtered)
         result_message = f"Processor '{name}' created successfully."
-        if warnings:
-            result_message += f" Warnings: {'; '.join(warnings)}"
+        if filtered_warnings:
+            result_message += f" Warnings: {'; '.join(filtered_warnings)}"
         
         if validation_status == "VALID":
             return {
                 "status": "success",
                 "message": result_message,
                 "entity": nifi_response_data,
-                "warnings": warnings
+                "warnings": filtered_warnings
             }
         else:
             error_msg_snippet = f" ({validation_errors[0]})" if validation_errors else ""
             local_logger.warning(f"Processor '{name}' created but is {validation_status}{error_msg_snippet}. Requires configuration or connections.")
             warning_message = f"Processor '{name}' created but is currently {validation_status}{error_msg_snippet}. Further configuration or connections likely required."
-            if warnings:
-                warning_message += f" Property warnings: {'; '.join(warnings)}"
+            if filtered_warnings:
+                warning_message += f" Property warnings: {'; '.join(filtered_warnings)}"
             return {
                 "status": "warning",
                 "message": warning_message,
                 "entity": nifi_response_data,
-                "warnings": warnings
+                "warnings": filtered_warnings
             }
             
     except (NiFiAuthenticationError, ConnectionError, ValueError) as e:
         local_logger.error(f"API error creating processor: {e}", exc_info=False)
         local_logger.bind(interface="nifi", direction="response", data={"error": str(e)}).debug("Received error from NiFi API")
         # Return structured error instead of raising ToolError
-        return {"status": "error", "message": f"Failed to create NiFi processor: {e}", "entity": None}
+        return {"status": "error", "message": f"Failed to create processor '{name}' (type: {processor_type}): {e}", "entity": None}
     except Exception as e:
         local_logger.error(f"Unexpected error creating processor: {e}", exc_info=True)
         local_logger.bind(interface="nifi", direction="response", data={"error": str(e)}).debug("Received error from NiFi API")
-        return {"status": "error", "message": f"An unexpected error occurred during processor creation: {e}", "entity": None}
+        return {"status": "error", "message": f"An unexpected error occurred creating processor '{name}' (type: {processor_type}): {e}", "entity": None}
 
 async def _create_nifi_connection_single(
     source_id: str,
@@ -484,14 +504,15 @@ async def _create_nifi_port_single(
     except (NiFiAuthenticationError, ConnectionError, ValueError) as e:
         local_logger.error(f"API error creating {port_type} port: {e}", exc_info=False)
         local_logger.bind(interface="nifi", direction="response", data={"error": str(e)}).debug("Received error from NiFi API")
-        return {"status": "error", "message": f"Failed to create NiFi {port_type} port: {e}", "entity": None}
+        return {"status": "error", "message": f"Failed to create {port_type} port '{name}': {e}", "entity": None}
     except Exception as e:
         local_logger.error(f"Unexpected error creating {port_type} port: {e}", exc_info=True)
         local_logger.bind(interface="nifi", direction="response", data={"error": str(e)}).debug("Received error from NiFi API")
-        return {"status": "error", "message": f"An unexpected error occurred during {port_type} port creation: {e}", "entity": None}
+        return {"status": "error", "message": f"An unexpected error occurred creating {port_type} port '{name}': {e}", "entity": None}
 
-@mcp.tool()
-@tool_phases(["Modify"])
+# HIDDEN: Use create_controller_services instead for batch operations
+# @mcp.tool()
+# @tool_phases(["Build"])
 async def create_nifi_controller_service(
     service_type: str,
     name: str,
@@ -500,15 +521,36 @@ async def create_nifi_controller_service(
 ) -> Dict:
     """
     Creates a new controller service within a specified NiFi process group.
+    
+    This tool creates a single controller service that can be referenced by processors
+    and other components within the process group.
+    
+    **Auto-Enable Feature**: The controller service is automatically enabled after creation,
+    making it immediately available for use by processors. This saves manual enable steps.
 
     Args:
         service_type: The fully qualified Java class name of the controller service type (e.g., 'org.apache.nifi.dbcp.DBCPConnectionPool').
         name: The desired name for the new controller service instance.
         process_group_id: The UUID of the target process group where the controller service should be created.
         properties: A dictionary containing the controller service's configuration properties.
+        
+    Example:
+    ```python
+    service_type = "org.apache.nifi.dbcp.DBCPConnectionPool"
+    name = "DatabaseConnectionPool" 
+    process_group_id = "abc-123-def-456"
+    properties = {
+        "Database Connection URL": "jdbc:postgresql://localhost:5432/mydb",
+        "Database Driver Class Name": "org.postgresql.Driver",
+        "Database User": "admin"
+    }
+    # Service will be automatically enabled and ready for processor use
+    ```
     
     Returns:
-        A dictionary reporting the success, warning, or error status of the operation, including the created controller service entity details.
+        A dictionary reporting the success, warning, or error status of the operation, 
+        including the created controller service entity details and auto-enable status.
+        Contains 'auto_enable_attempted': True to indicate enable was attempted.
     """
     # Get client and logger from context
     nifi_client: Optional[NiFiClient] = current_nifi_client.get()
@@ -524,6 +566,17 @@ async def create_nifi_controller_service(
 
     local_logger = local_logger.bind(process_group_id=process_group_id)
     local_logger.info(f"Executing create_controller_service: Type='{service_type}', Name='{name}'")
+
+    # --- STRIP QUOTES FROM PROPERTY NAMES ---
+    if properties and isinstance(properties, dict):
+        cleaned_properties = {}
+        for k, v in properties.items():
+            if isinstance(k, str):
+                cleaned_key = k.strip('"\'')
+            else:
+                cleaned_key = k
+            cleaned_properties[cleaned_key] = v
+        properties = cleaned_properties
 
     try:
         nifi_request_data = {
@@ -553,29 +606,80 @@ async def create_nifi_controller_service(
         validation_status = component.get("validationStatus", "UNKNOWN")
         validation_errors = component.get("validationErrors", [])
         
+        # Auto-enable the controller service after successful creation
+        service_id = controller_service_entity.get('id')
+        enable_message = ""
+        enable_status = "success"
+        
+        if service_id:
+            local_logger.info(f"Auto-enabling controller service '{name}' with ID: {service_id}")
+            try:
+                enable_result = await operate_nifi_objects([{
+                    "object_type": "controller_service",
+                    "object_id": service_id,
+                    "operation_type": "enable",
+                    "name": name
+                }])
+                
+                if enable_result and len(enable_result) > 0:
+                    enable_response = enable_result[0]
+                    if enable_response.get("status") == "success":
+                        enable_message = " Service auto-enabled successfully."
+                        local_logger.info(f"Successfully auto-enabled controller service '{name}'")
+                    elif enable_response.get("status") == "warning":
+                        enable_message = f" Service auto-enable warning: {enable_response.get('message', 'Unknown warning')}"
+                        enable_status = "warning"
+                        local_logger.warning(f"Auto-enable warning for service '{name}': {enable_response.get('message')}")
+                    else:
+                        enable_message = f" Service auto-enable failed: {enable_response.get('message', 'Unknown error')}"
+                        enable_status = "warning"  # Don't fail the whole operation for enable failure
+                        local_logger.warning(f"Failed to auto-enable service '{name}': {enable_response.get('message')}")
+                else:
+                    enable_message = " Service auto-enable failed: No response from enable operation"
+                    enable_status = "warning"
+                    local_logger.warning(f"No response from auto-enable operation for service '{name}'")
+                    
+            except Exception as e:
+                enable_message = f" Service auto-enable failed: {e}"
+                enable_status = "warning"  # Don't fail the whole operation for enable failure
+                local_logger.warning(f"Exception during auto-enable for service '{name}': {e}")
+        else:
+            enable_message = " Could not auto-enable: Service ID not available"
+            enable_status = "warning"
+            local_logger.warning(f"Cannot auto-enable service '{name}': Service ID not available")
+        
+        # Determine final status and message
+        base_message = f"Controller service '{name}' created successfully."
+        final_message = base_message + enable_message
+        
         if validation_status == "VALID":
+            final_status = enable_status  # Use enable status if creation was valid
             return {
-                "status": "success",
-                "message": f"Controller service '{name}' created successfully.",
-                "entity": nifi_response_data
+                "status": final_status,
+                "message": final_message,
+                "entity": nifi_response_data,
+                "auto_enable_attempted": True
             }
         else:
             error_msg_snippet = f" ({validation_errors[0]})" if validation_errors else ""
-            local_logger.warning(f"Controller service '{name}' created but is {validation_status}{error_msg_snippet}. Requires configuration.")
+            validation_message = f"Controller service '{name}' created but is currently {validation_status}{error_msg_snippet}. Further configuration likely required."
+            final_message = validation_message + enable_message
+            # Use warning status if validation failed, regardless of enable status
             return {
                 "status": "warning",
-                "message": f"Controller service '{name}' created but is currently {validation_status}{error_msg_snippet}. Further configuration likely required.",
-                "entity": nifi_response_data
+                "message": final_message,
+                "entity": nifi_response_data,
+                "auto_enable_attempted": True
             }
             
     except (NiFiAuthenticationError, ConnectionError, ValueError) as e:
         local_logger.error(f"API error creating controller service: {e}", exc_info=False)
         local_logger.bind(interface="nifi", direction="response", data={"error": str(e)}).debug("Received error from NiFi API")
-        return {"status": "error", "message": f"Failed to create controller service: {e}", "entity": None}
+        return {"status": "error", "message": f"Failed to create controller service '{name}' (type: {service_type}): {e}", "entity": None}
     except Exception as e:
         local_logger.error(f"Unexpected error creating controller service: {e}", exc_info=True)
         local_logger.bind(interface="nifi", direction="response", data={"error": str(e)}).debug("Received error from NiFi API")
-        return {"status": "error", "message": f"An unexpected error occurred during controller service creation: {e}", "entity": None}
+        return {"status": "error", "message": f"An unexpected error occurred creating controller service '{name}' (type: {service_type}): {e}", "entity": None}
 
 
 async def _create_controller_service_single(
@@ -611,12 +715,16 @@ async def _create_controller_service_single(
 # --- Plural batch tools ---
 
 @mcp.tool()
-@tool_phases(["Modify"])
+@tool_phases(["Build"])
 async def create_nifi_processors(
-    processors: List[Dict[str, Any]]
+    processors: List[Dict[str, Any]],
+    process_group_id: str
 ) -> List[Dict]:
     """
     Creates one or more NiFi processors in batch.
+    
+    This tool efficiently handles multiple processor creation in a single request,
+    ideal for building complex flows that require multiple processors.
 
     Args:
         processors: List of processor definitions. Each dictionary must contain:
@@ -624,14 +732,61 @@ async def create_nifi_processors(
             - name (str): The desired name for the processor instance
             - position_x (int) OR position (dict): X coordinate OR nested position object {"x": 100, "y": 200}
             - position_y (int): Y coordinate (only if using position_x format)
-            - process_group_id (str, optional): UUID of the target process group
             - properties (dict, optional): Configuration properties for the processor
+            - process_group_id (str, optional): Override the default process group for this specific processor
+        process_group_id: Default process group UUID where all processors will be created (required)
+            
+    Example:
+    ```python
+    processors = [
+        {
+            "processor_type": "org.apache.nifi.processors.standard.GenerateFlowFile",
+            "name": "GenerateFlowFile",
+            "position_x": 100,
+            "position_y": 100,
+            "properties": {
+                "File Size": "1KB",
+                "Batch Size": "1"
+            }
+        },
+        {
+            "processor_type": "org.apache.nifi.processors.standard.LogAttribute",
+            "name": "LogAttribute",
+            "position": {"x": 300, "y": 100},
+            "properties": {
+                "Log Level": "info"
+            },
+            "process_group_id": "different-pg-uuid"  # Optional override
+        }
+    ]
+    process_group_id = "default-pg-uuid"
+    ```
 
     Returns:
         List of result dictionaries, one per processor creation attempt.
     """
     results = []
-    for proc in processors:
+    for i, proc in enumerate(processors):
+        # Validate required fields early to provide better error messages
+        processor_type = proc.get("processor_type")
+        name = proc.get("name")
+        
+        if not processor_type:
+            results.append({
+                "status": "error", 
+                "message": f"Processor definition at index {i} missing required field 'processor_type'.", 
+                "definition": proc
+            })
+            continue
+            
+        if not name:
+            results.append({
+                "status": "error", 
+                "message": f"Processor definition at index {i} missing required field 'name'.", 
+                "definition": proc
+            })
+            continue
+        
         # CRITICAL FIX: Handle both flat and nested position formats
         position_x = proc.get("position_x")
         position_y = proc.get("position_y")
@@ -643,13 +798,34 @@ async def create_nifi_processors(
                 position_x = position.get("x")
                 position_y = position.get("y")
         
+        # Validate position fields
+        if position_x is None or position_y is None:
+            results.append({
+                "status": "error", 
+                "message": f"Processor '{name}' (type: {processor_type}) missing required position fields (position_x/position_y or position.x/position.y).", 
+                "definition": proc
+            })
+            continue
+        
+        # --- STRIP QUOTES FROM PROPERTY NAMES ---
+        properties = proc.get("properties")
+        if properties and isinstance(properties, dict):
+            cleaned_properties = {}
+            for k, v in properties.items():
+                if isinstance(k, str):
+                    cleaned_key = k.strip('"\'')
+                else:
+                    cleaned_key = k
+                cleaned_properties[cleaned_key] = v
+            properties = cleaned_properties
+        
         result = await _create_nifi_processor_single(
-            processor_type=proc.get("processor_type"),
-            name=proc.get("name"),
+            processor_type=processor_type,
+            name=name,
             position_x=position_x,
             position_y=position_y,
-            process_group_id=proc.get("process_group_id"),
-            properties=proc.get("properties")
+            process_group_id=proc.get("process_group_id", process_group_id),  # Use top-level default with per-record override
+            properties=properties
         )
         results.append(result)
     return results
@@ -694,12 +870,16 @@ async def _create_nifi_connections_legacy(
     return await create_nifi_connections(converted_connections)
 
 @mcp.tool()
-@tool_phases(["Modify"])
+@tool_phases(["Build"])
 async def create_nifi_ports(
-    ports: List[Dict[str, Any]]
+    ports: List[Dict[str, Any]],
+    process_group_id: str
 ) -> List[Dict]:
     """
     Creates one or more NiFi ports in batch.
+    
+    This tool efficiently handles multiple port creation in a single request,
+    ideal for setting up data ingress and egress points for process groups.
 
     Args:
         ports: List of port definitions. Each dictionary must contain:
@@ -707,13 +887,62 @@ async def create_nifi_ports(
             - name (str): The desired name for the port instance
             - position_x (int) OR position (dict): X coordinate OR nested position object {"x": 100, "y": 200}
             - position_y (int): Y coordinate (only if using position_x format)
-            - process_group_id (str, optional): UUID of the target process group
+            - process_group_id (str, optional): Override the default process group for this specific port
+        process_group_id: Default process group UUID where all ports will be created (required)
+            
+    Example:
+    ```python
+    ports = [
+        {
+            "port_type": "input",
+            "name": "DataIngressPort",
+            "position_x": 50,
+            "position_y": 50
+        },
+        {
+            "port_type": "output", 
+            "name": "DataEgressPort",
+            "position": {"x": 400, "y": 50},
+            "process_group_id": "different-pg-uuid"  # Optional override
+        }
+    ]
+    process_group_id = "default-pg-uuid"
+    ```
 
     Returns:
         List of result dictionaries, one per port creation attempt.
     """
     results = []
-    for port in ports:
+    for i, port in enumerate(ports):
+        # Validate required fields early to provide better error messages
+        port_type = port.get("port_type")
+        name = port.get("name")
+        
+        if not port_type:
+            results.append({
+                "status": "error", 
+                "message": f"Port definition at index {i} missing required field 'port_type'.", 
+                "definition": port
+            })
+            continue
+            
+        if not name:
+            results.append({
+                "status": "error", 
+                "message": f"Port definition at index {i} missing required field 'name'.", 
+                "definition": port
+            })
+            continue
+        
+        # Validate port_type values
+        if port_type not in ["input", "output"]:
+            results.append({
+                "status": "error", 
+                "message": f"Port '{name}' has invalid port_type '{port_type}'. Must be 'input' or 'output'.", 
+                "definition": port
+            })
+            continue
+        
         # CRITICAL FIX: Handle both flat and nested position formats
         position_x = port.get("position_x")
         position_y = port.get("position_y")
@@ -725,24 +954,36 @@ async def create_nifi_ports(
                 position_x = position.get("x")
                 position_y = position.get("y")
         
+        # Validate position fields
+        if position_x is None or position_y is None:
+            results.append({
+                "status": "error", 
+                "message": f"Port '{name}' (type: {port_type}) missing required position fields (position_x/position_y or position.x/position.y).", 
+                "definition": port
+            })
+            continue
+        
         result = await _create_nifi_port_single(
-            port_type=port.get("port_type"),
-            name=port.get("name"),
+            port_type=port_type,
+            name=name,
             position_x=position_x,
             position_y=position_y,
-            process_group_id=port.get("process_group_id")
+            process_group_id=port.get("process_group_id", process_group_id)  # Use top-level default with per-record override
         )
         results.append(result)
     return results
 
 @mcp.tool()
-@tool_phases(["Modify"])
+@tool_phases(["Build"])
 async def create_controller_services(
     controller_services: List[Dict[str, Any]],
     process_group_id: str
 ) -> List[Dict]:
     """
     Creates one or more controller services in batch within a specified process group.
+    
+    **Auto-Enable Feature**: Controller services are automatically enabled after creation,
+    making them immediately available for use by processors. This saves manual enable steps.
     
     Args:
         controller_services: List of controller service definitions, each containing:
@@ -753,7 +994,8 @@ async def create_controller_services(
     
     Returns:
         List of results, one per controller service creation attempt.
-        Includes enhanced error handling with available types when invalid types are provided.
+        Each result includes auto-enable status and enhanced error handling.
+        Results contain 'auto_enable_attempted': True to indicate enable was attempted.
         
     Example:
         ```python
@@ -767,6 +1009,7 @@ async def create_controller_services(
         }]
         process_group_id = "process-group-uuid"
         result = create_controller_services(controller_services, process_group_id)
+        # Services are automatically enabled and ready for processor use
         ```
     """
     results = []
@@ -791,32 +1034,55 @@ async def create_controller_services(
             })
             continue
         
+        # --- STRIP QUOTES FROM PROPERTY NAMES ---
+        properties = cs.get("properties")
+        if properties and isinstance(properties, dict):
+            cleaned_properties = {}
+            for k, v in properties.items():
+                if isinstance(k, str):
+                    cleaned_key = k.strip('"\'')
+                else:
+                    cleaned_key = k
+                cleaned_properties[cleaned_key] = v
+            properties = cleaned_properties
+        
         result = await _create_controller_service_single(
             service_type=service_type,
             name=name,
             process_group_id=process_group_id,
-            properties=cs.get("properties")
+            properties=properties
         )
         results.append(result)
     
     return results
 
 @mcp.tool()
-@tool_phases(["Modify"])
+@tool_phases(["Build"])
 async def create_nifi_process_group(
     name: str,
     position_x: int,
     position_y: int,
-    parent_process_group_id: str | None = None
+    parent_process_group_id: str
 ) -> Dict:
     """
     Creates a new process group within a specified parent NiFi process group.
+    
+    This tool creates a process group that can contain other processors, services,
+    and sub-process groups, helping organize complex flows.
 
     Args:
         name: The desired name for the new process group.
         position_x: The desired X coordinate for the process group on the canvas.
         position_y: The desired Y coordinate for the process group on the canvas.
-        parent_process_group_id: The UUID of the parent process group where the new group should be created. Defaults to the root group if None.
+        parent_process_group_id: The UUID of the parent process group where the new group should be created (required).
+        
+    Example:
+    ```python
+    name = "DataProcessingGroup"
+    position_x = 200
+    position_y = 150
+    parent_process_group_id = "abc-123-def-456"  # Required parent process group UUID
+    ```
 
     Returns:
         A dictionary representing the result, including status and the created process group entity.
@@ -839,18 +1105,6 @@ async def create_nifi_process_group(
     # --------------------------
 
     target_parent_pg_id = parent_process_group_id
-    if target_parent_pg_id is None:
-        local_logger.info("No parent_process_group_id provided, fetching root process group ID.")
-        try:
-            nifi_request_data = {"operation": "get_root_process_group_id"}
-            local_logger.bind(interface="nifi", direction="request", data=nifi_request_data).debug("Calling NiFi API")
-            target_parent_pg_id = await nifi_client.get_root_process_group_id(user_request_id=user_request_id, action_id=action_id)
-            nifi_response_data = {"root_pg_id": target_parent_pg_id}
-            local_logger.bind(interface="nifi", direction="response", data=nifi_response_data).debug("Received from NiFi API")
-        except Exception as e:
-            local_logger.error(f"Failed to get root process group ID: {e}", exc_info=True)
-            local_logger.bind(interface="nifi", direction="response", data={"error": str(e)}).debug("Received error from NiFi API")
-            raise ToolError(f"Failed to determine root process group ID for PG creation: {e}")
 
     position = {"x": position_x, "y": position_y}
     local_logger = local_logger.bind(parent_process_group_id=target_parent_pg_id)
@@ -880,11 +1134,11 @@ async def create_nifi_process_group(
     except (NiFiAuthenticationError, ConnectionError, ValueError) as e:
         local_logger.error(f"API error creating process group: {e}", exc_info=False)
         local_logger.bind(interface="nifi", direction="response", data={"error": str(e)}).debug("Received error from NiFi API")
-        return {"status": "error", "message": f"Failed to create NiFi process group: {e}", "entity": None}
+        return {"status": "error", "message": f"Failed to create process group '{name}': {e}", "entity": None}
     except Exception as e:
         local_logger.error(f"Unexpected error creating process group: {e}", exc_info=True)
         local_logger.bind(interface="nifi", direction="response", data={"error": str(e)}).debug("Received error from NiFi API")
-        return {"status": "error", "message": f"An unexpected error occurred during process group creation: {e}", "entity": None}
+        return {"status": "error", "message": f"An unexpected error occurred creating process group '{name}': {e}", "entity": None}
 
 
 # REMOVED: create_nifi_flow tool - replaced by create_complete_nifi_flow
@@ -996,6 +1250,17 @@ async def create_nifi_flow(
                 pos_y = position_dict.get("y")
                 # Get properties (might be nested or top-level depending on LLM mood)
                 properties = proc_def.get("properties", {}) 
+                
+                # --- STRIP QUOTES FROM PROPERTY NAMES ---
+                if properties and isinstance(properties, dict):
+                    cleaned_properties = {}
+                    for k, v in properties.items():
+                        if isinstance(k, str):
+                            cleaned_key = k.strip('"\'')
+                        else:
+                            cleaned_key = k
+                        cleaned_properties[cleaned_key] = v
+                    properties = cleaned_properties
 
                 if not proc_name:
                     results.append({"status": "error", "message": "Processor definition missing 'name'.", "definition": proc_def})
@@ -1363,6 +1628,17 @@ async def create_complete_nifi_flow(
             service_type = cs_def.get("service_type") or cs_def.get("class")
             properties = cs_def.get("properties", {})
             
+            # --- STRIP QUOTES FROM PROPERTY NAMES ---
+            if properties and isinstance(properties, dict):
+                cleaned_properties = {}
+                for k, v in properties.items():
+                    if isinstance(k, str):
+                        cleaned_key = k.strip('"\'')
+                    else:
+                        cleaned_key = k
+                    cleaned_properties[cleaned_key] = v
+                properties = cleaned_properties
+            
             if not all([name, service_type]):
                 error_result = {
                     "status": "error",
@@ -1473,6 +1749,17 @@ async def create_complete_nifi_flow(
             position = proc_def.get("position", {})
             properties = proc_def.get("properties", {}).copy()  # Copy to avoid mutating original
             
+            # --- STRIP QUOTES FROM PROPERTY NAMES ---
+            if properties and isinstance(properties, dict):
+                cleaned_properties = {}
+                for k, v in properties.items():
+                    if isinstance(k, str):
+                        cleaned_key = k.strip('"\'')
+                    else:
+                        cleaned_key = k
+                    cleaned_properties[cleaned_key] = v
+                properties = cleaned_properties
+            
             if not all([name, processor_type, position.get("x") is not None, position.get("y") is not None]):
                 error_result = {
                     "status": "error",
@@ -1572,14 +1859,15 @@ async def create_complete_nifi_flow(
                 continue
             
             local_logger.info(f"Creating processor: {name} ({processor_type})")
-            proc_result = await create_nifi_processors([{
-                "processor_type": processor_type,
-                "name": name,
-                "position_x": position["x"],
-                "position_y": position["y"],
-                "process_group_id": target_pg_id,
-                "properties": resolved_properties
-            }])
+            proc_result = await create_nifi_processors([
+                {
+                    "processor_type": processor_type,
+                    "name": name,
+                    "position_x": position["x"],
+                    "position_y": position["y"],
+                    "properties": resolved_properties
+                }
+            ], process_group_id=target_pg_id)
             # Extract the single result from the list
             proc_result = proc_result[0] if proc_result else {"status": "error", "message": "No result returned"}
             
@@ -3585,10 +3873,10 @@ async def _validate_processor_properties_upfront(processor_type: str, properties
 
 @smart_parameter_validation
 @mcp.tool()
-@tool_phases(["Create"])
+@tool_phases(["Build", "Modify"])
 async def create_nifi_connections(
     connections: List[Dict[str, Any]],
-    process_group_id: Optional[str] = None
+    process_group_id: str
 ) -> List[Dict]:
     """
     Creates NiFi connections using component names OR UUIDs with automatic resolution.
@@ -3614,7 +3902,7 @@ async def create_nifi_connections(
             - relationships (list): List of relationship names to connect
             - process_group_id (str, optional): Process group to search in (defaults to parameter)
             
-        process_group_id: Default process group to search for components (optional)
+        process_group_id: Default process group to search for components (required)
             
     Example:
     ```python
@@ -3675,7 +3963,7 @@ async def create_nifi_connections(
     
     # Collect all process groups to search
     for conn in connections:
-        pg_id = conn.get("process_group_id", process_group_id or "root")
+        pg_id = conn.get("process_group_id", process_group_id)
         search_process_groups.add(pg_id)
     
     # Build name mapping for each process group
@@ -3712,10 +4000,20 @@ async def create_nifi_connections(
                                 component_map[f"{pg_id}:{name}:{existing_entry['type']}"] = existing_entry
                                 local_logger.warning(f"Duplicate name '{name}' found - created type-specific keys")
                             else:
-                                # Same type duplicates - this is a real problem
+                                # Same type duplicates - handle gracefully by using UUIDs as identifiers
                                 existing_id = component_map[key]["id"]
-                                local_logger.error(f"Duplicate processor name '{name}' in process group {pg_id}: existing={existing_id}, new={proc_id}")
-                                raise ToolError(f"Duplicate processor name '{name}' found in process group {pg_id}. Names must be unique within each process group.")
+                                local_logger.warning(f"Duplicate processor name '{name}' in process group {pg_id}: existing={existing_id}, new={proc_id}")
+                                
+                                # Create UUID-based keys for both the existing and new processors
+                                existing_entry = component_map.pop(key)
+                                component_map[f"{pg_id}:UUID:{existing_id}"] = existing_entry
+                                component_map[f"{pg_id}:UUID:{proc_id}"] = {
+                                    "id": proc_id,
+                                    "type": "processor",
+                                    "name": name,
+                                    "process_group_id": pg_id
+                                }
+                                local_logger.info(f"Created UUID-based keys for duplicate processor name '{name}': {existing_id}, {proc_id}")
                         else:
                             component_map[key] = {
                                 "id": proc_id,
@@ -3757,10 +4055,20 @@ async def create_nifi_connections(
                                 component_map[f"{pg_id}:{name}:{existing_entry['type']}"] = existing_entry
                                 local_logger.warning(f"Duplicate name '{name}' found - created type-specific keys")
                             else:
-                                # Same type duplicates - this is a real problem
+                                # Same type duplicates - handle gracefully by using UUIDs as identifiers
                                 existing_id = component_map[key]["id"]
-                                local_logger.error(f"Duplicate {normalized_type} name '{name}' in process group {pg_id}: existing={existing_id}, new={port_id}")
-                                raise ToolError(f"Duplicate {normalized_type} name '{name}' found in process group {pg_id}. Names must be unique within each process group.")
+                                local_logger.warning(f"Duplicate {normalized_type} name '{name}' in process group {pg_id}: existing={existing_id}, new={port_id}")
+                                
+                                # Create UUID-based keys for both the existing and new ports
+                                existing_entry = component_map.pop(key)
+                                component_map[f"{pg_id}:UUID:{existing_id}"] = existing_entry
+                                component_map[f"{pg_id}:UUID:{port_id}"] = {
+                                    "id": port_id,
+                                    "type": normalized_type,
+                                    "name": name,
+                                    "process_group_id": pg_id
+                                }
+                                local_logger.info(f"Created UUID-based keys for duplicate {normalized_type} name '{name}': {existing_id}, {port_id}")
                         else:
                             component_map[key] = {
                                 "id": port_id,
@@ -3798,7 +4106,20 @@ async def create_nifi_connections(
             """Resolve component name or UUID to component info, handling duplicates and type-specific keys."""
             # Check if input is already a UUID
             if is_uuid(component_name):
-                # Search for this UUID in the component map
+                # First, try direct UUID-based key lookup (for duplicates handled by UUID keys)
+                uuid_key = f"{pg_id}:UUID:{component_name}"
+                if uuid_key in component_map:
+                    local_logger.info(f"Resolved {component_role} UUID '{component_name}' via direct UUID key: {uuid_key}")
+                    return uuid_key, component_map[uuid_key]
+                
+                # Also try root process group UUID key
+                if pg_id != "root":
+                    root_uuid_key = f"root:UUID:{component_name}"
+                    if root_uuid_key in component_map:
+                        local_logger.info(f"Resolved {component_role} UUID '{component_name}' via root UUID key: {root_uuid_key}")
+                        return root_uuid_key, component_map[root_uuid_key]
+                
+                # Fallback: Search for this UUID in the component map values
                 for key, info in component_map.items():
                     if info["id"] == component_name:
                         local_logger.info(f"Resolved {component_role} UUID '{component_name}' to component '{info['name']}' ({info['type']})")

@@ -12,12 +12,13 @@ async def test_auto_stop_feature(
     async_client: httpx.AsyncClient,
     base_url: str,
     mcp_headers: dict,
-    global_logger: Any
+    global_logger: Any,
+    root_process_group_id: str
 ):
     """Test Auto-Stop feature with a running processor."""
     # Create a fresh PG for this test
     pg_name = "mcp-test-pg-auto-stop"
-    create_pg_args = {"name": pg_name, "position_x": 0, "position_y": 0}
+    create_pg_args = {"name": pg_name, "position_x": 0, "position_y": 0, "parent_process_group_id": root_process_group_id}
     pg_result_list = await call_tool(
         client=async_client,
         base_url=base_url,
@@ -45,7 +46,7 @@ async def test_auto_stop_feature(
             client=async_client,
             base_url=base_url,
             tool_name="create_nifi_processors",
-            arguments={"processors": [processor_args]},
+            arguments={"processors": [processor_args], "process_group_id": pg_id},
             headers=mcp_headers,
             custom_logger=global_logger
         )
@@ -133,7 +134,7 @@ async def test_auto_stop_feature(
             client=async_client,
             base_url=base_url,
             tool_name="create_nifi_processors",
-            arguments={"processors": [processor_args]},
+            arguments={"processors": [processor_args], "process_group_id": pg_id},
             headers=mcp_headers,
             custom_logger=global_logger
         )
@@ -248,12 +249,13 @@ async def test_auto_delete_feature(
     async_client: httpx.AsyncClient,
     base_url: str,
     mcp_headers: dict,
-    global_logger: Any
+    global_logger: Any,
+    root_process_group_id: str
 ):
     """Test Auto-Delete feature with processors that have connections."""
     # Create a fresh PG for this test
     pg_name = "mcp-test-pg-auto-delete"
-    create_pg_args = {"name": pg_name, "position_x": 0, "position_y": 0}
+    create_pg_args = {"name": pg_name, "position_x": 0, "position_y": 0, "parent_process_group_id": root_process_group_id}
     pg_result_list = await call_tool(
         client=async_client,
         base_url=base_url,
@@ -284,7 +286,7 @@ async def test_auto_delete_feature(
             client=async_client,
             base_url=base_url,
             tool_name="create_nifi_processors",
-            arguments={"processors": [processor_args]},
+            arguments={"processors": [processor_args], "process_group_id": pg_id},
             headers=mcp_headers,
             custom_logger=global_logger
         )
@@ -321,7 +323,7 @@ async def test_auto_delete_feature(
             client=async_client,
             base_url=base_url,
             tool_name="create_nifi_processors",
-            arguments={"processors": [dest_processor_args]},
+            arguments={"processors": [dest_processor_args], "process_group_id": pg_id},
             headers=mcp_headers,
             custom_logger=global_logger
         )
@@ -437,7 +439,7 @@ async def test_auto_delete_feature(
         # ========================== DISABLED CASE ==========================
         # Create a fresh process group for this test to avoid interference
         disabled_pg_name = "mcp-test-pg-auto-delete-disabled"
-        disabled_pg_args = {"name": disabled_pg_name, "position_x": 500, "position_y": 0}
+        disabled_pg_args = {"name": disabled_pg_name, "position_x": 500, "position_y": 0, "parent_process_group_id": root_process_group_id}
         disabled_pg_result = await call_tool(
             client=async_client,
             base_url=base_url,
@@ -463,7 +465,7 @@ async def test_auto_delete_feature(
             client=async_client,
             base_url=base_url,
             tool_name="create_nifi_processors",
-            arguments={"processors": [disabled_processor_args]},
+            arguments={"processors": [disabled_processor_args], "process_group_id": disabled_pg_id},
             headers=mcp_headers,
             custom_logger=global_logger
         )
@@ -500,7 +502,7 @@ async def test_auto_delete_feature(
             client=async_client,
             base_url=base_url,
             tool_name="create_nifi_processors",
-            arguments={"processors": [disabled_dest_args]},
+            arguments={"processors": [disabled_dest_args], "process_group_id": disabled_pg_id},
             headers=mcp_headers,
             custom_logger=global_logger
         )
@@ -647,14 +649,15 @@ async def test_feature_configuration_defaults(
     async_client: httpx.AsyncClient,
     base_url: str,
     mcp_headers: dict,
-    global_logger: Any
+    global_logger: Any,
+    root_process_group_id: str
 ):
     """Test that feature configuration defaults work correctly when no headers are provided."""
     from config import settings as mcp_settings
 
     # Create a fresh PG for the default configuration test
     pg_name = "mcp-test-pg-defaults"
-    create_pg_args = {"name": pg_name, "position_x": 0, "position_y": 0}
+    create_pg_args = {"name": pg_name, "position_x": 0, "position_y": 0, "parent_process_group_id": root_process_group_id}
     pg_result_list = await call_tool(
         client=async_client,
         base_url=base_url,
@@ -681,7 +684,7 @@ async def test_feature_configuration_defaults(
             client=async_client,
             base_url=base_url,
             tool_name="create_nifi_processors",
-            arguments={"processors": [processor_args]},
+            arguments={"processors": [processor_args], "process_group_id": pg_id},
             headers=mcp_headers,
             custom_logger=global_logger
         )
@@ -808,12 +811,13 @@ async def test_intelligent_relationship_update_with_auto_delete(
     async_client: httpx.AsyncClient,
     base_url: str,
     mcp_headers: dict,
-    global_logger: Any
+    global_logger: Any,
+    root_process_group_id: str
 ):
     """Test intelligent relationship update that automatically deletes conflicting connections."""
     # Create a fresh PG for this test
     pg_name = "mcp-test-pg-intelligent-relationships"
-    create_pg_args = {"name": pg_name, "position_x": 0, "position_y": 0}
+    create_pg_args = {"name": pg_name, "position_x": 0, "position_y": 0, "parent_process_group_id": root_process_group_id}
     pg_result_list = await call_tool(
         client=async_client,
         base_url=base_url,
@@ -840,7 +844,7 @@ async def test_intelligent_relationship_update_with_auto_delete(
             client=async_client,
             base_url=base_url,
             tool_name="create_nifi_processors",
-            arguments={"processors": [source_processor_args]},
+            arguments={"processors": [source_processor_args], "process_group_id": pg_id},
             headers=mcp_headers,
             custom_logger=global_logger
         )
@@ -861,7 +865,7 @@ async def test_intelligent_relationship_update_with_auto_delete(
             client=async_client,
             base_url=base_url,
             tool_name="create_nifi_processors",
-            arguments={"processors": [target_processor_args]},
+            arguments={"processors": [target_processor_args], "process_group_id": pg_id},
             headers=mcp_headers,
             custom_logger=global_logger
         )

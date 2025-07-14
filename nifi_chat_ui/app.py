@@ -5,7 +5,7 @@ import time # Added for timing tracking
 from loguru import logger # Import logger directly
 from st_copy_to_clipboard import st_copy_to_clipboard # Import the new component
 from typing import List, Dict
-from chat_manager import calculate_input_tokens  # Import for smart pruning
+# New modular imports are above
 
 # Set page config MUST be the first Streamlit call
 st.set_page_config(page_title="NiFi Chat UI", layout="wide")
@@ -50,9 +50,10 @@ except ImportError:
     print("Warning: Logging setup failed. Check config/logging_setup.py")
 # ---------------------
 
-# Restore imports
-from chat_manager import get_llm_response, get_formatted_tool_definitions, calculate_input_tokens
-from chat_manager import configure_llms, is_initialized
+# Use new modular ChatManager directly
+from llm.chat_manager import ChatManager
+from llm.utils.token_counter import TokenCounter
+from llm.mcp.client import MCPClient
 from mcp_handler import get_available_tools, execute_mcp_tool, get_nifi_servers
 # Import config from the new location
 try:
@@ -70,10 +71,59 @@ except ImportError:
     st.error("Configuration loading failed. Application cannot start.")
     st.stop()
 
-# Initialize LLM clients after page config
-if not is_initialized:
-    logger.info("Initializing LLM clients...")
-    configure_llms()
+# Initialize new modular ChatManager after page config
+_chat_manager = None
+_token_counter = None
+_mcp_client = None
+
+def get_chat_manager() -> ChatManager:
+    """Get or create the ChatManager instance."""
+    global _chat_manager
+    
+    if _chat_manager is None:
+        logger.info("Initializing new modular ChatManager...")
+        
+        # Use the existing config system - the API keys are already loaded
+        config_dict = {
+            'openai': {
+                'api_key': config.OPENAI_API_KEY,
+                'models': config.OPENAI_MODELS
+            },
+            'gemini': {
+                'api_key': config.GOOGLE_API_KEY,
+                'models': config.GEMINI_MODELS
+            },
+            'anthropic': {
+                'api_key': config.ANTHROPIC_API_KEY,
+                'models': config.ANTHROPIC_MODELS
+            },
+            'perplexity': {
+                'api_key': config.PERPLEXITY_API_KEY,
+                'models': config.PERPLEXITY_MODELS
+            }
+        }
+        
+        _chat_manager = ChatManager(config_dict)
+        logger.info("Successfully initialized new modular ChatManager")
+    
+    return _chat_manager
+
+def get_token_counter() -> TokenCounter:
+    """Get or create the TokenCounter instance."""
+    global _token_counter
+    if _token_counter is None:
+        _token_counter = TokenCounter()
+    return _token_counter
+
+def get_mcp_client() -> MCPClient:
+    """Get or create the MCPClient instance."""
+    global _mcp_client
+    if _mcp_client is None:
+        _mcp_client = MCPClient()
+    return _mcp_client
+
+# Initialize on first use (lazy initialization)
+logger.info("New modular LLM architecture initialized (lazy loading)")
 
 # --- Constants ---
 MAX_LOOP_ITERATIONS = 10 # Safety break for the execution loop
@@ -176,18 +226,9 @@ with st.sidebar:
         st.error("No LLM models configured or API keys missing. Please check your .env file.")
     else:
         # Determine default selection
-        # Prioritize Gemini if available, otherwise first OpenAI, else first in list
-        default_selection = None
-        if config.GOOGLE_API_KEY and config.GEMINI_MODELS:
-            default_selection = f"Google: {config.GEMINI_MODELS[0]}"
-        elif config.OPENAI_API_KEY and config.OPENAI_MODELS:
-             default_selection = f"OpenAI: {config.OPENAI_MODELS[0]}"
-        
-        # Ensure default is actually in the list
-        if default_selection not in available_models:
-            default_selection = available_models[0] # Fallback to first item
-        
-        default_index = list(available_models.keys()).index(default_selection)
+        # Use the first value from the dropdown list of models as the default
+        default_selection = list(available_models.keys())[0]
+        default_index = 0
         
         selected_model_display_name = st.selectbox(
             "Select LLM Model:", 
@@ -255,35 +296,22 @@ with st.sidebar:
     st.markdown("---") # Add separator
     
     # Initialize workflow session state
-    if "workflow_execution_mode" not in st.session_state:
-        st.session_state.workflow_execution_mode = "unguided"  # Default to unguided
+    # TEMPORARY: Hide Execution Mode dropdown and force 'unguided' mode
+    st.session_state.workflow_execution_mode = "unguided"  # Always set to unguided
+    # (Do not render the selectbox for execution mode)
+    # (Remove or comment out the selectbox and related logic)
+    # END TEMPORARY
+    
     if "selected_workflow" not in st.session_state:
         st.session_state.selected_workflow = None
     if "available_workflows" not in st.session_state:
         st.session_state.available_workflows = []
     
-    # Execution Mode Selection - Temporarily hidden
-    # execution_modes = ["unguided", "guided"]
-    # current_mode_index = execution_modes.index(st.session_state.workflow_execution_mode) if st.session_state.workflow_execution_mode in execution_modes else 0
-    # 
-    # def on_execution_mode_change():
-    #     new_mode = st.session_state.execution_mode_selector
-    #     if st.session_state.workflow_execution_mode != new_mode:
-    #         st.session_state.workflow_execution_mode = new_mode
-    #         # Reset workflow selection when mode changes
-    #         st.session_state.selected_workflow = None
-    #         logger.info(f"Workflow execution mode changed to: {new_mode}")
-    # 
-    # st.selectbox(
-    #     "Execution Mode:",
-    #     options=execution_modes,
-    #     index=current_mode_index,
-    #     key="execution_mode_selector",
-    #     on_change=on_execution_mode_change,
-    #     help="Select workflow execution mode: 'unguided' for free-form chat, 'guided' for structured workflows"
-    # )
-    
-    # === PHASE SELECTION ===
+    # === WORKFLOW SELECTION (for guided mode) ===
+    # (Do not render workflow selection if execution mode is always 'unguided')
+    # ... existing code ...
+
+    # --- PHASE SELECTION ===
     st.markdown("---") # Add separator
     phase_options = ["All", "Review", "Build", "Modify", "Operate"]
     # Initialize session state for selected_phase if it doesn't exist
@@ -509,13 +537,14 @@ Keep this concise but informative.
         bound_logger.info("Requesting automated status report from LLM")
         
         # Call LLM for status report (no tools needed)
-        status_response = get_llm_response(
+        chat_manager = get_chat_manager()
+        status_response = chat_manager.get_llm_response(
             messages=status_messages,
             system_prompt=system_prompt,
-            tools=None,  # No tools for status report
             provider=provider,
             model_name=model_name,
-            user_request_id=user_req_id
+            user_request_id=user_req_id,
+            tools=None  # No tools for status report
         )
         
         if status_response and status_response.get("content"):
@@ -557,6 +586,249 @@ Keep this concise but informative.
         bound_logger.info("Status report failed, but continuing normally")
 
 # --- Workflow Execution Function ---
+def run_async_workflow_integrated(workflow_name: str, provider: str, model_name: str, base_sys_prompt: str, user_req_id: str):
+    """Run an async workflow with integrated real-time UI updates in the main chat interface."""
+    import asyncio
+    import threading
+    import time
+    from nifi_mcp_server.workflows.core.event_system import get_event_emitter, EventTypes
+    from nifi_mcp_server.workflows.registry import get_workflow_registry
+    
+    bound_logger = logger.bind(user_request_id=user_req_id)
+    execution_start_time = time.time()
+    
+    try:
+        # Display workflow start message
+        with st.chat_message("assistant"):
+            st.markdown(f"🚀 **Starting async workflow:** {workflow_name}")
+            st.markdown("*Real-time updates will appear below...*")
+        
+        st.session_state.messages.append({
+            "role": "assistant",
+            "content": f"🚀 **Starting async workflow:** {workflow_name}\n\n*Real-time updates will appear below...*"
+        })
+        
+        # Create real-time UI containers
+        progress_container = st.empty()
+        status_container = st.empty()
+        
+        # Prepare execution context (same as sync version)
+        current_objective = st.session_state.get("current_objective", "")
+        if current_objective and current_objective.strip():
+            effective_system_prompt = f"{base_sys_prompt}\n\n## Current Objective\n{current_objective.strip()}"
+        else:
+            effective_system_prompt = base_sys_prompt
+        
+        # Filter messages (same as sync version)
+        filtered_messages = []
+        for msg in st.session_state.messages:
+            if (msg.get("role") == "assistant" and 
+                msg.get("content", "").startswith("🚀 **Starting async workflow:")):
+                continue
+            filtered_messages.append(msg)
+        
+        context = {
+            "provider": provider,
+            "model_name": model_name,
+            "system_prompt": effective_system_prompt,
+            "user_request_id": user_req_id,
+            "messages": filtered_messages,
+            "selected_nifi_server_id": st.session_state.get("selected_nifi_server_id"),
+            "selected_phase": st.session_state.get("selected_phase", "All"),
+            "max_loop_iterations": st.session_state.get("max_loop_iterations", 10),
+            "max_tokens_limit": st.session_state.get("max_tokens_limit", 8000),
+            "auto_prune_history": st.session_state.get("auto_prune_history", False),
+            "current_objective": current_objective
+        }
+        
+        # Create async executor
+        registry = get_workflow_registry()
+        async_executor = registry.create_async_executor(workflow_name)
+        
+        if not async_executor:
+            st.error(f"Failed to create async executor for workflow: {workflow_name}")
+            return
+        
+        # Set up event handling for real-time UI updates
+        events_received = []
+        event_emitter = get_event_emitter()
+        
+        def handle_workflow_event(event):
+            """Handle workflow events - just collect them for main thread processing."""
+            events_received.append(event)
+        
+        # Register event handler
+        event_emitter.on(handle_workflow_event)
+        
+        # Execute workflow asynchronously in background thread
+        result_container = {"result": None, "error": None, "completed": False}
+        
+        def run_async_workflow():
+            """Run the async workflow in a separate thread."""
+            try:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                result = loop.run_until_complete(async_executor.execute_async(context))
+                result_container["result"] = result
+                result_container["completed"] = True
+            except Exception as e:
+                result_container["error"] = str(e)
+                result_container["completed"] = True
+            finally:
+                loop.close()
+        
+        # Start async execution in background thread
+        workflow_thread = threading.Thread(target=run_async_workflow)
+        workflow_thread.start()
+        
+        # Poll for completion with progress updates
+        progress_bar = progress_container.progress(0)
+        
+        start_time = time.time()
+        max_wait_time = 300  # 5 minutes max
+        
+        while not result_container["completed"] and (time.time() - start_time) < max_wait_time:
+            elapsed = time.time() - start_time
+            progress = min(elapsed / max_wait_time, 0.95)  # Never show 100% until complete
+            
+            # Update progress bar with event count
+            progress_bar.progress(progress, text=f"Executing workflow... ({len(events_received)} events)")
+            
+            # Show latest status based on most recent events
+            if events_received:
+                latest_event = events_received[-1]
+                
+                with status_container:
+                    if latest_event.event_type == EventTypes.LLM_START:
+                        provider_name = latest_event.data.get('provider', 'Unknown')
+                        model_name = latest_event.data.get('model', 'Unknown')
+                        st.info(f"🤖 **LLM Call Started** - {provider_name} {model_name}")
+                        
+                    elif latest_event.event_type == EventTypes.LLM_COMPLETE:
+                        tokens_in = latest_event.data.get("tokens_in", 0)
+                        tokens_out = latest_event.data.get("tokens_out", 0)
+                        st.success(f"✅ **LLM Call Complete** - Tokens: {tokens_in:,}/{tokens_out:,}")
+                        
+                    elif latest_event.event_type == EventTypes.TOOL_START:
+                        tool_name = latest_event.data.get("tool_name", "Unknown")
+                        tool_index = latest_event.data.get("tool_index", 1)
+                        total_tools = latest_event.data.get("total_tools", 1)
+                        st.info(f"⚙️ **Tool Call Started:** `{tool_name}` ({tool_index}/{total_tools})")
+                        
+                    elif latest_event.event_type == EventTypes.TOOL_COMPLETE:
+                        tool_name = latest_event.data.get("tool_name", "Unknown")
+                        st.success(f"✅ **Tool Call Complete:** `{tool_name}`")
+                        
+                    elif latest_event.event_type == EventTypes.WORKFLOW_COMPLETE:
+                        loop_count = latest_event.data.get("loop_count", 0)
+                        tool_calls_executed = latest_event.data.get("tool_calls_executed", 0)
+                        st.success(f"🎉 **Workflow Complete!** Iterations: {loop_count}, Tool calls: {tool_calls_executed}")
+            
+            time.sleep(0.5)  # Update every 500ms
+        
+        # Wait for thread to complete
+        workflow_thread.join(timeout=10)
+        
+        # Clean up progress indicators
+        progress_bar.progress(1.0, text="Workflow execution complete")
+        time.sleep(1)  # Brief pause to show completion
+        progress_container.empty()
+        status_container.empty()
+        
+        # Remove event handler
+        event_emitter.remove_callback(handle_workflow_event)
+        
+        # Process results (same logic as sync workflow)
+        if result_container["error"]:
+            st.error(f"Async workflow execution failed: {result_container['error']}")
+            return
+        
+        result = result_container["result"]
+        if result and result.get("status") == "success":
+            bound_logger.info("Async workflow execution completed successfully")
+            
+            # Extract workflow results (same as sync version)
+            shared_state = result.get("shared_state", {})
+            workflow_messages = shared_state.get("final_messages", [])
+            
+            if workflow_messages:
+                # Calculate new messages (same logic as sync version)
+                original_message_count = len(filtered_messages)
+                new_messages = workflow_messages[original_message_count:] if len(workflow_messages) > original_message_count else []
+                
+                bound_logger.info(f"Async workflow completed with {len(new_messages)} new messages")
+                
+                # Process and display new messages (same as sync version)
+                for msg in new_messages:
+                    if msg.get("role") == "assistant" and (msg.get("content") or msg.get("tool_calls")):
+                        # Extract workflow context from action_id for display
+                        action_id = msg.get("action_id", "")
+                        workflow_context = ""
+                        
+                        if action_id.startswith("wf-") and "-" in action_id:
+                            parts = action_id.split("-")
+                            if len(parts) >= 3:
+                                workflow_id = parts[1]
+                                step_id = parts[2]
+                                workflow_context = f" | **Workflow:** {workflow_id} | **Step:** {step_id}"
+                        
+                        # Display assistant message with workflow context
+                        with st.chat_message("assistant"):
+                            if msg.get("content"):
+                                st.markdown(msg["content"])
+                            
+                            if msg.get("tool_calls"):
+                                tool_names = [tc.get('function', {}).get('name', 'unknown') for tc in msg.get("tool_calls", [])]
+                                if tool_names:
+                                    st.markdown(f"⚙️ **Workflow Tool Call(s):** `{', '.join(tool_names)}`{workflow_context}")
+                            
+                            # Show token info if available
+                            tokens_in = msg.get("token_count_in", 0)
+                            tokens_out = msg.get("token_count_out", 0)
+                            if tokens_in > 0 or tokens_out > 0:
+                                st.caption(f"Tokens: {tokens_in:,} in, {tokens_out:,} out | Action ID: `{action_id}`")
+                
+                # Add new messages to session state
+                for msg in new_messages:
+                    st.session_state.messages.append(msg)
+                
+                # Calculate final statistics
+                execution_duration = time.time() - execution_start_time
+                total_tokens_in = sum(msg.get("token_count_in", 0) for msg in new_messages if msg.get("role") == "assistant")
+                total_tokens_out = sum(msg.get("token_count_out", 0) for msg in new_messages if msg.get("role") == "assistant")
+                
+                # Update session totals
+                st.session_state.conversation_total_tokens_in += total_tokens_in
+                st.session_state.conversation_total_tokens_out += total_tokens_out
+                st.session_state.conversation_total_duration += execution_duration
+                
+                # Display execution summary with real-time event info
+                with st.chat_message("assistant"):
+                    st.markdown(f"📊 **Async Workflow Summary:**")
+                    st.markdown(f"- **Events Received:** {len(events_received)}")
+                    st.markdown(f"- **New Messages:** {len(new_messages)}")
+                    st.markdown(f"- **Total Tokens:** {total_tokens_in + total_tokens_out:,} ({total_tokens_in:,} in, {total_tokens_out:,} out)")
+                    st.markdown(f"- **Execution Time:** {execution_duration:.1f}s")
+                    
+                    if events_received:
+                        with st.expander("📋 Event Timeline", expanded=False):
+                            for event in events_received[-10:]:  # Show last 10 events
+                                timestamp = time.strftime("%H:%M:%S", time.localtime(event.timestamp))
+                                event_desc = event.data.get('tool_name', event.data.get('action_id', 'N/A'))
+                                st.text(f"[{timestamp}] {event.event_type}: {event_desc}")
+                
+                st.session_state.messages.append({
+                    "role": "assistant",
+                    "content": f"📊 **Async Workflow Summary:**\n- **Events Received:** {len(events_received)}\n- **New Messages:** {len(new_messages)}\n- **Total Tokens:** {total_tokens_in + total_tokens_out:,} ({total_tokens_in:,} in, {total_tokens_out:,} out)\n- **Execution Time:** {execution_duration:.1f}s"
+                })
+        else:
+            st.error("Async workflow execution failed or returned unexpected result")
+            
+    except Exception as e:
+        bound_logger.error(f"Async workflow execution error: {e}", exc_info=True)
+        st.error(f"Failed to execute async workflow: {str(e)}")
+
+
 def run_workflow_execution(workflow_name: str, provider: str, model_name: str, base_sys_prompt: str, user_req_id: str):
     """Runs a guided workflow execution."""
     bound_logger = logger.bind(user_request_id=user_req_id)
@@ -603,19 +875,32 @@ def run_workflow_execution(workflow_name: str, provider: str, model_name: str, b
             effective_system_prompt = base_sys_prompt
             bound_logger.debug("No objective set, using base system prompt for workflow.")
         
+        # Filter out the workflow startup message to prevent duplication
+        # The startup message we just added should not be passed to the workflow
+        filtered_messages = []
+        for msg in st.session_state.messages:
+            # Skip the workflow startup message we just added
+            if (msg.get("role") == "assistant" and 
+                msg.get("content", "").startswith("🚀 **Starting guided workflow:")):
+                continue
+            filtered_messages.append(msg)
+        
         context = {
             "provider": provider,
             "model_name": model_name,
             "system_prompt": effective_system_prompt,  # Use the effective system prompt with objective
             "user_request_id": user_req_id,
-            "messages": st.session_state.messages.copy(),
+            "messages": filtered_messages,  # Use filtered messages instead of all messages
             "selected_nifi_server_id": st.session_state.get("selected_nifi_server_id"),
             "selected_phase": st.session_state.get("selected_phase", "All"),
+            "max_loop_iterations": st.session_state.get("max_loop_iterations", MAX_LOOP_ITERATIONS),
+            "max_tokens_limit": st.session_state.get("max_tokens_limit", 8000),  # Add token limit from UI
+            "auto_prune_history": st.session_state.get("auto_prune_history", False),  # Add pruning setting
             "current_objective": current_objective  # Also pass the objective separately for workflow use
         }
         
-        # Execute workflow
-        with st.spinner(f"🤔 Thinking... (Guided Workflow: {workflow_name})"):
+        # Execute workflow with real-time LLM call display
+        with st.spinner(f"🤔 Executing Workflow: {workflow_name}"):
             result = executor.execute(context)
         
         # Calculate execution duration
@@ -627,15 +912,44 @@ def run_workflow_execution(workflow_name: str, provider: str, model_name: str, b
             
             # Extract the actual workflow results from shared state
             shared_state = result.get("shared_state", {})
+            
+            # --- FIX: Get messages from the correct key ---
+            # The complete message history is now in "final_messages"
+            workflow_messages = shared_state.get("final_messages", [])
+            
+            # DEBUG: Log what we actually received
+            workflow_logger = bound_logger.bind(
+                interface="workflow", 
+                direction="ui_processing",
+                data={
+                    "message_count": len(workflow_messages),
+                    "messages": [
+                        {
+                            "index": i,
+                            "role": msg.get("role", "unknown"),
+                            "has_content": bool(msg.get("content")),
+                            "has_tool_calls": bool(msg.get("tool_calls"))
+                        }
+                        for i, msg in enumerate(workflow_messages)
+                    ]
+                }
+            )
+            workflow_logger.info("Received workflow messages in UI")
+            
+            # Get other details from the "unguided_mimic_result" for the summary
             workflow_result = shared_state.get("unguided_mimic_result", {})
             
-            # Get the messages from the workflow execution
-            workflow_messages = workflow_result.get("messages", [])
+            # Calculate token counts correctly by summing from all messages
+            total_tokens_in = 0
+            total_tokens_out = 0
             
-            # Get token counts
-            tokens_in = workflow_result.get("total_tokens_in", 0)
-            tokens_out = workflow_result.get("total_tokens_out", 0)
-            total_tokens = tokens_in + tokens_out
+            # Sum up tokens from all assistant messages in the workflow
+            for msg in workflow_messages:
+                if msg.get("role") == "assistant":
+                    total_tokens_in += msg.get("token_count_in", 0)
+                    total_tokens_out += msg.get("token_count_out", 0)
+            
+            total_tokens = total_tokens_in + total_tokens_out
             
             # Get workflow execution details for summary
             loop_count = workflow_result.get("loop_count", 0)
@@ -653,26 +967,125 @@ def run_workflow_execution(workflow_name: str, provider: str, model_name: str, b
             
             # Extract and display the actual LLM responses from the workflow first
             if workflow_messages:
-                # Find new messages that aren't already in session state
-                existing_message_count = len(st.session_state.messages) - 1  # Subtract the start message we just added
-                new_messages = workflow_messages[existing_message_count:]
+                # CRITICAL FIX: Only process messages that are NEW from this workflow execution
+                # The workflow_messages contains ALL messages (input + new), but we only want to display the new ones
+                
+                # Calculate how many messages we originally passed to the workflow
+                original_message_count = len(filtered_messages)
+                
+                # The new messages are everything after the original message count
+                # Note: workflow_messages includes system prompt + original messages + new messages
+                # But the workflow removes the system prompt, so it's: original_messages + new_messages
+                new_messages = workflow_messages[original_message_count:] if len(workflow_messages) > original_message_count else []
+                
+                bound_logger.info(f"Message calculation: Original={original_message_count}, Total={len(workflow_messages)}, New={len(new_messages)}")
+                
+                workflow_logger.bind(
+                    direction="ui_processing", 
+                    data={
+                        "original_message_count": original_message_count,
+                        "total_workflow_messages": len(workflow_messages),
+                        "new_messages_count": len(new_messages),
+                        "message_details": [
+                            {
+                                "role": msg.get("role"),
+                                "has_content": bool(msg.get("content")),
+                                "has_tool_calls": bool(msg.get("tool_calls"))
+                            }
+                            for msg in new_messages
+                        ]
+                    }
+                ).info("Processing new workflow messages")
                 
                 for msg in new_messages:
-                    if msg.get("role") == "assistant" and msg.get("content"):
-                        # Display the LLM response
+                    if msg.get("role") == "assistant" and (msg.get("content") or msg.get("tool_calls")):
+                        # Extract workflow and step info from action_id
+                        action_id = msg.get("action_id", "")
+                        workflow_id = "unknown"
+                        step_id = "unknown"
+                        
+                        # Parse workflow context from action_id if it follows the pattern wf-{workflow}-{step}-tool-{uuid}
+                        if action_id.startswith("wf-") and "-tool-" in action_id:
+                            parts = action_id.split("-tool-")[0]  # Remove the tool UUID part
+                            if parts.startswith("wf-"):
+                                workflow_parts = parts[3:].split("-")  # Remove 'wf-' prefix
+                                if len(workflow_parts) >= 2:
+                                    # Last part is step_id, everything before is workflow_id
+                                    step_id = workflow_parts[-1]
+                                    workflow_id = "-".join(workflow_parts[:-1])
+                        
+                        # Log workflow context for debugging
+                        bound_logger.debug(f"Processing message: Action: {action_id}, Parsed Workflow: {workflow_id}, Step: {step_id}, Content: {len(msg.get('content', ''))}, Tool calls: {len(msg.get('tool_calls', []))}")
+                        msg_tokens_in = msg.get("token_count_in", 0)
+                        msg_tokens_out = msg.get("token_count_out", 0)
+                        msg_total_tokens = msg_tokens_in + msg_tokens_out
+                        
+                        # Display the LLM response with workflow context
                         with st.chat_message("assistant"):
-                            st.markdown(msg["content"])
+                            # Show workflow context like unguided mode shows Req/Act IDs
+                            st.markdown(f"**🤖 LLM Response** - Workflow: `{workflow_id}` | Step: `{step_id}` | Action: `{action_id[:8]}...`")
+                            
+                            # Show token information
+                            if msg_total_tokens > 0:
+                                st.markdown(f"*📊 {msg_total_tokens:,} tokens ({msg_tokens_in:,} in, {msg_tokens_out:,} out)*")
+                            
+                            # Show tool calls if any (like unguided mode)
+                            tool_calls = msg.get("tool_calls", [])
+                            if tool_calls:
+                                # Extract workflow context from tool_calls if available
+                                tool_call_contexts = []
+                                tool_names = []
+                                for tc in tool_calls:
+                                    tool_name = tc.get('function', {}).get('name', 'unknown')
+                                    tool_names.append(tool_name)
+                                    
+                                    # Try to extract workflow context from tool call id
+                                    tool_call_id = tc.get('id', '')
+                                    if tool_call_id.startswith("wf-") and "-tool-" in tool_call_id:
+                                        context_parts = tool_call_id.split("-tool-")[0]  # Remove UUID
+                                        if context_parts.startswith("wf-"):
+                                            context_workflow_parts = context_parts[3:].split("-")
+                                            if len(context_workflow_parts) >= 2:
+                                                context_step = context_workflow_parts[-1]
+                                                context_workflow = "-".join(context_workflow_parts[:-1])
+                                                tool_call_contexts.append(f"{context_workflow}/{context_step}")
+                                            else:
+                                                tool_call_contexts.append("unknown/unknown")
+                                        else:
+                                            tool_call_contexts.append("unknown/unknown")
+                                    else:
+                                        tool_call_contexts.append("unknown/unknown")
+                                
+                                if tool_names:
+                                    # Show tool names and their contexts
+                                    contexts_str = ", ".join(set(tool_call_contexts))  # Remove duplicates
+                                    st.markdown(f"⚙️ **Workflow Tool Call(s):** `{', '.join(tool_names)}` | Context: `{contexts_str}`")
+                                else:
+                                    st.markdown("_(Tool call with no details)_")
+                            
+                            # Show actual content if present
+                            content = msg.get("content", "")
+                            if content:
+                                st.markdown(content)
                         
                         # Add to session state
-                        st.session_state.messages.append({
+                        session_message = {
                             "role": "assistant",
-                            "content": msg["content"],
-                            "token_count_in": msg.get("token_count_in", 0),
-                            "token_count_out": msg.get("token_count_out", 0),
-                            "action_id": msg.get("action_id")
-                        })
+                            "content": content,
+                            "token_count_in": msg_tokens_in,
+                            "token_count_out": msg_tokens_out,
+                            "action_id": action_id,
+                            "workflow_id": workflow_id,
+                            "step_id": step_id
+                        }
                         
-                        bound_logger.info(f"Displayed LLM response from workflow: {len(msg['content'])} characters")
+                        # Include tool_calls if present
+                        if tool_calls:
+                            session_message["tool_calls"] = tool_calls
+                            
+                        st.session_state.messages.append(session_message)
+                        
+                        bound_logger.info(f"Displayed LLM response from workflow: {len(content)} characters, {len(tool_calls)} tool calls, Workflow: {workflow_id}, Step: {step_id}")
                     elif msg.get("role") == "tool":
                         # Handle tool call results if needed
                         bound_logger.debug(f"Workflow included tool result: {msg.get('tool_call_id', 'unknown')}")
@@ -704,7 +1117,7 @@ def run_workflow_execution(workflow_name: str, provider: str, model_name: str, b
                 
                 # Display token and duration summary like unguided mode
                 if total_tokens > 0:
-                    st.markdown(f"📊 **Workflow Summary:** {total_tokens:,} tokens ({tokens_in:,} in, {tokens_out:,} out) • {execution_duration:.1f}s")
+                    st.markdown(f"📊 **Workflow Summary:** {total_tokens:,} tokens ({total_tokens_in:,} in, {total_tokens_out:,} out) • {execution_duration:.1f}s")
             
             # Generate status report when max iterations reached (like unguided mode)
             if max_iterations_reached and st.session_state.get("enable_status_reports", True):
@@ -712,7 +1125,28 @@ def run_workflow_execution(workflow_name: str, provider: str, model_name: str, b
                 
                 # Prepare context messages for status report (like unguided mode)
                 llm_context_messages = [{"role": "system", "content": effective_system_prompt}]
-                llm_context_messages.extend(st.session_state.messages)
+                
+                # Validate and clean session messages before adding to context
+                clean_messages = []
+                for msg in st.session_state.messages:
+                    if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                        # For assistant messages with tool_calls, only include if we have corresponding tool responses
+                        # For now, skip these to avoid validation errors in status reports
+                        clean_msg = {
+                            "role": "assistant",
+                            "content": msg.get("content", "")
+                        }
+                        if clean_msg["content"]:  # Only add if there's actual content
+                            clean_messages.append(clean_msg)
+                    elif msg.get("role") in ["user", "assistant"] and msg.get("content"):
+                        # Include user messages and assistant messages with content (no tool_calls)
+                        clean_messages.append({
+                            "role": msg["role"],
+                            "content": msg["content"]
+                        })
+                    # Skip tool messages for status report
+                
+                llm_context_messages.extend(clean_messages)
                 
                 # Call the same status report function used in unguided mode
                 send_status_report(provider, model_name, effective_system_prompt, 
@@ -723,7 +1157,28 @@ def run_workflow_execution(workflow_name: str, provider: str, model_name: str, b
                 
                 # Prepare context messages for status report (like unguided mode)
                 llm_context_messages = [{"role": "system", "content": effective_system_prompt}]
-                llm_context_messages.extend(st.session_state.messages)
+                
+                # Validate and clean session messages before adding to context
+                clean_messages = []
+                for msg in st.session_state.messages:
+                    if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                        # For assistant messages with tool_calls, only include if we have corresponding tool responses
+                        # For now, skip these to avoid validation errors in status reports
+                        clean_msg = {
+                            "role": "assistant",
+                            "content": msg.get("content", "")
+                        }
+                        if clean_msg["content"]:  # Only add if there's actual content
+                            clean_messages.append(clean_msg)
+                    elif msg.get("role") in ["user", "assistant"] and msg.get("content"):
+                        # Include user messages and assistant messages with content (no tool_calls)
+                        clean_messages.append({
+                            "role": msg["role"],
+                            "content": msg["content"]
+                        })
+                    # Skip tool messages for status report
+                
+                llm_context_messages.extend(clean_messages)
                 
                 # Call the same status report function used in unguided mode
                 send_status_report(provider, model_name, effective_system_prompt, 
@@ -744,7 +1199,7 @@ def run_workflow_execution(workflow_name: str, provider: str, model_name: str, b
             if result.get("message"):
                 completion_message += f"\n\n*{result['message']}*"
             if total_tokens > 0:
-                completion_message += f"\n\n📊 **Workflow Summary:** {total_tokens:,} tokens ({tokens_in:,} in, {tokens_out:,} out) • {execution_duration:.1f}s"
+                completion_message += f"\n\n📊 **Workflow Summary:** {total_tokens:,} tokens ({total_tokens_in:,} in, {total_tokens_out:,} out) • {execution_duration:.1f}s"
             
             st.session_state.messages.append({
                 "role": "assistant",
@@ -755,7 +1210,7 @@ def run_workflow_execution(workflow_name: str, provider: str, model_name: str, b
             st.session_state.last_request_duration = execution_duration
             st.session_state.conversation_total_duration = st.session_state.get("conversation_total_duration", 0) + execution_duration
             
-            bound_logger.info(f"Workflow completed: {total_tokens} tokens ({tokens_in} in, {tokens_out} out) in {execution_duration:.1f}s")
+            bound_logger.info(f"Workflow completed: {total_tokens} tokens ({total_tokens_in} in, {total_tokens_out} out) in {execution_duration:.1f}s")
         else:
             # Handle error case - could be status="error" or no result
             if result:
@@ -808,7 +1263,8 @@ def smart_prune_messages(messages: List[Dict], max_tokens: int, provider: str, m
     
     # Calculate current tokens
     try:
-        current_tokens = calculate_input_tokens(messages, provider, model_name, tools)
+        token_counter = get_token_counter()
+        current_tokens = token_counter.calculate_input_tokens(messages, provider, model_name, tools)
         logger.info(f"SMART_PRUNE_DEBUG: Initial tokens: {current_tokens}, Limit: {max_tokens}, Messages: {len(messages)}")
         if current_tokens <= max_tokens:
             logger.info("SMART_PRUNE_DEBUG: Already under limit, no pruning needed")
@@ -961,7 +1417,7 @@ def smart_prune_messages(messages: List[Dict], max_tokens: int, provider: str, m
         
         # Check if we're now under the limit
         try:
-            new_tokens = calculate_input_tokens(pruned_messages, provider, model_name, tools)
+            new_tokens = token_counter.calculate_input_tokens(pruned_messages, provider, model_name, tools)
             logger.debug(f"After removing group: {new_tokens} tokens (limit: {max_tokens})")
             if new_tokens <= max_tokens:
                 break
@@ -1009,6 +1465,7 @@ def smart_prune_messages(messages: List[Dict], max_tokens: int, provider: str, m
                                 elif tool_message.get("role") != "tool":
                                     break  # End of tool responses
                                 k += 1
+                            # Don't break here - continue looking for more assistant messages in this turn
                         # Don't break here - continue looking for more assistant messages in this turn
                     elif next_role == "tool":
                         # Orphaned tool message (shouldn't happen, but handle gracefully)
@@ -1045,7 +1502,7 @@ def smart_prune_messages(messages: List[Dict], max_tokens: int, provider: str, m
                 
                 # More aggressive pruning when severely over limit (same logic as initial pass)
                 try:
-                    recalc_tokens = calculate_input_tokens(pruned_messages, provider, model_name, tools)
+                    recalc_tokens = token_counter.calculate_input_tokens(pruned_messages, provider, model_name, tools)
                 except Exception:
                     recalc_tokens = max_tokens * 2  # Assume severe if we can't calculate
                 
@@ -1069,7 +1526,7 @@ def smart_prune_messages(messages: List[Dict], max_tokens: int, provider: str, m
         return messages
     
     try:
-        final_tokens = calculate_input_tokens(pruned_messages, provider, model_name, tools)
+        final_tokens = token_counter.calculate_input_tokens(pruned_messages, provider, model_name, tools)
         logger.info(f"Smart pruning complete: {len(messages)} → {len(pruned_messages)} messages, {current_tokens} → {final_tokens} tokens")
     except Exception:
         pass
@@ -1211,28 +1668,89 @@ def run_execution_loop(provider: str, model_name: str, base_sys_prompt: str, use
                 selected_nifi_server_id=current_nifi_server_id
             )
             
-            formatted_tools = None
-            current_loop_logger.debug(f"Formatting tools for provider: {provider}")
-            if filtered_raw_tools_list:
-                 try:
-                      formatted_tools = get_formatted_tool_definitions(
-                          provider=provider, 
-                          raw_tools=filtered_raw_tools_list, 
-                          user_request_id=user_req_id
-                      ) 
-                      if formatted_tools:
-                           current_loop_logger.debug(f"Tools successfully formatted for {provider} ({len(formatted_tools)} tools).")
-                      else:
-                           current_loop_logger.warning(f"get_formatted_tool_definitions returned None/empty for {provider}.")
-                 except Exception as fmt_e:
-                      st.error(f"Error formatting tools for {provider} in loop: {fmt_e}")
-                      current_loop_logger.error(f"Error formatting tools for {provider}: {fmt_e}", exc_info=True)
-                      formatted_tools = None 
+            # Use filtered tools directly - ChatManager will handle formatting
+            current_loop_logger.debug(f"Using {len(filtered_raw_tools_list) if filtered_raw_tools_list else 0} pre-filtered tools for provider: {provider}") 
             # --------------------------------------------------
                 
             # 2. Initialize LLM context messages (AFTER tool prep, BEFORE pruning)
             llm_context_messages = [{"role": "system", "content": effective_system_prompt}]
-            llm_context_messages.extend(st.session_state.messages)
+            
+            # CRITICAL FIX: Validate and clean session messages before adding to context
+            # This prevents sending incomplete tool call sequences to the LLM
+            session_messages = st.session_state.messages.copy()
+            
+            # Validate message structure first
+            if not validate_message_structure(session_messages, current_loop_logger):
+                current_loop_logger.warning("Session messages contain invalid tool call sequences. Cleaning...")
+                
+                # Clean the messages by removing incomplete tool call sequences
+                cleaned_messages = []
+                pending_tool_calls = set()
+                
+                for msg in session_messages:
+                    role = msg.get("role")
+                    
+                    if role == "assistant":
+                        # Check if we have pending tool calls from previous assistant message
+                        if pending_tool_calls:
+                            current_loop_logger.debug(f"Skipping assistant message with unresolved tool calls: {pending_tool_calls}")
+                            continue
+                            
+                        # Check for new tool calls
+                        tool_calls = msg.get("tool_calls", [])
+                        if tool_calls:
+                            # Only include if we can expect tool results to follow
+                            # For now, skip assistant messages with tool calls that don't have results
+                            tool_call_ids = {tc.get("id") for tc in tool_calls if tc.get("id")}
+                            
+                            # Look ahead to see if there are corresponding tool results
+                            has_all_results = True
+                            remaining_messages = session_messages[session_messages.index(msg) + 1:]
+                            found_tool_ids = set()
+                            
+                            for future_msg in remaining_messages:
+                                if future_msg.get("role") == "tool":
+                                    tool_call_id = future_msg.get("tool_call_id")
+                                    if tool_call_id in tool_call_ids:
+                                        found_tool_ids.add(tool_call_id)
+                                elif future_msg.get("role") == "assistant":
+                                    # Stop looking when we hit another assistant message
+                                    break
+                            
+                            if found_tool_ids != tool_call_ids:
+                                current_loop_logger.debug(f"Skipping assistant message with incomplete tool results. Expected: {tool_call_ids}, Found: {found_tool_ids}")
+                                continue
+                            else:
+                                pending_tool_calls = tool_call_ids.copy()
+                        
+                        cleaned_messages.append(msg)
+                        
+                    elif role == "tool":
+                        tool_call_id = msg.get("tool_call_id")
+                        if tool_call_id in pending_tool_calls:
+                            cleaned_messages.append(msg)
+                            pending_tool_calls.remove(tool_call_id)
+                        else:
+                            current_loop_logger.debug(f"Skipping orphaned tool message with id: {tool_call_id}")
+                            
+                    elif role == "user":
+                        # User messages are always safe to include
+                        # But if there are pending tool calls, we need to clear them
+                        if pending_tool_calls:
+                            current_loop_logger.debug(f"Clearing pending tool calls due to user message: {pending_tool_calls}")
+                            pending_tool_calls.clear()
+                        cleaned_messages.append(msg)
+                        
+                    else:
+                        # Other message types (shouldn't happen in our case)
+                        cleaned_messages.append(msg)
+                
+                current_loop_logger.info(f"Message cleaning complete: {len(session_messages)} → {len(cleaned_messages)} messages")
+                llm_context_messages.extend(cleaned_messages)
+            else:
+                # Messages are valid, use them as-is
+                llm_context_messages.extend(session_messages)
+                
             current_loop_logger.debug(f"Initial llm_context_messages length (incl system prompt): {len(llm_context_messages)}")
 
             # --- Apply Auto-Pruning (if enabled) --- 
@@ -1246,11 +1764,12 @@ def run_execution_loop(provider: str, model_name: str, base_sys_prompt: str, use
                 
                 # CRITICAL FIX: Use smart pruning instead of naive pruning
                 try:
-                    current_tokens = calculate_input_tokens(
+                    token_counter = get_token_counter()
+                    current_tokens = token_counter.calculate_input_tokens(
                         llm_context_messages, 
                         provider, 
                         model_name, 
-                        tools=formatted_tools
+                        tools=filtered_raw_tools_list
                     )
                     current_loop_logger.info(f"DEBUG: Current token count (incl. tools): {current_tokens}, Limit: {max_tokens}")
                     
@@ -1263,7 +1782,7 @@ def run_execution_loop(provider: str, model_name: str, base_sys_prompt: str, use
                             max_tokens=max_tokens,
                             provider=provider,
                             model_name=model_name,
-                            tools=formatted_tools,
+                            tools=filtered_raw_tools_list,
                             logger=current_loop_logger
                         )
                         
@@ -1272,7 +1791,7 @@ def run_execution_loop(provider: str, model_name: str, base_sys_prompt: str, use
                         current_loop_logger.info(f"DEBUG: Smart pruning results: {original_count} → {final_count} messages")
                         
                         try:
-                            final_tokens = calculate_input_tokens(llm_context_messages, provider, model_name, tools=formatted_tools)
+                            final_tokens = token_counter.calculate_input_tokens(llm_context_messages, provider, model_name, tools=filtered_raw_tools_list)
                             current_loop_logger.info(f"DEBUG: Smart pruning token results: {current_tokens} → {final_tokens} tokens")
                             
                             if final_tokens > max_tokens:
@@ -1302,26 +1821,23 @@ def run_execution_loop(provider: str, model_name: str, base_sys_prompt: str, use
             # Note: formatted_tools was prepared BEFORE the pruning loop
             response_data = None
             with st.spinner(f"Thinking... (Step {loop_count}/{max_iterations}) / Tokens: ~{current_tokens if 'current_tokens' in locals() else 'N/A'}"):
-                try:
-                    current_loop_logger.info(f"Calling LLM ({provider} - {model_name})...")
-                    response_data = get_llm_response(
-                        messages=llm_context_messages, 
-                        system_prompt=effective_system_prompt,
-                        tools=formatted_tools,
-                        provider=provider,
-                        model_name=model_name,
-                        user_request_id=user_req_id
-                    )
-                    if response_data is None:
-                         st.error("LLM response was empty.")
-                         current_loop_logger.error("LLM response data was None.")
-                         break
-                    else:
-                        current_loop_logger.info(f"Received response from LLM ({provider}).")
-                except Exception as e:
-                    st.error(f"Error calling LLM API: {e}")
-                    current_loop_logger.error(f"Error calling LLM API ({provider}): {e}", exc_info=True)
-                    break
+                current_loop_logger.info(f"Calling LLM ({provider} - {model_name})...")
+                chat_manager = get_chat_manager()
+                response_data = chat_manager.get_llm_response(
+                    messages=llm_context_messages, 
+                    system_prompt=effective_system_prompt,
+                    provider=provider,
+                    model_name=model_name,
+                    user_request_id=user_req_id,
+                    selected_nifi_server_id=current_nifi_server_id,
+                    tools=filtered_raw_tools_list  # Pass pre-filtered tools directly
+                )
+                if response_data is None:
+                     st.error("LLM response was empty.")
+                     current_loop_logger.error("LLM response data was None.")
+                     break
+                else:
+                    current_loop_logger.info(f"Received response from LLM ({provider}).")
             # ---------------
             
             # --- Process LLM Response --- 
@@ -1569,15 +2085,25 @@ if is_executing or pending_execution:
             bound_logger.info(f"Guided mode execution: selected_workflow='{selected_workflow}', execution_mode='{execution_mode}'")
             
             if selected_workflow:
-                # Run guided workflow
-                bound_logger.info(f"Starting guided workflow execution: {selected_workflow}")
-                run_workflow_execution(
-                    workflow_name=selected_workflow,
-                    provider=provider, 
-                    model_name=model_name, 
-                    base_sys_prompt=base_system_prompt, 
-                    user_req_id=user_req_id
-                )
+                # Check if this is an async workflow
+                if selected_workflow == "async_unguided_mimic":
+                    # Run async workflow with integrated real-time UI
+                    try:
+                        run_async_workflow_integrated(selected_workflow, provider, model_name, base_system_prompt, user_req_id)
+                    except Exception as e:
+                        bound_logger.error(f"Failed to run async workflow: {e}", exc_info=True)
+                        st.error(f"Failed to run async workflow: {str(e)}")
+                        # Fall back to regular workflow execution
+                        run_workflow_execution(selected_workflow, provider, model_name, base_system_prompt, user_req_id)
+                else:
+                    # Run regular guided workflow
+                    run_workflow_execution(
+                        workflow_name=selected_workflow,
+                        provider=provider, 
+                        model_name=model_name, 
+                        base_sys_prompt=base_system_prompt, 
+                        user_req_id=user_req_id
+                    )
             else:
                 # No workflow selected, show error and fall back to unguided
                 bound_logger.warning(f"Guided mode selected but no workflow chosen (selected_workflow='{selected_workflow}'), falling back to unguided")

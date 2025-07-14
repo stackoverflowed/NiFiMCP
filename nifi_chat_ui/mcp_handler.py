@@ -11,6 +11,59 @@ import os
 from loguru import logger # Import Loguru logger
 from google.protobuf.internal.containers import MessageMap # Import the type if possible
 
+def _convert_mapcomposite_to_dict(value):
+    """
+    Recursively convert MapComposite objects and other Google Proto objects to serializable dictionaries.
+    
+    Args:
+        value: The value to convert, which may be a MapComposite, list, dict, or primitive type
+        
+    Returns:
+        A JSON-serializable representation of the value
+    """
+    # Handle MapComposite objects
+    if hasattr(value, 'items') and callable(value.items):
+        # This is a MapComposite or similar dict-like object
+        result = {}
+        for key, val in value.items():
+            result[key] = _convert_mapcomposite_to_dict(val)  # Recursive conversion
+        return result
+    
+    # Handle lists (including ListComposite)
+    elif isinstance(value, list) or (hasattr(value, '__iter__') and not isinstance(value, (str, bytes))):
+        try:
+            return [_convert_mapcomposite_to_dict(item) for item in value]
+        except TypeError:
+            # If iteration fails, convert to string
+            return str(value)
+    
+    # Handle dictionaries
+    elif isinstance(value, dict):
+        result = {}
+        for key, val in value.items():
+            result[key] = _convert_mapcomposite_to_dict(val)
+        return result
+    
+    # Handle Google Proto objects and other complex objects
+    elif hasattr(value, '__dict__') or hasattr(value, '_pb') or str(type(value)).startswith('<google'):
+        # Try to convert to dict if it has dict-like behavior
+        if hasattr(value, 'items') and callable(value.items):
+            result = {}
+            for key, val in value.items():
+                result[key] = _convert_mapcomposite_to_dict(val)
+            return result
+        else:
+            # Fall back to string representation
+            return str(value)
+    
+    # Handle primitive types - test if JSON serializable
+    else:
+        try:
+            json.dumps(value)
+            return value
+        except (TypeError, OverflowError):
+            return str(value)
+
 # --- Configuration --- #
 # URL for the FastAPI server
 API_BASE_URL = "http://localhost:8000"
@@ -78,12 +131,8 @@ def execute_mcp_tool(
     # Convert MapComposite to dict before creating payload
     processed_params = {}
     for key, value in params.items():
-        # Check if the object is an instance of MapComposite
-        # Using type name check as a fallback if direct import is tricky
-        if isinstance(value, MessageMap) or type(value).__name__ == 'MapComposite': 
-            processed_params[key] = dict(value)
-        else:
-            processed_params[key] = value
+        # Use the robust recursive conversion function
+        processed_params[key] = _convert_mapcomposite_to_dict(value)
 
     # Add context IDs to the payload
     payload = {

@@ -517,9 +517,7 @@ async def test_purge_process_group(
     # Create additional processors for multiple connections
     processors = []
     for i in range(2):  # Create 2 additional GenerateFlowFile processors
-        # Create processor
         create_proc_args = {
-            "process_group_id": pg_id,
             "processor_type": "org.apache.nifi.processors.standard.GenerateFlowFile",
             "name": f"Generate_{i+2}",  # Generate_2, Generate_3
             "position_x": (i+2) * 200,  # Space them out
@@ -529,7 +527,10 @@ async def test_purge_process_group(
             client=async_client,
             base_url=base_url,
             tool_name="create_nifi_processors",
-            arguments={"processors": [create_proc_args]},
+            arguments={
+                "processors": [create_proc_args],
+                "process_group_id": pg_id
+            },
             headers=mcp_headers,
             custom_logger=global_logger
         )

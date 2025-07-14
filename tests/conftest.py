@@ -50,7 +50,7 @@ async def async_client() -> AsyncGenerator[httpx.AsyncClient, None]:
 
 # --- Header Fixtures ---
 
-@pytest.fixture(scope="session")
+@pytest.fixture(scope="module")
 def base_headers() -> dict:
     """Basic headers for most API calls."""
     return {
@@ -58,7 +58,7 @@ def base_headers() -> dict:
         "Accept": "application/json",
     }
 
-@pytest.fixture(scope="function")
+@pytest.fixture(scope="module")
 def mcp_headers(base_headers: dict, nifi_test_server_id: str) -> dict:
     """Headers required for MCP NiFi operations, including the target server ID."""
     return {
@@ -66,6 +66,17 @@ def mcp_headers(base_headers: dict, nifi_test_server_id: str) -> dict:
         "X-Nifi-Server-Id": nifi_test_server_id,
     }
 
+@pytest.fixture(scope="module")
+def nifi_test_server_id():
+    """Provides the NiFi server ID for testing from config."""
+    servers = get_nifi_servers()
+    if not servers:
+        pytest.fail("No NiFi servers configured in config.yaml")
+    # Use the first configured server for testing
+    server_id = servers[0].get('id')
+    if not server_id:
+        pytest.fail("First NiFi server in config.yaml has no ID")
+    return server_id
 
 @pytest.fixture(scope="module", autouse=True)
 async def check_server_connectivity(base_url: str, nifi_test_server_id: str, async_client: httpx.AsyncClient, global_logger: Any):
@@ -93,18 +104,33 @@ async def check_server_connectivity(base_url: str, nifi_test_server_id: str, asy
 
 # Add more fixtures here as we refactor (e.g., for creating/cleaning up test PGs)
 
+# --- Root Process Group ID Fixture ---
+
+@pytest.fixture(scope="module")
+async def root_process_group_id(async_client, base_url, mcp_headers, global_logger):
+    """Fetch the root process group ID for the configured NiFi server."""
+    url = f"{base_url}/tools/get_process_group_status"
+    resp = await async_client.post(url, json={"arguments": {"process_group_id": "root"}}, headers=mcp_headers)
+    resp.raise_for_status()
+    data = resp.json()
+    root_pg_id = data.get("process_group_id")
+    assert root_pg_id, "Could not fetch root process group ID"
+    global_logger.info(f"Fetched root process group ID: {root_pg_id}")
+    return root_pg_id
+
 @pytest.fixture(scope="function")
 async def test_pg(
     async_client: httpx.AsyncClient,
     base_url: str,
     mcp_headers: dict,
     nifi_test_server_id: str,  # Changed from test_run_id
-    global_logger: Any
+    global_logger: Any,
+    root_process_group_id: str,  # <-- Add this
 ):
     """Creates a test process group for a test function and ensures its deletion afterwards."""
     pg_name = f"mcp-test-pg-{nifi_test_server_id}"  # Use server ID instead of run ID
     global_logger.info(f"Fixture: Creating test process group: {pg_name}")
-    create_pg_args = {"name": pg_name, "position_x": 0, "position_y": 0}
+    create_pg_args = {"name": pg_name, "position_x": 0, "position_y": 0, "parent_process_group_id": root_process_group_id}
     
     pg_result_list = await call_tool(
         client=async_client, 
@@ -281,7 +307,8 @@ async def test_pg_with_processors(
     base_url: str,
     mcp_headers: dict,
     nifi_test_server_id: str, # Changed from test_run_id
-    global_logger: Any
+    global_logger: Any,
+    root_process_group_id: str,  # <-- Add this for consistency (even if not used directly)
 ) -> AsyncGenerator[Dict[str, Any], None]:
     """Creates a test PG and two standard processors (Generate & Log) within it."""
     pg_id = test_pg["id"]
@@ -294,7 +321,6 @@ async def test_pg_with_processors(
     # 1. Create GenerateFlowFile Processor
     gen_proc_name = f"mcp-test-generate-{nifi_test_server_id}"  # Use server ID instead of run ID
     create_gen_args = {
-        "process_group_id": pg_id,
         "processor_type": "org.apache.nifi.processors.standard.GenerateFlowFile",
         "name": gen_proc_name,
         "position_x": 0,
@@ -305,7 +331,7 @@ async def test_pg_with_processors(
         client=async_client,
         base_url=base_url,
         tool_name="create_nifi_processors",
-        arguments={"processors": [create_gen_args]},
+        arguments={"processors": [create_gen_args], "process_group_id": pg_id},
         headers=mcp_headers,
         custom_logger=global_logger
     )
@@ -334,7 +360,6 @@ async def test_pg_with_processors(
     # 2. Create LogAttribute Processor
     log_proc_name = f"mcp-test-log-{nifi_test_server_id}"  # Use server ID instead of run ID
     create_log_args = {
-        "process_group_id": pg_id,
         "processor_type": "org.apache.nifi.processors.standard.LogAttribute",
         "name": log_proc_name,
         "position_x": 0,
@@ -345,7 +370,7 @@ async def test_pg_with_processors(
         client=async_client,
         base_url=base_url,
         tool_name="create_nifi_processors",
-        arguments={"processors": [create_log_args]},
+        arguments={"processors": [create_log_args], "process_group_id": pg_id},
         headers=mcp_headers,
         custom_logger=global_logger
     )
@@ -372,24 +397,24 @@ async def test_pg_with_processors(
     log_details = log_details_list[0].get("component", log_details_list[0])
 
     # 3. Create Split Processor (RouteOnAttribute)
+    split_proc_args = {
+        "processor_type": "org.apache.nifi.processors.standard.RouteOnAttribute",
+        "name": "Split Flow",
+        "position_x": 300,
+        "position_y": 100,
+        "properties": {
+            "Route Strategy": "Route to Property name",
+            "Routing Strategy": "Route to Property name",
+            "success": "${status:equals('success')}",
+            "failure": "${status:equals('failure')}",
+            "original": "${status:equals('original')}"
+        }
+    }
     split_proc_result_list = await call_tool(
         client=async_client,
         base_url=base_url,
         tool_name="create_nifi_processors",
-        arguments={"processors": [{
-            "process_group_id": pg_id,
-            "processor_type": "org.apache.nifi.processors.standard.RouteOnAttribute",
-            "name": "Split Flow",
-            "position_x": 300,
-            "position_y": 100,
-            "properties": {
-                "Route Strategy": "Route to Property name",
-                "Routing Strategy": "Route to Property name",
-                "success": "${status:equals('success')}",
-                "failure": "${status:equals('failure')}",
-                "original": "${status:equals('original')}"
-            }
-        }]},
+        arguments={"processors": [split_proc_args], "process_group_id": pg_id},
         headers=mcp_headers,
         custom_logger=global_logger
     )
@@ -481,24 +506,13 @@ async def test_connection(
     except Exception as e_del_conn:
         global_logger.error(f"Fixture: Error during Connection {connection_id} deletion: {e_del_conn}", exc_info=False)
 
-@pytest.fixture(scope="session")
-def nifi_test_server_id():
-    """Provides the NiFi server ID for testing from config."""
-    servers = get_nifi_servers()
-    if not servers:
-        pytest.fail("No NiFi servers configured in config.yaml")
-    # Use the first configured server for testing
-    server_id = servers[0].get('id')
-    if not server_id:
-        pytest.fail("First NiFi server in config.yaml has no ID")
-    return server_id
-
 @pytest.fixture
 async def test_complex_flow(
     async_client: httpx.AsyncClient,
     base_url: str,
     mcp_headers: Dict[str, str],
-    global_logger: Any
+    global_logger: Any,
+    root_process_group_id: str,  # <-- Add this
 ) -> AsyncGenerator[Dict[str, Any], None]:
     """Creates a more complex flow for testing documentation features.
     
@@ -513,7 +527,8 @@ async def test_complex_flow(
     pg_creation = {
         "name": f"mcp-test-doc-flow-{mcp_headers['X-Nifi-Server-Id']}",
         "position_x": 0,
-        "position_y": 0
+        "position_y": 0,
+        "parent_process_group_id": root_process_group_id,
     }
     
     # Create the process group
@@ -540,13 +555,15 @@ async def test_complex_flow(
             client=async_client,
             base_url=base_url,
             tool_name="create_nifi_ports",
-            arguments={"ports": [{
-                "process_group_id": pg_id,
-                "name": "Test Input",
-                "position_x": 100,
-                "position_y": 100,
-                "port_type": "input"
-            }]},
+            arguments={
+                "ports": [{
+                    "name": "Test Input",
+                    "position_x": 100,
+                    "position_y": 100,
+                    "port_type": "input"
+                }],
+                "process_group_id": pg_id
+            },
             headers=mcp_headers,
             custom_logger=global_logger
         )
@@ -563,20 +580,22 @@ async def test_complex_flow(
             client=async_client,
             base_url=base_url,
             tool_name="create_nifi_processors",
-            arguments={"processors": [{
-                "process_group_id": pg_id,
-                "processor_type": "org.apache.nifi.processors.standard.RouteOnAttribute",
-                "name": "Split Flow",
-                "position_x": 300,
-                "position_y": 100,
-                "properties": {
-                    "Route Strategy": "Route to Property name",
-                    "Routing Strategy": "Route to Property name",
-                    "success": "${status:equals('success')}",
-                    "failure": "${status:equals('failure')}",
-                    "original": "${status:equals('original')}"
-                }
-            }]},
+            arguments={
+                "processors": [{
+                    "processor_type": "org.apache.nifi.processors.standard.RouteOnAttribute",
+                    "name": "Split Flow",
+                    "position_x": 300,
+                    "position_y": 100,
+                    "properties": {
+                        "Route Strategy": "Route to Property name",
+                        "Routing Strategy": "Route to Property name",
+                        "success": "${status:equals('success')}",
+                        "failure": "${status:equals('failure')}",
+                        "original": "${status:equals('original')}"
+                    }
+                }],
+                "process_group_id": pg_id
+            },
             headers=mcp_headers,
             custom_logger=global_logger
         )
@@ -593,16 +612,18 @@ async def test_complex_flow(
             client=async_client,
             base_url=base_url,
             tool_name="create_nifi_processors",
-            arguments={"processors": [{
-                "process_group_id": pg_id,
-                "processor_type": "org.apache.nifi.processors.attributes.UpdateAttribute",
-                "name": "Transform Data",
-                "position_x": 500,
-                "position_y": 0,
-                "properties": {
-                    "transformed": "true"
-                }
-            }]},
+            arguments={
+                "processors": [{
+                    "processor_type": "org.apache.nifi.processors.attributes.UpdateAttribute",
+                    "name": "Transform Data",
+                    "position_x": 500,
+                    "position_y": 0,
+                    "properties": {
+                        "transformed": "true"
+                    }
+                }],
+                "process_group_id": pg_id
+            },
             headers=mcp_headers,
             custom_logger=global_logger
         )
@@ -619,17 +640,19 @@ async def test_complex_flow(
             client=async_client,
             base_url=base_url,
             tool_name="create_nifi_processors",
-            arguments={"processors": [{
-                "process_group_id": pg_id,
-                "processor_type": "org.apache.nifi.processors.standard.MergeContent",
-                "name": "Merge Results",
-                "position_x": 700,
-                "position_y": 0,
-                "properties": {
-                    "Merge Strategy": "Defragment",
-                    "Correlation Attribute Name": "fragment.identifier"
-                }
-            }]},
+            arguments={
+                "processors": [{
+                    "processor_type": "org.apache.nifi.processors.standard.MergeContent",
+                    "name": "Merge Results",
+                    "position_x": 700,
+                    "position_y": 0,
+                    "properties": {
+                        "Merge Strategy": "Defragment",
+                        "Correlation Attribute Name": "fragment.identifier"
+                    }
+                }],
+                "process_group_id": pg_id
+            },
             headers=mcp_headers,
             custom_logger=global_logger
         )
@@ -646,17 +669,19 @@ async def test_complex_flow(
             client=async_client,
             base_url=base_url,
             tool_name="create_nifi_processors",
-            arguments={"processors": [{
-                "process_group_id": pg_id,
-                "processor_type": "org.apache.nifi.processors.standard.LogAttribute",
-                "name": "Log Error",
-                "position_x": 500,
-                "position_y": 200,
-                "properties": {
-                    "Log Level": "WARN",
-                    "Log Prefix": "Flow Error"
-                }
-            }]},
+            arguments={
+                "processors": [{
+                    "processor_type": "org.apache.nifi.processors.standard.LogAttribute",
+                    "name": "Log Error",
+                    "position_x": 500,
+                    "position_y": 200,
+                    "properties": {
+                        "Log Level": "WARN",
+                        "Log Prefix": "Flow Error"
+                    }
+                }],
+                "process_group_id": pg_id
+            },
             headers=mcp_headers,
             custom_logger=global_logger
         )
@@ -673,17 +698,19 @@ async def test_complex_flow(
             client=async_client,
             base_url=base_url,
             tool_name="create_nifi_processors",
-            arguments={"processors": [{
-                "process_group_id": pg_id,
-                "processor_type": "org.apache.nifi.processors.standard.LogAttribute",
-                "name": "Log Original",
-                "position_x": 500,
-                "position_y": 400,
-                "properties": {
-                    "Log Level": "INFO",
-                    "Log Prefix": "Original Flow"
-                }
-            }]},
+            arguments={
+                "processors": [{
+                    "processor_type": "org.apache.nifi.processors.standard.LogAttribute",
+                    "name": "Log Original",
+                    "position_x": 500,
+                    "position_y": 400,
+                    "properties": {
+                        "Log Level": "INFO",
+                        "Log Prefix": "Original Flow"
+                    }
+                }],
+                "process_group_id": pg_id
+            },
             headers=mcp_headers,
             custom_logger=global_logger
         )
@@ -898,7 +925,8 @@ async def test_merge_flow(
     async_client: httpx.AsyncClient,
     base_url: str,
     mcp_headers: Dict[str, str],
-    global_logger: Any
+    global_logger: Any,
+    root_process_group_id: str,  # <-- Add this
 ) -> AsyncGenerator[Dict[str, Any], None]:
     """Creates a flow with multiple inputs converging to a single processor.
     
@@ -912,7 +940,8 @@ async def test_merge_flow(
     pg_creation = {
         "name": f"mcp-test-merge-flow-{mcp_headers['X-Nifi-Server-Id']}",
         "position_x": 0,
-        "position_y": 0
+        "position_y": 0,
+        "parent_process_group_id": root_process_group_id,
     }
     
     pg_result_list = await call_tool(
@@ -937,16 +966,18 @@ async def test_merge_flow(
             client=async_client,
             base_url=base_url,
             tool_name="create_nifi_processors",
-            arguments={"processors": [{
-                "process_group_id": pg_id,
-                "processor_type": "org.apache.nifi.processors.standard.GenerateFlowFile",
-                "name": "Generate Flow 1",
-                "position_x": 100,
-                "position_y": 100,
-                "properties": {
-                    "Custom Text": "Data from source 1"
-                }
-            }]},
+            arguments={
+                "processors": [{
+                    "processor_type": "org.apache.nifi.processors.standard.GenerateFlowFile",
+                    "name": "Generate Flow 1",
+                    "position_x": 100,
+                    "position_y": 100,
+                    "properties": {
+                        "Custom Text": "Data from source 1"
+                    }
+                }],
+                "process_group_id": pg_id
+            },
             headers=mcp_headers,
             custom_logger=global_logger
         )
@@ -963,16 +994,18 @@ async def test_merge_flow(
             client=async_client,
             base_url=base_url,
             tool_name="create_nifi_processors",
-            arguments={"processors": [{
-                "process_group_id": pg_id,
-                "processor_type": "org.apache.nifi.processors.standard.GenerateFlowFile",
-                "name": "Generate Flow 2",
-                "position_x": 100,
-                "position_y": 300,
-                "properties": {
-                    "Custom Text": "Data from source 2"
-                }
-            }]},
+            arguments={
+                "processors": [{
+                    "processor_type": "org.apache.nifi.processors.standard.GenerateFlowFile",
+                    "name": "Generate Flow 2",
+                    "position_x": 100,
+                    "position_y": 300,
+                    "properties": {
+                        "Custom Text": "Data from source 2"
+                    }
+                }],
+                "process_group_id": pg_id
+            },
             headers=mcp_headers,
             custom_logger=global_logger
         )
@@ -989,16 +1022,18 @@ async def test_merge_flow(
             client=async_client,
             base_url=base_url,
             tool_name="create_nifi_processors",
-            arguments={"processors": [{
-                "process_group_id": pg_id,
-                "processor_type": "org.apache.nifi.processors.attributes.UpdateAttribute",
-                "name": "Update 1",
-                "position_x": 400,
-                "position_y": 100,
-                "properties": {
-                    "source": "flow1"
-                }
-            }]},
+            arguments={
+                "processors": [{
+                    "processor_type": "org.apache.nifi.processors.attributes.UpdateAttribute",
+                    "name": "Update 1",
+                    "position_x": 400,
+                    "position_y": 100,
+                    "properties": {
+                        "source": "flow1"
+                    }
+                }],
+                "process_group_id": pg_id
+            },
             headers=mcp_headers,
             custom_logger=global_logger
         )
@@ -1015,16 +1050,18 @@ async def test_merge_flow(
             client=async_client,
             base_url=base_url,
             tool_name="create_nifi_processors",
-            arguments={"processors": [{
-                "process_group_id": pg_id,
-                "processor_type": "org.apache.nifi.processors.attributes.UpdateAttribute",
-                "name": "Update 2",
-                "position_x": 400,
-                "position_y": 300,
-                "properties": {
-                    "source": "flow2"
-                }
-            }]},
+            arguments={
+                "processors": [{
+                    "processor_type": "org.apache.nifi.processors.attributes.UpdateAttribute",
+                    "name": "Update 2",
+                    "position_x": 400,
+                    "position_y": 300,
+                    "properties": {
+                        "source": "flow2"
+                    }
+                }],
+                "process_group_id": pg_id
+            },
             headers=mcp_headers,
             custom_logger=global_logger
         )
@@ -1041,17 +1078,19 @@ async def test_merge_flow(
             client=async_client,
             base_url=base_url,
             tool_name="create_nifi_processors",
-            arguments={"processors": [{
-                "process_group_id": pg_id,
-                "processor_type": "org.apache.nifi.processors.standard.MergeContent",
-                "name": "Merge Flows",
-                "position_x": 700,
-                "position_y": 200,
-                "properties": {
-                    "Merge Strategy": "Defragment",
-                    "Correlation Attribute Name": "source"
-                }
-            }]},
+            arguments={
+                "processors": [{
+                    "processor_type": "org.apache.nifi.processors.standard.MergeContent",
+                    "name": "Merge Flows",
+                    "position_x": 700,
+                    "position_y": 200,
+                    "properties": {
+                        "Merge Strategy": "Defragment",
+                        "Correlation Attribute Name": "source"
+                    }
+                }],
+                "process_group_id": pg_id
+            },
             headers=mcp_headers,
             custom_logger=global_logger
         )

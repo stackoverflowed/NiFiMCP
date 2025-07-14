@@ -1,3 +1,7 @@
+The following is an example of an actual conversation with an LLM (gpt 4.1) to DEBUG an existing flow.  The process starts with inserting the following flow spec (including sections 1 - 5) into the "Objective" textbox at the top of the chat session.  This will be sent as part of the system prompt for each request to ensure the LLM never forgets what it is working on.  After that we start the conversation by asking the LLM to "please proceed with the objective".  
+
+
+
 ## Conversation History: This is the actual log of a conversation using the ChatGPT 4.1 LLM to build a new flow
 
 **User:**
@@ -88,8 +92,11 @@ We have a flow in group id: 01961089-6001-1312-1782-81ffaa4c9729 (root-> "Martin
 - Missing `order.shipping.method`: Default to "standard" (no extra fee).
 - Empty `order.items`: Return error response.
 
+---
 
+## Flow Diagram
 
+![Example Conversation Flow Diagram](./ExampleConversationFlowDiagram.png)
 
 **Assistant:** ⚙️ Calling tool(s): `document_nifi_flow`...
 
@@ -385,7 +392,24 @@ if (!indata.userId || !indata.order?.items || !indata.order.shipping?.address) {
     result.error = true
     result.status = 'error'
     result.message = 'Missing required fields.'
-    ...
+    session.write(flowFile, { outputStream ->
+        outputStream.write(JsonOutput.toJson(result).getBytes(StandardCharsets.UTF_8))
+    } as OutputStreamCallback)
+    flowFile = session.putAttribute(flowFile, 'http.status.code', '400')
+    REL_FAILURE << flowFile
+    return
+}
+if (!indata.order.items || !indata.order.items.size()) {
+    result.error = true
+    result.status = 'error'
+    result.message = 'Order items empty.'
+    session.write(flowFile, { outputStream ->
+        outputStream.write(JsonOutput.toJson(result).getBytes(StandardCharsets.UTF_8))
+    } as OutputStreamCallback)
+    flowFile = session.putAttribute(flowFile, 'http.status.code', '400')
+    REL_FAILURE << flowFile
+    return
+}
 ```
 
 **Key issue:**  
@@ -398,7 +422,13 @@ if (!indata.order.items || !indata.order.items.size()) {
     result.error = true
     result.status = 'error'
     result.message = 'Order items empty.'
-    ...
+    session.write(flowFile, { outputStream ->
+        outputStream.write(JsonOutput.toJson(result).getBytes(StandardCharsets.UTF_8))
+    } as OutputStreamCallback)
+    flowFile = session.putAttribute(flowFile, 'http.status.code', '400')
+    REL_FAILURE << flowFile
+    return
+}
 ```
 
 **In your payload:**
@@ -668,7 +698,7 @@ TASK COMPLETE
 excellent!  it works now.
 
 **Assistant:**
-Great to hear that it’s working! 🎉
+Great to hear that it's working! 🎉
 
 If you have any more issues or need help tuning, validating, or adding features to your NiFi flows, just let me know. Happy dataflowing!
 
