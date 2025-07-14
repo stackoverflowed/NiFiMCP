@@ -1319,9 +1319,8 @@ async def create_nifi_flow(
         results.append({"status": "error", "message": f"An unexpected error occurred during flow creation: {e}"})
         return results
 
-# TEMPORARILY DISABLED: Complex tool removed from LLM exposure
-# @mcp.tool()
-# @tool_phases(["Build"])
+@mcp.tool()
+@tool_phases(["Build"])
 async def create_complete_nifi_flow(
     nifi_objects: List[Dict[str, Any]],
     process_group_id: str | None = None,
@@ -1780,14 +1779,15 @@ async def create_complete_nifi_flow(
                 continue
             
             local_logger.info(f"Creating processor: {name} ({processor_type})")
-            proc_result = await create_nifi_processors([{
-                "processor_type": processor_type,
-                "name": name,
-                "position_x": position["x"],
-                "position_y": position["y"],
-                "process_group_id": target_pg_id,
-                "properties": resolved_properties
-            }])
+            proc_result = await create_nifi_processors([
+                {
+                    "processor_type": processor_type,
+                    "name": name,
+                    "position_x": position["x"],
+                    "position_y": position["y"],
+                    "properties": resolved_properties
+                }
+            ], process_group_id=target_pg_id)
             # Extract the single result from the list
             proc_result = proc_result[0] if proc_result else {"status": "error", "message": "No result returned"}
             

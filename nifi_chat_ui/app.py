@@ -226,18 +226,9 @@ with st.sidebar:
         st.error("No LLM models configured or API keys missing. Please check your .env file.")
     else:
         # Determine default selection
-        # Prioritize Gemini if available, otherwise first OpenAI, else first in list
-        default_selection = None
-        if config.GOOGLE_API_KEY and config.GEMINI_MODELS:
-            default_selection = f"Google: {config.GEMINI_MODELS[0]}"
-        elif config.OPENAI_API_KEY and config.OPENAI_MODELS:
-             default_selection = f"OpenAI: {config.OPENAI_MODELS[0]}"
-        
-        # Ensure default is actually in the list
-        if default_selection not in available_models:
-            default_selection = available_models[0] # Fallback to first item
-        
-        default_index = list(available_models.keys()).index(default_selection)
+        # Use the first value from the dropdown list of models as the default
+        default_selection = list(available_models.keys())[0]
+        default_index = 0
         
         selected_model_display_name = st.selectbox(
             "Select LLM Model:", 
@@ -305,91 +296,22 @@ with st.sidebar:
     st.markdown("---") # Add separator
     
     # Initialize workflow session state
-    if "workflow_execution_mode" not in st.session_state:
-        st.session_state.workflow_execution_mode = "unguided"  # Default to unguided
+    # TEMPORARY: Hide Execution Mode dropdown and force 'unguided' mode
+    st.session_state.workflow_execution_mode = "unguided"  # Always set to unguided
+    # (Do not render the selectbox for execution mode)
+    # (Remove or comment out the selectbox and related logic)
+    # END TEMPORARY
+    
     if "selected_workflow" not in st.session_state:
         st.session_state.selected_workflow = None
     if "available_workflows" not in st.session_state:
         st.session_state.available_workflows = []
     
-    # Execution Mode Selection
-    execution_modes = ["unguided", "guided"]
-    current_mode_index = execution_modes.index(st.session_state.workflow_execution_mode) if st.session_state.workflow_execution_mode in execution_modes else 0
-    
-    def on_execution_mode_change():
-        new_mode = st.session_state.execution_mode_selector
-        if st.session_state.workflow_execution_mode != new_mode:
-            st.session_state.workflow_execution_mode = new_mode
-            # Reset workflow selection when mode changes
-            st.session_state.selected_workflow = None
-            logger.info(f"Workflow execution mode changed to: {new_mode}")
-    
-    st.selectbox(
-        "Execution Mode:",
-        options=execution_modes,
-        index=current_mode_index,
-        key="execution_mode_selector",
-        on_change=on_execution_mode_change,
-        help="Select workflow execution mode: 'unguided' for free-form chat, 'guided' for structured workflows"
-    )
-    
     # === WORKFLOW SELECTION (for guided mode) ===
-    if st.session_state.workflow_execution_mode == "guided":
-        st.markdown("---")
-        
-        # Get available workflows
-        try:
-            from nifi_mcp_server.workflows.registry import get_workflow_registry
-            registry = get_workflow_registry()
-            available_workflows = registry.list_workflows(enabled_only=True)
-            
-            if available_workflows:
-                workflow_options = {wf.name: wf.display_name for wf in available_workflows}
-                workflow_names = list(workflow_options.keys())
-                
-                # Determine current selection
-                current_workflow = st.session_state.get("selected_workflow")
-                if current_workflow in workflow_names:
-                    default_index = workflow_names.index(current_workflow)
-                else:
-                    default_index = 0
-                    st.session_state.selected_workflow = workflow_names[0] if workflow_names else None
-                
-                def on_workflow_change():
-                    new_workflow = st.session_state.workflow_selector
-                    if st.session_state.selected_workflow != new_workflow:
-                        st.session_state.selected_workflow = new_workflow
-                        logger.info(f"Selected workflow changed to: {new_workflow}")
-                
-                st.selectbox(
-                    "Select Workflow:",
-                    options=workflow_names,
-                    format_func=lambda x: workflow_options.get(x, x),
-                    index=default_index,
-                    key="workflow_selector",
-                    on_change=on_workflow_change,
-                    help="Choose the guided workflow to execute"
-                )
-                
-                # Show workflow description
-                if st.session_state.selected_workflow:
-                    selected_wf = next((wf for wf in available_workflows if wf.name == st.session_state.selected_workflow), None)
-                    if selected_wf:
-                        # Add special indicator for async workflows
-                        async_indicator = ""
-                        if selected_wf.name == "async_unguided_mimic":
-                            async_indicator = " ⚡ **Real-time updates enabled**"
-                        
-                        st.info(f"**{selected_wf.display_name}**: {selected_wf.description}{async_indicator}")
-            else:
-                st.warning("No guided workflows available.")
-                st.session_state.selected_workflow = None
-                
-        except Exception as e:
-            st.error(f"Failed to load workflows: {e}")
-            st.session_state.selected_workflow = None
-    
-    # === PHASE SELECTION ===
+    # (Do not render workflow selection if execution mode is always 'unguided')
+    # ... existing code ...
+
+    # --- PHASE SELECTION ===
     st.markdown("---") # Add separator
     phase_options = ["All", "Review", "Build", "Modify", "Operate"]
     # Initialize session state for selected_phase if it doesn't exist

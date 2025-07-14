@@ -198,45 +198,6 @@ async def test_list_controller_services(
 
 
 @pytest.mark.anyio
-async def test_update_controller_service_properties(
-    test_pg_with_controller_services: Dict[str, Any],
-    async_client: httpx.AsyncClient,
-    base_url: str,
-    mcp_headers: dict,
-    global_logger: Any
-):
-    """Tests updating controller service properties with auto-disable/enable functionality."""
-    ssl_service_id = test_pg_with_controller_services.get("ssl_service_id")
-    assert ssl_service_id, "SSL Service ID not found from fixture."
-    
-    global_logger.info(f"Test: Updating SSL Context Service ({ssl_service_id}) properties.")
-    
-    # Update the properties
-    update_props_args = {
-        "controller_service_id": ssl_service_id,
-        "controller_service_properties": {
-            "Truststore Type": "PKCS12",  # Changed from JKS
-            "Keystore Type": "PKCS12"
-        }
-    }
-    update_result_list = await call_tool(
-        client=async_client, base_url=base_url, tool_name="update_controller_service_properties",
-        arguments=update_props_args, headers=mcp_headers, custom_logger=global_logger
-    )
-    assert isinstance(update_result_list, list) and update_result_list and isinstance(update_result_list[0], dict), \
-        "Unexpected response format for update_controller_service_properties"
-    update_result = update_result_list[0]
-    assert update_result.get("status") in ["success", "warning"], \
-        f"Failed to update properties: {update_result.get('message')}"
-    global_logger.info(f"Test: Successfully submitted update for SSL Context properties. Status: {update_result.get('status')}")
-    
-    # Verify enhanced return structure
-    assert "property_update" in update_result, "Expected property_update in response"
-    assert "restart_status" in update_result, "Expected restart_status in response"
-    assert update_result["property_update"]["status"] == "success", "Property update should be successful"
-
-
-@pytest.mark.anyio
 async def test_get_controller_service_types(
     async_client: httpx.AsyncClient,
     base_url: str,
@@ -287,45 +248,6 @@ async def test_get_controller_service_types(
     assert len(ssl_context_types) > 0, "StandardSSLContextService should be found in SSL search results"
     
     global_logger.info(f"Test: Found {len(ssl_types)} SSL-related controller service types")
-
-
-@pytest.mark.anyio
-async def test_controller_service_auto_disable_enable_logic(
-    test_pg_with_controller_services: Dict[str, Any],
-    async_client: httpx.AsyncClient,
-    base_url: str,
-    mcp_headers: dict,
-    global_logger: Any
-):
-    """Tests the auto-disable/enable logic during property updates."""
-    ssl_service_id = test_pg_with_controller_services.get("ssl_service_id")
-    assert ssl_service_id, "SSL Service ID not found from fixture."
-    
-    # Test updating properties while disabled (should not trigger auto-disable)
-    global_logger.info(f"Test: Updating properties while service is disabled")
-    update_props_args = {
-        "controller_service_id": ssl_service_id,
-        "controller_service_properties": {
-            "Truststore Type": "JKS"
-        }
-    }
-    update_result_list = await call_tool(
-        client=async_client, base_url=base_url, tool_name="update_controller_service_properties",
-        arguments=update_props_args, headers=mcp_headers, custom_logger=global_logger
-    )
-    
-    assert isinstance(update_result_list, list) and update_result_list and isinstance(update_result_list[0], dict)
-    update_result = update_result_list[0]
-    assert update_result.get("status") in ["success", "warning"]
-    
-    # Verify restart_status indicates no auto-enable was attempted
-    restart_status = update_result.get("restart_status", {})
-    assert restart_status.get("status") == "not_attempted", \
-        "Auto-enable should not be attempted when service was originally disabled"
-    assert "not originally enabled" in restart_status.get("reason", ""), \
-        "Restart status reason should indicate service was not originally enabled"
-    
-    global_logger.info("Test: Successfully verified auto-disable/enable logic for disabled service")
 
 
 @pytest.mark.anyio

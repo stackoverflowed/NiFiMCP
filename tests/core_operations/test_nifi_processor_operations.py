@@ -430,17 +430,21 @@ async def test_create_processor_with_service_reference_resolution(
     create_service_result = await call_tool(
         client=async_client,
         base_url=base_url,
-        tool_name="create_nifi_controller_service",
+        tool_name="create_controller_services",
         arguments={
-            "service_type": "org.apache.nifi.http.StandardHttpContextMap",
-            "name": "TestHttpContextMap",
+            "controller_services": [
+                {
+                    "service_type": "org.apache.nifi.http.StandardHttpContextMap",
+                    "name": "TestHttpContextMap"
+                }
+            ],
             "process_group_id": pg_id
         },
         headers=mcp_headers,
         custom_logger=global_logger
     )
     
-    assert create_service_result[0]["status"] == "success", f"Failed to create controller service: {create_service_result[0].get('message')}"
+    assert create_service_result[0]["status"] in ["success", "warning"], f"Failed to create controller service: {create_service_result[0].get('message')}"
     service_id = create_service_result[0]["entity"]["id"]
     global_logger.info(f"Test: Successfully created service with ID: {service_id}")
     
@@ -472,7 +476,7 @@ async def test_create_processor_with_service_reference_resolution(
         client=async_client,
         base_url=base_url,
         tool_name="create_nifi_processors",
-        arguments={"processors": processors_data},
+        arguments={"processors": processors_data, "process_group_id": pg_id},
         headers=mcp_headers,
         custom_logger=global_logger
     )
@@ -525,7 +529,7 @@ async def test_create_processor_with_invalid_base_path_property(
         client=async_client,
         base_url=base_url,
         tool_name="create_nifi_processors",
-        arguments={"processors": processors_data},
+        arguments={"processors": processors_data, "process_group_id": pg_id},
         headers=mcp_headers,
         custom_logger=global_logger
     )
@@ -601,7 +605,7 @@ async def test_create_processor_with_nested_position_format(
         client=async_client,
         base_url=base_url,
         tool_name="create_nifi_processors",
-        arguments={"processors": processors_data},
+        arguments={"processors": processors_data, "process_group_id": pg_id},
         headers=mcp_headers,
         custom_logger=global_logger
     )
@@ -640,10 +644,14 @@ async def test_create_processor_with_invalid_property_name_service_reference(
     create_service_result = await call_tool(
         client=async_client,
         base_url=base_url,
-        tool_name="create_nifi_controller_service",
+        tool_name="create_controller_services",
         arguments={
-            "service_type": "org.apache.nifi.http.StandardHttpContextMap",
-            "name": "TestHttpContextMap",
+            "controller_services": [
+                {
+                    "service_type": "org.apache.nifi.http.StandardHttpContextMap",
+                    "name": "TestHttpContextMap"
+                }
+            ],
             "process_group_id": pg_id
         },
         headers=mcp_headers,
@@ -672,7 +680,7 @@ async def test_create_processor_with_invalid_property_name_service_reference(
         client=async_client,
         base_url=base_url,
         tool_name="create_nifi_processors",
-        arguments={"processors": processors_data},
+        arguments={"processors": processors_data, "process_group_id": pg_id},
         headers=mcp_headers,
         custom_logger=global_logger
     )

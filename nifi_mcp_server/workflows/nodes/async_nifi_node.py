@@ -13,7 +13,10 @@ import importlib.util
 from typing import Dict, Any, List, Optional
 
 # Import PocketFlow async classes
-pocketflow_path = os.path.join(os.path.dirname(__file__), '..', '..', '..', 'docs', 'pocketflow examples')
+"""
+Update: The pocketflow examples directory has moved to docs/libdocs/pocketflow examples
+"""
+pocketflow_path = os.path.join(os.path.dirname(__file__), '..', '..', '..', 'docs', 'libdocs', 'pocketflow examples')
 sys.path.append(pocketflow_path)
 
 # Import AsyncNode from the pocketflow examples __init__.py
