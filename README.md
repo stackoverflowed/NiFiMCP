@@ -7,8 +7,8 @@ It has been tested with Nifi versions 1.23 and 1.28, but could work on other ver
 It's ability to read and document existing flows is very good.  It's ability to create new and modify existing flows is OK, but often takes several iterations and some user help. My future plans are to refine the tools to improve this aspect.  I may also introduce some tools to help it debug flows itself.
 
 ### Example Conversations
-- [Build A New Flow From A Spec](./examples/ExampleConversation-Build-o4-mini.md) - See how the system creates a complete NiFi flow from requirements
-- [Debug An Existing Flow](./examples/ExampleConversationForDebugging.md) - Watch the system diagnose and fix issues in an existing flow
+- [Build A New Flow From A Spec](./docs/examples/ExampleConversation-Build-o4-mini.md) - See how the system creates a complete NiFi flow from requirements
+- [Debug An Existing Flow](./docs/examples/ExampleConversationForDebugging.md) - Watch the system diagnose and fix issues in an existing flow
 
 ## Recent Updates
 
