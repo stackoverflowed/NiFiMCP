@@ -2,7 +2,7 @@ nifi:
   servers:
     - id: "nifi-local-example" # Unique internal ID, used by the client/API calls
       name: "Local NiFi Example" # Display name for UI dropdown
-      url: "https://localhost:8443/nifi-api" # URL to NiFi API
+      url: "https://localhost:8080/nifi-api" # URL to NiFi API
       username: "" # Optional: Username for NiFi basic auth
       password: "" # Optional: Password for NiFi basic auth - DO NOT COMMIT REAL PASSWORDS
       tls_verify: false # Set to true for valid certs, false for self-signed (dev only)
@@ -27,9 +27,12 @@ llm:
   anthropic:
     api_key: "" # Your Anthropic API Key (e.g., sk-ant-...)
     models: ["claude-opus-4-20250514", "claude-sonnet-4-20250109", "claude-3-5-haiku-20241022"] # Comma-separated list of allowed models
+  groq:
+    api_key: "" # Your Groq API Key (e.g., gsk_...)
+    models: ["llama3-70b-8192", "llama3-8b-8192", "mixtral-8x7b-32768"] # Comma-separated list of allowed models
   expert_help_model:
-    provider: "perplexity" # Choose from: openai, google, perplexity, anthropic
-    model: "sonar-pro" # Must be one of the models listed above for the chosen provider
+    provider: "groq" # Choose from: openai, google, perplexity, anthropic, groq
+    model: "llama3-70b-8192" # Must be one of the models listed above for the chosen provider
 
 mcp_features:
   auto_stop_enabled: true

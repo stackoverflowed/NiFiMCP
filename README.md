@@ -24,6 +24,12 @@ After this I will consider looking into support for more models.  I will say tha
 
 **Note:** These instructions should also be followed after pulling a new version as there may be new package requirements.
 
+### For Claude Desktop Users
+
+If you want to use this with Claude Desktop, see the [Claude Desktop Setup Guide](./docs/Claude_Desktop_Setup.md) for detailed instructions.
+
+### For Development/Web Interface Users
+
 To set up the development environment and install all dependencies, follow these steps:
 
 1. **Clone the Repository:**
@@ -63,6 +69,11 @@ To set up the development environment and install all dependencies, follow these
    uvicorn nifi_mcp_server.server:app --reload --port 8000
    ```
 
+   **Or run the SSE-enabled server:**
+   ```bash
+   uvicorn nifi_mcp_server.fastmcp_sse_server:app --reload --port 8000
+   ```
+
 7. **Run the Streamlit Client:**
    Start the Streamlit client with:
    ```bash
@@ -72,6 +83,8 @@ To set up the development environment and install all dependencies, follow these
 ## Usage Tips
 
 For detailed usage information, tips, and UI features, see the [Usage Guide](./docs/UsageGuide.md).
+
+For information about the new SSE (Server-Sent Events) server with real-time streaming capabilities, see the [SSE Server Guide](./docs/SSE_Server_Guide.md).
 
 ## Running Automated Tests
 

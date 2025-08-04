@@ -28,6 +28,7 @@ DEFAULT_APP_CONFIG = {
         'openai': {'api_key': None, 'models': ['gpt-4-turbo-preview']},
         'perplexity': {'api_key': None, 'models': ['sonar-pro']},
         'anthropic': {'api_key': None, 'models': ['claude-sonnet-4-20250109']},
+        'groq': {'api_key': None, 'models': ['llama3-70b-8192', 'llama3-8b-8192', 'mixtral-8x7b-32768']},
         'expert_help_model': {'provider': None, 'model': None}
     },
     'mcp_features': {
@@ -157,12 +158,14 @@ GOOGLE_API_KEY = _APP_CONFIG.get('llm', {}).get('google', {}).get('api_key')
 OPENAI_API_KEY = _APP_CONFIG.get('llm', {}).get('openai', {}).get('api_key')
 PERPLEXITY_API_KEY = _APP_CONFIG.get('llm', {}).get('perplexity', {}).get('api_key')
 ANTHROPIC_API_KEY = _APP_CONFIG.get('llm', {}).get('anthropic', {}).get('api_key')
+GROQ_API_KEY = _APP_CONFIG.get('llm', {}).get('groq', {}).get('api_key')
 
 # Load model configurations with defaults from DEFAULT_APP_CONFIG if necessary
 OPENAI_MODELS = _APP_CONFIG.get('llm', {}).get('openai', {}).get('models', DEFAULT_APP_CONFIG['llm']['openai']['models'])
 GEMINI_MODELS = _APP_CONFIG.get('llm', {}).get('google', {}).get('models', DEFAULT_APP_CONFIG['llm']['google']['models'])
 PERPLEXITY_MODELS = _APP_CONFIG.get('llm', {}).get('perplexity', {}).get('models', DEFAULT_APP_CONFIG['llm']['perplexity']['models'])
 ANTHROPIC_MODELS = _APP_CONFIG.get('llm', {}).get('anthropic', {}).get('models', DEFAULT_APP_CONFIG['llm']['anthropic']['models'])
+GROQ_MODELS = _APP_CONFIG.get('llm', {}).get('groq', {}).get('models', DEFAULT_APP_CONFIG['llm']['groq']['models'])
 
 # Expert Help Model Configuration
 EXPERT_HELP_PROVIDER = _APP_CONFIG.get('llm', {}).get('expert_help_model', {}).get('provider')
@@ -187,6 +190,8 @@ def is_expert_help_available() -> bool:
         return PERPLEXITY_API_KEY is not None
     elif provider == 'anthropic':
         return ANTHROPIC_API_KEY is not None
+    elif provider == 'groq':
+        return GROQ_API_KEY is not None
     else:
         return False
 

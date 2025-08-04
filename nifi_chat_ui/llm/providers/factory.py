@@ -41,6 +41,12 @@ class LLMProviderFactory:
             'requires_api_key': True,
             'supports_tools': True,
             'error_handler': 'extract_perplexity_error',  # Compatible format
+        },
+        'groq': {
+            'client_class': 'GroqClient',
+            'requires_api_key': True,
+            'supports_tools': True,
+            'error_handler': 'extract_groq_error',
         }
     }
     
@@ -116,11 +122,18 @@ class LLMProviderFactory:
         
         # Check if API key is required and present
         if provider_config.get('requires_api_key', False):
-            # Check for nested config structure (e.g., config['openai']['api_key'])
+            # Check for nested config structure (e.g., config['llm']['openai']['api_key'])
+            if 'llm' in config and provider_name in config['llm']:
+                provider_section = config['llm'][provider_name]
+                if isinstance(provider_section, dict) and provider_section.get('api_key'):
+                    logger.debug(f"Found API key for {provider_name} in nested config")
+                    return True
+            
+            # Check for direct nested config structure (e.g., config['openai']['api_key'])
             if provider_name in config:
                 provider_section = config[provider_name]
                 if isinstance(provider_section, dict) and provider_section.get('api_key'):
-                    logger.debug(f"Found API key for {provider_name} in nested config")
+                    logger.debug(f"Found API key for {provider_name} in direct nested config")
                     return True
             
             # Special case for Gemini which uses GOOGLE_API_KEY in nested config

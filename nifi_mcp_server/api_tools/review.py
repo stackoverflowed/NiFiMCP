@@ -1949,3 +1949,18 @@ async def get_flowfile_event_details(
         results["status"] = "error"
         results["message"] = f"An unexpected error occurred: {e}"
         return results
+
+# --- Wrapper Functions for MCP Wrapper ---
+
+async def document_flow(client, process_group_id: str = "root"):
+    """Document a NiFi flow."""
+    from ..request_context import current_request_logger
+    local_logger = current_request_logger.get() or logger
+    
+    try:
+        result = await document_nifi_flow(process_group_id)
+        local_logger.info(f"Successfully documented flow for process group {process_group_id}")
+        return result
+    except Exception as e:
+        local_logger.error(f"Error documenting flow: {e}")
+        raise

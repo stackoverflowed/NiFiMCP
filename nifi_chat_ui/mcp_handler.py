@@ -66,7 +66,7 @@ def _convert_mapcomposite_to_dict(value):
 
 # --- Configuration --- #
 # URL for the FastAPI server
-API_BASE_URL = "http://localhost:8000"
+API_BASE_URL = "http://localhost:8001"
 
 # --- Remove All MCP Client, Threading, Asyncio imports and helpers --- #
 # (Imports like ClientSession, stdio_client, websocket_client, McpError, ToolError removed)

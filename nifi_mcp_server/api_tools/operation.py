@@ -1029,3 +1029,125 @@ def _generate_debugging_suggestions(patterns: List[str], processor_type: str) ->
             })
     
     return suggestions
+
+
+# --- List Functions for MCP Wrapper ---
+
+async def list_process_groups(client, process_group_id: str = "root"):
+    """List all process groups in the specified process group."""
+    from ..request_context import current_request_logger
+    local_logger = current_request_logger.get() or logger
+    
+    try:
+        result = await client.get_process_groups(process_group_id)
+        local_logger.info(f"Successfully listed {len(result)} process groups in {process_group_id}")
+        return result
+    except Exception as e:
+        local_logger.error(f"Error listing process groups: {e}")
+        raise
+
+
+async def list_processors(client, process_group_id: str = "root"):
+    """List all processors in the specified process group."""
+    from ..request_context import current_request_logger
+    local_logger = current_request_logger.get() or logger
+    
+    try:
+        result = await client.list_processors(process_group_id)
+        local_logger.info(f"Successfully listed {len(result)} processors in {process_group_id}")
+        return result
+    except Exception as e:
+        local_logger.error(f"Error listing processors: {e}")
+        raise
+
+
+async def list_connections(client, process_group_id: str = "root"):
+    """List all connections in the specified process group."""
+    from ..request_context import current_request_logger
+    local_logger = current_request_logger.get() or logger
+    
+    try:
+        result = await client.list_connections(process_group_id)
+        local_logger.info(f"Successfully listed {len(result)} connections in {process_group_id}")
+        return result
+    except Exception as e:
+        local_logger.error(f"Error listing connections: {e}")
+        raise
+
+
+async def list_input_ports(client, process_group_id: str = "root"):
+    """List all input ports in the specified process group."""
+    from ..request_context import current_request_logger
+    local_logger = current_request_logger.get() or logger
+    
+    try:
+        result = await client.get_input_ports(process_group_id)
+        local_logger.info(f"Successfully listed {len(result)} input ports in {process_group_id}")
+        return result
+    except Exception as e:
+        local_logger.error(f"Error listing input ports: {e}")
+        raise
+
+
+async def list_output_ports(client, process_group_id: str = "root"):
+    """List all output ports in the specified process group."""
+    from ..request_context import current_request_logger
+    local_logger = current_request_logger.get() or logger
+    
+    try:
+        result = await client.get_output_ports(process_group_id)
+        local_logger.info(f"Successfully listed {len(result)} output ports in {process_group_id}")
+        return result
+    except Exception as e:
+        local_logger.error(f"Error listing output ports: {e}")
+        raise
+
+
+async def list_flowfiles(client, connection_id: str):
+    """List flowfiles in a connection."""
+    from ..request_context import current_request_logger
+    local_logger = current_request_logger.get() or logger
+    
+    try:
+        # Create a flowfile listing request
+        request_result = await client.create_flowfile_listing_request(connection_id)
+        request_id = request_result.get("request", {}).get("id")
+        
+        if not request_id:
+            raise Exception("Failed to create flowfile listing request")
+        
+        # Get the listing results
+        result = await client.get_flowfile_listing_request(connection_id, request_id)
+        local_logger.info(f"Successfully listed flowfiles in connection {connection_id}")
+        return result
+    except Exception as e:
+        local_logger.error(f"Error listing flowfiles: {e}")
+        raise
+
+
+async def purge_connection(client, connection_id: str):
+    """Purge flowfiles from a connection."""
+    from ..request_context import current_request_logger
+    local_logger = current_request_logger.get() or logger
+    
+    try:
+        result = await client.handle_drop_request(connection_id)
+        local_logger.info(f"Successfully purged flowfiles from connection {connection_id}")
+        return result
+    except Exception as e:
+        local_logger.error(f"Error purging connection: {e}")
+        raise
+
+
+async def list_controller_services(client, process_group_id: str = "root"):
+    """List all controller services in the specified process group."""
+    from ..request_context import current_request_logger
+    local_logger = current_request_logger.get() or logger
+    
+    try:
+        result = await client.list_controller_services(process_group_id)
+        local_logger.info(f"Successfully listed {len(result)} controller services in {process_group_id}")
+        return result
+    except Exception as e:
+        local_logger.error(f"Error listing controller services: {e}")
+        raise

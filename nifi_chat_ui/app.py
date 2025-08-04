@@ -100,6 +100,10 @@ def get_chat_manager() -> ChatManager:
             'perplexity': {
                 'api_key': config.PERPLEXITY_API_KEY,
                 'models': config.PERPLEXITY_MODELS
+            },
+            'groq': {
+                'api_key': config.GROQ_API_KEY,
+                'models': config.GROQ_MODELS
             }
         }
         
@@ -217,6 +221,9 @@ with st.sidebar:
     if config.ANTHROPIC_API_KEY and config.ANTHROPIC_MODELS:
         for model in config.ANTHROPIC_MODELS:
             available_models[f"Anthropic: {model}"] = ("anthropic", model)
+    if config.GROQ_API_KEY and config.GROQ_MODELS:
+        for model in config.GROQ_MODELS:
+            available_models[f"Groq: {model}"] = ("groq", model)
     
     selected_model_display_name = None
     provider = None # Will be derived from selection

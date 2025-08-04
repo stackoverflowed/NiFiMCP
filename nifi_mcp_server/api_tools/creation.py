@@ -4270,3 +4270,95 @@ async def create_nifi_connections(
         raise ToolError(f"Connection creation failed after successful name resolution: {e}")
 
 
+# --- Wrapper Functions for MCP Wrapper ---
+
+async def create_process_group(client, name: str, parent_group_id: str = "root", position_x: float = 0.0, position_y: float = 0.0):
+    """Create a new process group in NiFi."""
+    from ..request_context import current_request_logger
+    local_logger = current_request_logger.get() or logger
+    
+    try:
+        position = {"x": position_x, "y": position_y}
+        result = await client.create_process_group(parent_group_id, name, position)
+        local_logger.info(f"Successfully created process group '{name}' in {parent_group_id}")
+        return result
+    except Exception as e:
+        local_logger.error(f"Error creating process group: {e}")
+        raise
+
+
+async def create_processor(client, processor_type: str, name: str, parent_group_id: str = "root", position_x: float = 0.0, position_y: float = 0.0):
+    """Create a new processor in NiFi."""
+    from ..request_context import current_request_logger
+    local_logger = current_request_logger.get() or logger
+    
+    try:
+        position = {"x": position_x, "y": position_y}
+        result = await client.create_processor(parent_group_id, processor_type, name, position)
+        local_logger.info(f"Successfully created processor '{name}' ({processor_type}) in {parent_group_id}")
+        return result
+    except Exception as e:
+        local_logger.error(f"Error creating processor: {e}")
+        raise
+
+
+async def create_connection(client, source_id: str, target_id: str, source_type: str, target_type: str, name: str, parent_group_id: str = "root"):
+    """Create a new connection in NiFi."""
+    from ..request_context import current_request_logger
+    local_logger = current_request_logger.get() or logger
+    
+    try:
+        # For now, use a default relationship. In a real implementation, you might want to determine the appropriate relationships
+        relationships = ["success"]
+        result = await client.create_connection(parent_group_id, source_id, target_id, relationships, source_type, target_type, name)
+        local_logger.info(f"Successfully created connection '{name}' from {source_id} to {target_id}")
+        return result
+    except Exception as e:
+        local_logger.error(f"Error creating connection: {e}")
+        raise
+
+
+async def create_input_port(client, name: str, parent_group_id: str = "root", position_x: float = 0.0, position_y: float = 0.0):
+    """Create a new input port in NiFi."""
+    from ..request_context import current_request_logger
+    local_logger = current_request_logger.get() or logger
+    
+    try:
+        position = {"x": position_x, "y": position_y}
+        result = await client.create_input_port(parent_group_id, name, position)
+        local_logger.info(f"Successfully created input port '{name}' in {parent_group_id}")
+        return result
+    except Exception as e:
+        local_logger.error(f"Error creating input port: {e}")
+        raise
+
+
+async def create_output_port(client, name: str, parent_group_id: str = "root", position_x: float = 0.0, position_y: float = 0.0):
+    """Create a new output port in NiFi."""
+    from ..request_context import current_request_logger
+    local_logger = current_request_logger.get() or logger
+    
+    try:
+        position = {"x": position_x, "y": position_y}
+        result = await client.create_output_port(parent_group_id, name, position)
+        local_logger.info(f"Successfully created output port '{name}' in {parent_group_id}")
+        return result
+    except Exception as e:
+        local_logger.error(f"Error creating output port: {e}")
+        raise
+
+
+async def create_controller_service(client, service_type: str, name: str, parent_group_id: str = "root"):
+    """Create a new controller service in NiFi."""
+    from ..request_context import current_request_logger
+    local_logger = current_request_logger.get() or logger
+    
+    try:
+        result = await client.create_controller_service(parent_group_id, service_type, name)
+        local_logger.info(f"Successfully created controller service '{name}' ({service_type}) in {parent_group_id}")
+        return result
+    except Exception as e:
+        local_logger.error(f"Error creating controller service: {e}")
+        raise
+
+

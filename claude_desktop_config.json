@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "nifi-mcp": {
+      "command": "/Users/kaushal/Documents/Forestrat/NiFiMCP/.venv/bin/python",
+      "args": ["/Users/kaushal/Documents/Forestrat/NiFiMCP/run_stdio_server.py"],
+      "env": {}
+    }
+  }
+}

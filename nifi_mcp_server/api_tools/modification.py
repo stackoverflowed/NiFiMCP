@@ -1939,3 +1939,98 @@ async def _resolve_service_reference(
     return reference, False
 
 
+# --- Wrapper Functions for MCP Wrapper ---
+
+async def delete_nifi_object(client, object_type: str, object_id: str):
+    """Delete a NiFi object (processor, port, process_group, connection, controller_service)."""
+    from ..request_context import current_request_logger
+    local_logger = current_request_logger.get() or logger
+    
+    try:
+        if object_type == "processor":
+            # Get the current version first
+            processor_details = await client.get_processor_details(object_id)
+            version = processor_details.get("revision", {}).get("version", 0)
+            result = await client.delete_processor(object_id, version)
+        elif object_type == "port":
+            # Try input port first, then output port
+            try:
+                port_details = await client.get_input_port_details(object_id)
+                version = port_details.get("revision", {}).get("version", 0)
+                result = await client.delete_input_port(object_id, version)
+            except:
+                port_details = await client.get_output_port_details(object_id)
+                version = port_details.get("revision", {}).get("version", 0)
+                result = await client.delete_output_port(object_id, version)
+        elif object_type == "process_group":
+            # Get the current version first
+            pg_details = await client.get_process_group_details(object_id)
+            version = pg_details.get("revision", {}).get("version", 0)
+            result = await client.delete_process_group(object_id, version)
+        elif object_type == "connection":
+            # Get the current version first
+            connection_details = await client.get_connection(object_id)
+            version = connection_details.get("revision", {}).get("version", 0)
+            result = await client.delete_connection(object_id, version)
+        elif object_type == "controller_service":
+            # Get the current version first
+            cs_details = await client.get_controller_service_details(object_id)
+            version = cs_details.get("revision", {}).get("version", 0)
+            result = await client.delete_controller_service(object_id, version)
+        else:
+            raise Exception(f"Unsupported object type: {object_type}")
+        
+        local_logger.info(f"Successfully deleted {object_type} {object_id}")
+        return result
+    except Exception as e:
+        local_logger.error(f"Error deleting {object_type} {object_id}: {e}")
+        raise
+
+
+async def update_process_group_state(client, process_group_id: str, state: str):
+    """Update the state of a process group."""
+    from ..request_context import current_request_logger
+    local_logger = current_request_logger.get() or logger
+    
+    try:
+        result = await client.update_process_group_state(process_group_id, state)
+        local_logger.info(f"Successfully updated process group {process_group_id} state to {state}")
+        return result
+    except Exception as e:
+        local_logger.error(f"Error updating process group state: {e}")
+        raise
+
+
+async def update_processor(client, processor_id: str, properties: Dict[str, Any]):
+    """Update processor properties."""
+    from ..request_context import current_request_logger
+    local_logger = current_request_logger.get() or logger
+    
+    try:
+        # Get current processor details
+        processor_details = await client.get_processor_details(processor_id)
+        current_config = processor_details.get("component", {}).get("config", {})
+        current_properties = current_config.get("properties", {})
+        
+        # Update properties
+        updated_properties = {**current_properties, **properties}
+        
+        # Update the processor configuration
+        update_payload = {
+            "component": {
+                "id": processor_id,
+                "config": {
+                    "properties": updated_properties
+                }
+            },
+            "revision": processor_details.get("revision", {})
+        }
+        
+        result = await client.update_processor_config(processor_id, "properties", updated_properties)
+        local_logger.info(f"Successfully updated processor {processor_id} properties")
+        return result
+    except Exception as e:
+        local_logger.error(f"Error updating processor properties: {e}")
+        raise
+
+

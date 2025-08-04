@@ -507,3 +507,60 @@ async def get_expert_help(question: str) -> str:
         expert_error_data = {"error": str(e)}
         local_logger.bind(interface="llm", direction="response", data=expert_error_data).debug("Received error from Expert LLM")
         return f"Expert help encountered an error: {e}. Please try again or ask your question directly."
+
+# --- Wrapper Functions for MCP Wrapper ---
+
+async def get_flow_summary(client, process_group_id: str = "root"):
+    """Get a summary of the flow in the specified process group."""
+    from ..request_context import current_request_logger
+    local_logger = current_request_logger.get() or logger
+    
+    try:
+        # Get process group details
+        pg_details = await client.get_process_group_details(process_group_id)
+        pg_name = pg_details.get("component", {}).get("name", "Unknown")
+        
+        # Get processors
+        processors = await client.list_processors(process_group_id)
+        
+        # Get connections
+        connections = await client.list_connections(process_group_id)
+        
+        # Get input ports
+        input_ports = await client.get_input_ports(process_group_id)
+        
+        # Get output ports
+        output_ports = await client.get_output_ports(process_group_id)
+        
+        # Get process groups
+        process_groups = await client.get_process_groups(process_group_id)
+        
+        # Get controller services
+        controller_services = await client.list_controller_services(process_group_id)
+        
+        summary = {
+            "process_group_id": process_group_id,
+            "process_group_name": pg_name,
+            "summary": {
+                "processors": len(processors),
+                "connections": len(connections),
+                "input_ports": len(input_ports),
+                "output_ports": len(output_ports),
+                "process_groups": len(process_groups),
+                "controller_services": len(controller_services)
+            },
+            "details": {
+                "processors": [{"id": p.get("id"), "name": p.get("component", {}).get("name"), "type": p.get("component", {}).get("type")} for p in processors],
+                "connections": [{"id": c.get("id"), "name": c.get("component", {}).get("name")} for c in connections],
+                "input_ports": [{"id": p.get("id"), "name": p.get("component", {}).get("name")} for p in input_ports],
+                "output_ports": [{"id": p.get("id"), "name": p.get("component", {}).get("name")} for p in output_ports],
+                "process_groups": [{"id": pg.get("id"), "name": pg.get("component", {}).get("name")} for pg in process_groups],
+                "controller_services": [{"id": cs.get("id"), "name": cs.get("component", {}).get("name"), "type": cs.get("component", {}).get("type")} for cs in controller_services]
+            }
+        }
+        
+        local_logger.info(f"Successfully generated flow summary for process group {process_group_id}")
+        return summary
+    except Exception as e:
+        local_logger.error(f"Error generating flow summary: {e}")
+        raise
